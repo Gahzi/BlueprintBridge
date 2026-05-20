@@ -1,59 +1,36 @@
-# Blueprint Bridge
+# BlueprintBridge
 
-> Working name. This plugin exposes a local Windows IPC bridge that lets an external coding agent inspect and edit Unreal Editor assets, especially Blueprints, without driving the editor UI with mouse/screen automation.
+BlueprintBridge is an **Editor-only Unreal Engine plugin** that exposes a local JSON command bridge for inspecting and authoring Blueprint assets from external tools, scripts, or coding agents.
 
-## Naming ideas
-
-Current internal name:
+It runs inside `UnrealEditor.exe`, listens on a local Windows named pipe, executes requests through Unreal Editor APIs, and returns structured JSON responses. The goal is to automate Blueprint editing without direct `.uasset` mutation and without fragile screen/mouse automation.
 
 ```text
-BlueprintBridge
-```
-
-Possible public names:
-
-- **K2Bridge** — short, Blueprint-focused, Unreal-flavored.
-- **EditorPipe** — emphasizes local IPC into the editor.
-- **BlueprintBridge** — clear and descriptive.
-- **BlueprintBridge** — clear if we want the project to feel Blueprint-first.
-- **GraphPipe** — concise, good if graph editing is the primary identity.
-- **UAgentBridge** — Unreal-ish naming, broader than Blueprint.
-
-My current favorite for a public GitHub repo is **K2Bridge** if the main value is Blueprint graph editing, or **BlueprintBridge** if we want it to sound broader and more discoverable.
-
-## What this is
-
-Blueprint Bridge is an **Editor-only Unreal Engine plugin** for Windows. It runs inside `UnrealEditor.exe`, listens on a local named pipe, accepts structured JSON commands, executes those commands using Unreal Editor APIs, and returns JSON responses.
-
-The intended workflow is:
-
-```text
-External agent / CLI / terminal
-    -> JSON request over Windows named pipe
-        -> Unreal Editor plugin
-            -> Unreal Editor APIs modify assets safely
+External tool / script / agent
+    -> length-prefixed JSON over local named pipe
+        -> BlueprintBridge editor plugin
+            -> Unreal Editor APIs inspect/edit assets
         <- JSON response
-    <- terminal output
+    <- terminal/tool output
 ```
 
-This avoids unsafe direct `.uasset` editing and avoids fragile screen/mouse automation.
+## Status
 
-## Current status
+BlueprintBridge is functional and has been used to create and iterate on real Blueprint-only gameplay assets. It currently supports a broad set of Blueprint authoring primitives:
 
-This is early but already functional. It can:
+- editor/project information and ping checks
+- Blueprint, graph, node, pin, variable, component, and widget-tree inspection
+- Blueprint asset and Widget Blueprint asset creation
+- Blueprint duplication, compile, save, and checkout helpers
+- component/SCS editing, including common specialized component setters
+- Blueprint variable creation, defaults, metadata, replication flags, and array/set container types
+- event graph and function graph creation/editing
+- node creation for variables, branches, sequences, functions, events, custom events, dynamic casts, spawn actor, macros, structs, delegates, timers, traces, arrays, math helpers, UMG runtime calls, and Create Widget
+- pin linking, link movement, link breaking, pin defaults, type copying, safer pin lookup aliases, node movement, and node deletion
+- initial UMG widget-tree creation/editing and slot layout commands
+- batched request execution
+- automation coverage under the `BlueprintBridge` test namespace
 
-- connect to the editor over a Windows named pipe
-- inspect Blueprints and graphs
-- find variable references
-- create and duplicate Blueprint assets
-- create and edit common Blueprint graph nodes
-- create function/event graphs
-- add function inputs/outputs
-- connect, move, and break pin links
-- compile and save Blueprints
-- perform simple Blueprint variable/default edits
-
-It has already been used to migrate a Blueprint from a bool-backed state flow to an enum-backed state flow.
+The plugin is still evolving. Some Blueprint systems remain context-sensitive and may need additional purpose-built primitives.
 
 ## Platform support
 
@@ -64,26 +41,26 @@ Windows only
 Unreal Editor only
 ```
 
-The transport is currently a Windows named pipe. By default it listens on:
+The transport is a Windows named pipe. By default BlueprintBridge listens on:
 
 ```text
 \\.\pipe\BlueprintBridge
 ```
 
-The pipe name is configurable through plugin config/settings.
+The pipe name is configurable through editor user settings.
 
-## Why a plugin instead of editing `.uasset` files directly?
+## Why this exists
 
-Blueprint assets are binary, versioned, editor-managed assets. Directly modifying `.uasset` files from an external process is risky and likely to corrupt assets.
+Blueprint assets are binary editor-managed assets. Editing `.uasset` files directly from an external process is unsafe and likely to corrupt assets.
 
-This plugin keeps Unreal in charge of its own assets:
+BlueprintBridge keeps Unreal in charge of its own data:
 
-- load assets through Unreal APIs
-- modify `UBlueprint`, `UEdGraph`, `UEdGraphNode`, and `UEdGraphPin` objects
-- use transactions where possible
-- mark packages dirty
-- compile Blueprints through Kismet editor utilities
-- save packages through editor saving utilities
+- assets are loaded through Unreal APIs
+- `UBlueprint`, `UEdGraph`, `UEdGraphNode`, `UEdGraphPin`, component templates, and widget trees are edited in-editor
+- transactions are used where practical
+- packages are marked dirty
+- Blueprints are compiled through Kismet editor utilities
+- assets are saved through editor saving utilities
 
 ## Architecture
 
@@ -106,12 +83,24 @@ Unreal operation layer
     asset loading
     Blueprint inspection
     graph/node/pin operations
-    compile/save/source control helpers
+    component/SCS operations
+    widget-tree operations
+    compile/save/source-control helpers
 ```
 
-### Request format
+## Transport protocol
 
-Requests are JSON objects:
+Messages are length-prefixed UTF-8 JSON:
+
+```text
+[4-byte little-endian uint32 payload length][UTF-8 JSON payload]
+```
+
+The plugin currently handles one connected client at a time. A client may send multiple framed requests over the same connection.
+
+## Request and response format
+
+### Request
 
 ```json
 {
@@ -134,7 +123,7 @@ Requests are JSON objects:
 }
 ```
 
-Some commands return a string instead of an object:
+Some commands return a string result:
 
 ```json
 {
@@ -157,25 +146,15 @@ Some commands return a string instead of an object:
 }
 ```
 
-## Transport protocol
-
-The named pipe uses length-prefixed UTF-8 JSON:
-
-```text
-[4-byte little-endian uint32 payload length][UTF-8 JSON payload]
-```
-
-The plugin currently handles one connected client at a time. A client may send multiple framed requests over the same connection.
-
 ## Configuration
 
-A default config file is included at:
+Default editor user settings live in:
 
 ```text
 Config/DefaultEditorPerProjectUserSettings.ini
 ```
 
-Current settings section:
+Settings section:
 
 ```ini
 [/Script/BlueprintBridgeEditor.BlueprintBridge]
@@ -184,69 +163,17 @@ bRequireAuthToken=false
 AuthToken=
 ```
 
-### Settings
+Settings:
 
-- `PipeName` — local pipe name without the `\\.\pipe\` prefix.
+- `PipeName` — pipe name without the `\\.\pipe\` prefix.
 - `bRequireAuthToken` — when `true`, every request must include `authToken`.
 - `AuthToken` — expected token value when auth is enabled.
 
-If auth is enabled and a request omits `authToken` or sends the wrong token, the plugin returns:
+If auth is enabled and a request omits `authToken` or sends the wrong token, BlueprintBridge returns an `Unauthorized` error.
 
-```json
-{
-  "ok": false,
-  "error": {
-    "code": "Unauthorized",
-    "message": "Missing or invalid auth token."
-  }
-}
-```
+## Installation
 
-## PowerShell client
-
-A simple PowerShell helper lives outside the plugin in this project:
-
-```text
-Projects/Biscuit/Tools/BlueprintBridge/blueprintbridge.ps1
-```
-
-Examples:
-
-```powershell
-blueprintbridge.ps1 ping
-blueprintbridge.ps1 project
-blueprintbridge.ps1 engine-version
-blueprintbridge.ps1 describe-blueprint /Game/Example/BP_Example
-blueprintbridge.ps1 describe-graph /Game/Example/BP_Example EventGraph
-blueprintbridge.ps1 find-variable-references /Game/Example/BP_Example ExampleState
-blueprintbridge.ps1 create-blueprint-asset /Game/Example/BP_NewAsset /Script/Engine.Actor
-blueprintbridge.ps1 duplicate-asset /Game/Example/BP_Template /Game/Example/BP_NewAsset
-```
-
-The client also accepts raw JSON:
-
-```powershell
-blueprintbridge.ps1 -RequestJson '{"id":"1","version":1,"command":"Ping","params":{}}'
-```
-
-If auth is enabled, either pass `-AuthToken` explicitly or set an environment variable:
-
-```powershell
-$env:BLUEPRINTBRIDGE_AUTH_TOKEN = "your-token"
-blueprintbridge.ps1 ping
-```
-
-The script automatically injects `authToken` into the request before serialization.
-
-When calling from Git Bash/MSYS, use `MSYS_NO_PATHCONV=1` so Unreal paths such as `/Game/...` are not rewritten into Windows paths:
-
-```bash
-MSYS_NO_PATHCONV=1 powershell.exe -ExecutionPolicy Bypass -File D:/Path/To/blueprintbridge.ps1 describe-blueprint /Game/Example/BP_Example
-```
-
-## Installation in an Unreal project
-
-1. Copy the plugin folder into your project:
+1. Copy the plugin folder into your Unreal project:
 
    ```text
    YourProject/Plugins/BlueprintBridge
@@ -264,35 +191,93 @@ MSYS_NO_PATHCONV=1 powershell.exe -ExecutionPolicy Bypass -File D:/Path/To/bluep
    ```
 
 3. Regenerate project files if needed.
-4. Build the editor target.
-5. Start the editor.
-6. Send a ping request through the client.
+4. Build your editor target.
+5. Start `UnrealEditor.exe`.
+6. Send a `Ping` request.
 
-## Current commands
+BlueprintBridge commands require a live Unreal Editor process. Headless `UnrealEditor-Cmd.exe` is useful for automation tests, but the named-pipe authoring bridge is served by the editor process.
+
+## PowerShell client
+
+This project includes a PowerShell helper script at:
+
+```text
+Tools/BlueprintBridge/blueprintbridge.ps1
+```
+
+Example commands:
+
+```powershell
+blueprintbridge.ps1 ping
+blueprintbridge.ps1 project
+blueprintbridge.ps1 engine-version
+blueprintbridge.ps1 describe-blueprint /Game/Example/BP_Example
+blueprintbridge.ps1 describe-graph /Game/Example/BP_Example EventGraph
+blueprintbridge.ps1 find-variable-references /Game/Example/BP_Example ExampleState
+blueprintbridge.ps1 create-blueprint-asset /Game/Example/BP_NewAsset /Script/Engine.Actor
+blueprintbridge.ps1 duplicate-asset /Game/Example/BP_Template /Game/Example/BP_NewAsset
+```
+
+Raw JSON requests are also supported:
+
+```powershell
+blueprintbridge.ps1 -RequestJson '{"id":"1","version":1,"command":"Ping","params":{}}'
+```
+
+If auth is enabled, pass `-AuthToken` or set:
+
+```powershell
+$env:BLUEPRINTBRIDGE_AUTH_TOKEN = "your-token"
+blueprintbridge.ps1 ping
+```
+
+When calling from Git Bash/MSYS, disable path conversion so Unreal `/Game/...` paths are not rewritten:
+
+```bash
+MSYS_NO_PATHCONV=1 powershell.exe -ExecutionPolicy Bypass -File D:/Path/To/blueprintbridge.ps1 describe-blueprint /Game/Example/BP_Example
+```
+
+## Core command reference
+
+Most graph commands use this common shape:
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph",
+  "x": 400,
+  "y": 200
+}
+```
 
 ### Basic/editor info
 
-#### `Ping`
+- `Ping`
+- `GetProjectName`
+- `GetEngineVersion`
 
-Returns `Pong`.
+### Batch execution
+
+#### `Batch`
+
+Executes a list of normal requests and returns per-request responses.
 
 ```json
-{"id":"1","version":1,"command":"Ping","params":{}}
+{
+  "requests": [
+    {
+      "id": "describe",
+      "version": 1,
+      "command": "DescribeBlueprint",
+      "params": { "asset": "/Game/Example/BP_Example" }
+    }
+  ]
+}
 ```
 
-#### `GetProjectName`
-
-Returns the current Unreal project name.
-
-#### `GetEngineVersion`
-
-Returns the current engine version string.
-
-### Blueprint/graph inspection
+### Blueprint and graph inspection
 
 #### `DescribeBlueprint`
-
-Params:
 
 ```json
 {
@@ -300,11 +285,9 @@ Params:
 }
 ```
 
-Returns parent class, Blueprint variables, and graph names.
+Returns parent class, variables, variable flags/replication metadata, variable container types, graph names, and widget-tree information for Widget Blueprints.
 
 #### `DescribeGraph`
-
-Params:
 
 ```json
 {
@@ -313,11 +296,9 @@ Params:
 }
 ```
 
-Returns nodes, pins, pin types, defaults, links, node GUIDs, positions, and variable node metadata.
+Returns graph nodes, pin names, pin directions, pin types, pin container types, defaults, links, node GUIDs, positions, and variable node metadata.
 
 #### `DescribeNode`
-
-Params:
 
 ```json
 {
@@ -327,11 +308,7 @@ Params:
 }
 ```
 
-Returns a single node description.
-
 #### `FindNodes`
-
-Params:
 
 ```json
 {
@@ -343,11 +320,7 @@ Params:
 }
 ```
 
-All filters except `asset` are optional.
-
 #### `FindVariableReferences`
-
-Params:
 
 ```json
 {
@@ -356,13 +329,143 @@ Params:
 }
 ```
 
-Returns variable get/set nodes referencing that variable.
+### Asset, source control, compile, save
 
-### Blueprint component editing
+#### `CreateBlueprintAsset`
+
+```json
+{
+  "asset": "/Game/Path/BP_NewAsset",
+  "parentClass": "/Script/Engine.Actor"
+}
+```
+
+#### `CreateWidgetBlueprintAsset`
+
+```json
+{
+  "asset": "/Game/Path/WBP_NewWidget",
+  "parentClass": "/Script/UMG.UserWidget"
+}
+```
+
+`parentClass` is optional and defaults to `UserWidget`.
+
+#### `DuplicateAsset`
+
+```json
+{
+  "sourceAsset": "/Game/Example/BP_Template",
+  "destAsset": "/Game/Example/BP_NewAsset"
+}
+```
+
+#### `CheckoutAsset`
+
+Checks out an asset through Unreal source-control helpers.
+
+#### `CompileBlueprint`
+
+Compiles a Blueprint and returns structured status fields:
+
+```json
+{
+  "status": "UpToDate",
+  "success": true,
+  "messages": []
+}
+```
+
+`messages` is reserved for richer compiler diagnostics.
+
+#### `SaveAsset`
+
+Saves an asset package.
+
+### Blueprint variables and defaults
+
+#### `AddBlueprintVariable`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "name": "SomeBool",
+  "category": "bool",
+  "defaultValue": "false"
+}
+```
+
+For object, class, enum, and struct variables, provide `subCategoryObject`:
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "name": "TargetActor",
+  "category": "object",
+  "subCategoryObject": "/Script/Engine.Actor"
+}
+```
+
+Container variables are supported with `containerType`:
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "name": "Targets",
+  "category": "object",
+  "subCategoryObject": "/Script/Engine.Actor",
+  "containerType": "Array"
+}
+```
+
+Supported container values:
+
+- `None`
+- `Array`
+- `Set`
+
+`Map` is currently rejected.
+
+Legacy `isArray: true` is also accepted.
+
+#### `SetBlueprintVariableFlags`
+
+Sets Blueprint variable metadata and replication flags.
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "name": "SomeValue",
+  "instanceEditable": true,
+  "blueprintReadOnly": false,
+  "exposeOnSpawn": true,
+  "private": false,
+  "categoryName": "Config",
+  "tooltip": "Shown in editor",
+  "replication": "RepNotify",
+  "repNotifyFunc": "OnRep_SomeValue"
+}
+```
+
+`replication` supports:
+
+- `None`
+- `Replicated`
+- `RepNotify`
+
+#### `SetBlueprintDefault`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "property": "SomeProperty",
+  "value": "SomeImportedTextValue"
+}
+```
+
+### Component/SCS editing
 
 #### `DescribeComponents`
-
-Params:
 
 ```json
 {
@@ -370,11 +473,9 @@ Params:
 }
 ```
 
-Returns Blueprint SCS component names, classes, parent names, root status, and template paths.
+Returns SCS component names, classes, parent names, root status, and template paths.
 
 #### `AddComponent`
-
-Params:
 
 ```json
 {
@@ -385,11 +486,7 @@ Params:
 }
 ```
 
-Creates a Blueprint component node. Omit `parent` to add a root-level component.
-
 #### `AttachComponent`
-
-Params:
 
 ```json
 {
@@ -399,9 +496,16 @@ Params:
 }
 ```
 
-#### `SetComponentTransform`
+#### `SetRootComponent`
 
-Params may include any of `location`, `rotation`, or `scale`:
+```json
+{
+  "asset": "/Game/Path/BP_Actor",
+  "name": "RootComponentName"
+}
+```
+
+#### `SetComponentTransform`
 
 ```json
 {
@@ -415,7 +519,7 @@ Params may include any of `location`, `rotation`, or `scale`:
 
 #### `SetComponentProperty`
 
-Imports a text value into a property on a Blueprint component template.
+Imports a text value into a property on a component template.
 
 ```json
 {
@@ -426,175 +530,90 @@ Imports a text value into a property on a Blueprint component template.
 }
 ```
 
-### Blueprint graph management
+#### Specialized component setters
 
-#### `CreateFunctionGraph`
+- `SetStaticMesh`
+- `SetCollisionProfileName`
+- `SetBoxExtent`
+- `SetGenerateOverlapEvents`
 
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "function": "GetFoo"
-}
-```
-
-Creates a user function graph.
-
-#### `CreateEventGraph`
-
-Params:
+Example:
 
 ```json
 {
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "NewEventGraph"
+  "asset": "/Game/Path/BP_Actor",
+  "name": "CollisionBox",
+  "extent": { "x": 100, "y": 100, "z": 50 }
 }
 ```
 
-Creates an event graph page.
-
-#### `AddFunctionInput`
-
-Params can specify a type directly:
+`SetCollisionProfileName` uses `profile`:
 
 ```json
 {
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "FunctionName",
-  "name": "InputName",
-  "category": "bool"
+  "asset": "/Game/Path/BP_Actor",
+  "name": "CollisionBox",
+  "profile": "OverlapAllDynamic"
 }
 ```
 
-Or copy a type from an existing Blueprint variable:
+### Graph management
 
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "FunctionName",
-  "name": "State",
-  "sourceVariable": "ExampleState"
-}
-```
+- `CreateFunctionGraph`
+- `CreateEventGraph`
+- `DeleteGraph`
+- `RenameGraph`
+- `AddFunctionInput`
+- `AddFunctionOutput`
+- `EditUserDefinedPin`
+- `RenameCustomEvent`
+- `AddVariableGetterFunction`
 
-#### `AddFunctionOutput`
-
-Same params as `AddFunctionInput`, but creates a return/result pin.
-
-#### `DeleteGraph`
-
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "GraphToDelete"
-}
-```
-
-#### `RenameGraph`
-
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "OldName",
-  "newName": "NewName"
-}
-```
+Function input/output pin type params use the same `category`, `subCategory`, `subCategoryObject`, and `containerType` fields as variables.
 
 ### Node creation
 
-All graph node creation commands require:
+Common graph nodes:
 
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "EventGraph",
-  "x": 400,
-  "y": 200
-}
-```
+- `AddVariableGetNode`
+- `AddVariableSetNode`
+- `AddBranchNode`
+- `AddSequenceNode`
+- `AddRerouteNode`
+- `AddCommentNode`
+- `AddEnumEqualityNode`
+- `AddEnumSwitchNode`
+- `AddFunctionCallNode`
+- `AddCustomEventNode`
+- `AddEventNode`
+- `AddDynamicCastNode`
+- `AddSelfNode`
 
-#### `AddVariableGetNode`
+Gameplay/control-flow helpers:
 
-Additional params:
+- `AddSpawnActorNode`
+- `AddComponentEventNode`
+- `AddEventDispatcher`
+- `AddDelegateBindNode`
+- `AddDelegateBroadcastNode`
+- `AddCreateDelegateNode`
+- `SetCreateDelegateFunction`
+- `AddForLoopNode`
+- `AddForEachLoopNode`
+- `AddAuthoritySwitchNode`
+- `AddMakeStructNode`
+- `AddBreakStructNode`
+- `AddTimerNode`
+- `AddLineTraceNode`
+- `AddArrayFunctionNode`
+- `AddMathNode`
 
-```json
-{
-  "variable": "ExampleState"
-}
-```
+UMG/runtime helpers:
 
-#### `AddVariableSetNode`
+- `AddCreateWidgetNode`
+- `AddWidgetFunctionNode`
 
-Additional params:
-
-```json
-{
-  "variable": "ExampleState"
-}
-```
-
-#### `AddBranchNode`
-
-Adds a Branch node.
-
-#### `AddSequenceNode`
-
-Adds a Sequence node.
-
-Optional:
-
-```json
-{
-  "extraOutputs": 1
-}
-```
-
-#### `AddRerouteNode`
-
-Adds a reroute/knot node.
-
-#### `AddCommentNode`
-
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "EventGraph",
-  "x": 100,
-  "y": 100,
-  "width": 400,
-  "height": 200,
-  "text": "Comment text"
-}
-```
-
-#### `AddEnumEqualityNode`
-
-Adds a proper Blueprint `Equal (Enum)` node.
-
-#### `AddEnumSwitchNode`
-
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "EventGraph",
-  "x": 400,
-  "y": 200,
-  "enum": "/Game/Path/EState.EState"
-}
-```
-
-#### `AddFunctionCallNode`
-
-Params:
+Many node creation commands support `pinDefaults`:
 
 ```json
 {
@@ -603,281 +622,368 @@ Params:
   "x": 400,
   "y": 200,
   "functionClass": "/Script/Engine.KismetMathLibrary",
-  "function": "EqualEqual_ByteByte"
+  "function": "Add_IntInt",
+  "pinDefaults": {
+    "B": "1"
+  }
 }
 ```
+
+#### `AddSpawnActorNode`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph",
+  "x": 400,
+  "y": 200,
+  "actorClass": "/Game/Path/BP_Spawned.BP_Spawned_C",
+  "pinDefaults": {
+    "CollisionHandlingOverride": "AlwaysSpawn"
+  }
+}
+```
+
+#### `AddTimerNode`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph",
+  "x": 400,
+  "y": 200,
+  "operation": "SetByFunctionName",
+  "pinDefaults": {
+    "FunctionName": "TickSpawn",
+    "Time": "1.0",
+    "bLooping": "true"
+  }
+}
+```
+
+Supported timer operations:
+
+- `SetByEvent`
+- `SetByFunctionName`
+- `ClearByHandle`
+- `ClearAndInvalidateByHandle`
+
+#### `AddArrayFunctionNode`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph",
+  "x": 400,
+  "y": 200,
+  "operation": "Length"
+}
+```
+
+Supported operations:
+
+- `Add`
+- `AddUnique`
+- `Remove`
+- `RemoveItem`
+- `Clear`
+- `Length`
+- `Get`
+- `Contains`
+
+#### Delegate binding pattern
+
+For context-sensitive `Create Event` nodes, create the node first, connect it to the delegate signature, then set its function:
+
+```json
+{
+  "command": "AddCreateDelegateNode",
+  "params": {
+    "asset": "/Game/Path/BP_Asset",
+    "graph": "EventGraph",
+    "x": 600,
+    "y": 200
+  }
+}
+```
+
+Connect:
+
+```text
+CreateEvent.OutputDelegate -> BindEvent.Delegate
+```
+
+Then call:
+
+```json
+{
+  "command": "SetCreateDelegateFunction",
+  "params": {
+    "asset": "/Game/Path/BP_Asset",
+    "graph": "EventGraph",
+    "node": "CREATE-DELEGATE-NODE-GUID",
+    "function": "HandleEvent"
+  }
+}
+```
+
+This order mirrors Unreal’s context-sensitive delegate validation and avoids invalid `Create Event` nodes.
 
 ### Pin and node editing
 
 #### `ConnectPins`
 
-Params:
-
 ```json
 {
   "asset": "/Game/Path/BP_Asset",
   "graph": "EventGraph",
-  "fromNode": "NODE-GUID",
+  "fromNode": "SOURCE-NODE-GUID",
   "fromPin": "then",
-  "toNode": "NODE-GUID",
+  "toNode": "TARGET-NODE-GUID",
   "toPin": "execute"
 }
 ```
 
-#### `MovePinLinks`
+Pin lookup is direction-aware and accepts normalized aliases for common cases such as:
 
-Moves all links from one pin to another.
+- `False` -> `else`
+- `True` -> `then`
+- `Exec` -> `execute`
+- whitespace/underscore-insensitive names such as `Other Actor` vs `OtherActor`
 
-#### `BreakPinLinks`
+Other editing commands:
 
-Breaks all links from one pin.
+- `MovePinLinks`
+- `BreakPinLinks`
+- `SetPinDefault`
+- `CopyPinType`
+- `SetNodePosition`
+- `DeleteNode`
 
-#### `SetPinDefault`
+### Widget Blueprints and UMG
 
-Params:
-
-```json
-{
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "EventGraph",
-  "node": "NODE-GUID",
-  "pin": "B",
-  "value": "NewEnumerator1"
-}
-```
-
-#### `CopyPinType`
-
-Copies the pin type from one pin to another. Useful for wildcard/enum-aware node setup.
-
-#### `SetNodePosition`
-
-Params:
+#### `DescribeWidgetTree`
 
 ```json
 {
-  "asset": "/Game/Path/BP_Asset",
-  "graph": "EventGraph",
-  "node": "NODE-GUID",
-  "x": 1200,
-  "y": 400
+  "asset": "/Game/Path/WBP_Widget"
 }
 ```
 
-#### `DeleteNode`
-
-Deletes a node by GUID.
-
-### Asset/source control/compile/save
-
-#### `CreateBlueprintAsset`
-
-Creates a new Blueprint asset with the requested native or loaded parent class.
-
-Params:
+#### `AddWidget`
 
 ```json
 {
-  "asset": "/Game/Path/BP_NewAsset",
-  "parentClass": "/Script/Engine.Actor"
+  "asset": "/Game/Path/WBP_Widget",
+  "name": "RootCanvas",
+  "widgetClass": "/Script/UMG.CanvasPanel",
+  "root": true
 }
 ```
 
-#### `DuplicateAsset`
-
-Duplicates an existing editor asset to a new package path. This is useful for creating a new gameplay ability from an existing Blueprint template, including all projectile spawning graphs and defaults.
-
-Params:
+To add to a panel:
 
 ```json
 {
-  "sourceAsset": "/Game/Example/BP_Template",
-  "destAsset": "/Game/Example/BP_NewAsset"
+  "asset": "/Game/Path/WBP_Widget",
+  "name": "TitleText",
+  "widgetClass": "/Script/UMG.TextBlock",
+  "parent": "RootCanvas"
 }
 ```
 
-#### `CheckoutAsset`
-
-Checks out an asset file through Unreal source-control helpers.
-
-#### `CompileBlueprint`
-
-Compiles a Blueprint and returns status:
+#### `SetRootWidget`
 
 ```json
 {
-  "status": "UpToDate"
+  "asset": "/Game/Path/WBP_Widget",
+  "widget": "RootCanvas"
 }
 ```
 
-#### `SaveAsset`
-
-Saves an asset package.
-
-### Blueprint variables/defaults
-
-#### `AddBlueprintVariable`
-
-Params:
+#### `AddWidgetToParent`
 
 ```json
 {
-  "asset": "/Game/Path/BP_Asset",
-  "name": "SomeBool",
-  "category": "bool",
-  "defaultValue": "false"
+  "asset": "/Game/Path/WBP_Widget",
+  "parent": "RootCanvas",
+  "child": "TitleText"
 }
 ```
 
-For object/struct/enum/class variables, provide `subCategoryObject`.
+#### `SetWidgetSlotLayout`
 
-#### `SetBlueprintDefault`
-
-Params:
+Supports Canvas slot position, size, anchors, alignment, and HorizontalBox/VerticalBox slot padding.
 
 ```json
 {
-  "asset": "/Game/Path/BP_Asset",
-  "property": "SomeProperty",
-  "value": "SomeImportedTextValue"
+  "asset": "/Game/Path/WBP_Widget",
+  "widget": "TitleText",
+  "position": { "x": 24, "y": 36 },
+  "size": { "x": 320, "y": 48 },
+  "alignment": { "x": 0.5, "y": 0.5 },
+  "anchors": {
+    "minimumX": 0.5,
+    "minimumY": 0.0,
+    "maximumX": 0.5,
+    "maximumY": 0.0
+  }
 }
 ```
-
-## Example: Duplicate an asset from a template
-
-This sequence creates a new asset by duplicating an existing template, then compiles and saves it if it is a Blueprint:
-
-```json
-{"id":"1","version":1,"command":"DuplicateAsset","params":{"sourceAsset":"/Game/Example/BP_Template","destAsset":"/Game/Example/BP_NewAsset"}}
-```
-
-```json
-{"id":"2","version":1,"command":"CompileBlueprint","params":{"asset":"/Game/Example/BP_NewAsset"}}
-{"id":"3","version":1,"command":"SaveAsset","params":{"asset":"/Game/Example/BP_NewAsset"}}
-```
-
-## Example: Create a variable getter function
-
-This sequence creates a function that returns a Blueprint variable.
-
-```json
-{"id":"1","version":1,"command":"CreateFunctionGraph","params":{"asset":"/Game/BP_Test","function":"GetExampleState"}}
-```
-
-```json
-{"id":"2","version":1,"command":"AddFunctionOutput","params":{"asset":"/Game/BP_Test","graph":"GetExampleState","name":"ExampleState","sourceVariable":"ExampleState"}}
-```
-
-```json
-{"id":"3","version":1,"command":"AddVariableGetNode","params":{"asset":"/Game/BP_Test","graph":"GetExampleState","variable":"ExampleState","x":32,"y":112}}
-```
-
-Then call `DescribeGraph`, find the result node GUID, and connect:
-
-```json
-{"id":"4","version":1,"command":"ConnectPins","params":{"asset":"/Game/BP_Test","graph":"GetExampleState","fromNode":"GET-NODE-GUID","fromPin":"ExampleState","toNode":"RESULT-NODE-GUID","toPin":"ExampleState"}}
-```
-
-Finally:
-
-```json
-{"id":"5","version":1,"command":"CompileBlueprint","params":{"asset":"/Game/BP_Test"}}
-{"id":"6","version":1,"command":"SaveAsset","params":{"asset":"/Game/BP_Test"}}
-```
-
-## Development workflow
-
-When changing the plugin C++:
-
-1. Build the editor target.
-2. Fully restart Unreal Editor.
-3. Test `Ping`.
-4. Test new commands.
-
-A full restart is currently recommended over Live Coding because the plugin owns a long-running named pipe thread and command router state.
 
 ## Examples
 
-Example JSON requests are included in:
+### Create an array variable
 
-```text
-examples/requests/
+```json
+{
+  "id": "1",
+  "version": 1,
+  "command": "AddBlueprintVariable",
+  "params": {
+    "asset": "/Game/Example/BP_Example",
+    "name": "SpawnVolumes",
+    "category": "object",
+    "subCategoryObject": "/Game/Example/BP_SpawnVolume.BP_SpawnVolume_C",
+    "containerType": "Array"
+  }
+}
 ```
 
-Included examples:
+### Create a function getter
 
-- `ping.json`
-- `describe-blueprint.json`
-- `create-function-getter.json`
-
-## Packaging for GitHub
-
-Before publishing this as an external repository, recommended cleanup:
-
-1. Move or include a standalone CLI client.
-2. Add CI or at least documented build commands.
-3. Consider splitting the large module `.cpp` into smaller files.
-4. Add richer compile diagnostics in command responses.
-
-Suggested repo layout:
-
-```text
-K2Bridge/
-  K2Bridge.uplugin
-  README.md
-  LICENSE
-  Source/
-    K2BridgeEditor/
-      K2BridgeEditor.Build.cs
-      Private/
-      Public/
-  Tools/
-    PowerShell/
-      k2bridge.ps1
-  examples/
-    requests/
-      ping.json
-      describe-blueprint.json
-      create-function-getter.json
+```json
+{
+  "id": "1",
+  "version": 1,
+  "command": "CreateFunctionGraph",
+  "params": {
+    "asset": "/Game/BP_Test",
+    "function": "GetExampleState"
+  }
+}
 ```
+
+```json
+{
+  "id": "2",
+  "version": 1,
+  "command": "AddFunctionOutput",
+  "params": {
+    "asset": "/Game/BP_Test",
+    "graph": "GetExampleState",
+    "name": "ExampleState",
+    "sourceVariable": "ExampleState"
+  }
+}
+```
+
+```json
+{
+  "id": "3",
+  "version": 1,
+  "command": "AddVariableGetNode",
+  "params": {
+    "asset": "/Game/BP_Test",
+    "graph": "GetExampleState",
+    "variable": "ExampleState",
+    "x": 32,
+    "y": 112
+  }
+}
+```
+
+Then use `DescribeGraph` to find the result node GUID and connect pins with `ConnectPins`.
+
+## Automation tests
+
+BlueprintBridge includes Unreal automation tests under the `BlueprintBridge` namespace.
+
+Recommended command:
+
+```bash
+D:/Path/To/Engine/Binaries/Win64/UnrealEditor-Cmd.exe \
+  D:/Path/To/YourProject.uproject \
+  -unattended \
+  -nop4 \
+  -nosplash \
+  -NullRHI \
+  -NoRestoreOpenAssetTabs \
+  -ExecCmds="Automation RunTests BlueprintBridge; Quit" \
+  -TestExit="Automation Test Queue Empty" \
+  -ReportOutputPath="D:/Path/To/YourProject/Saved/Automation/BlueprintBridge_All" \
+  -log
+```
+
+`-NoRestoreOpenAssetTabs` is recommended for commandlet runs because restoring editor asset tabs under `-NullRHI` can crash unrelated to the tests.
+
+Current test areas include:
+
+- protocol basics and auth
+- Blueprint inspection and variable references
+- graph/node/pin editing
+- function graph commands
+- custom events and event graphs
+- component editing and specialized setters
+- asset lifecycle/defaults
+- gameplay graph primitives
+- variable flags and container types
+- control-flow helpers
+- extended graph helpers such as arrays, timers, traces, delegates, math, self, and batch requests
+- UMG widget-tree commands
+- asset command error handling
+
+## Development workflow
+
+When changing plugin C++:
+
+1. Build the editor target.
+2. Fully restart Unreal Editor before named-pipe authoring tests.
+3. Test `Ping`.
+4. Exercise the new command with a small throwaway asset.
+5. Run the full `BlueprintBridge` automation suite before considering the milestone complete.
+
+A full editor restart is preferred over Live Coding because the plugin owns long-running named-pipe server state.
 
 ## Security notes
 
-This plugin can modify editor assets. Treat access to the pipe as trusted local automation.
+BlueprintBridge can modify and save editor assets. Treat access to the pipe as trusted local automation.
 
-Recommended before public release:
+Recommended hardening for broader distribution:
 
 - operation logging
 - dry-run support for destructive commands
 - command allowlist/denylist settings
 - explicit save policy
+- stronger auth if exposed beyond local trusted tooling
 
-Do not paste GitHub credentials, tokens, or passwords into an AI chat. When publishing, use GitHub CLI/browser auth locally, or provide a token through a local environment variable or credential manager that is never echoed into logs.
+Do not paste GitHub credentials, tokens, or passwords into AI chats or logs. Use GitHub CLI/browser auth locally or a credential manager.
 
 ## Known limitations
 
 - Windows-only named pipe transport.
-- Auth is simple shared-token auth, not a full security model.
+- Editor-only; not a runtime plugin.
 - One client at a time.
-- Some Blueprint editor behaviors are context-sensitive and may require new primitives.
-- Function graph support is improving but still basic.
-- UMG, Animation Blueprints, Materials, Niagara, Behavior Trees, and State Trees are not covered as separate graph systems yet.
-- The code should be split into smaller files before public release.
+- Auth is simple shared-token auth, not a full security model.
+- Blueprint compiler message collection currently returns a structured placeholder and can be made richer.
+- Some Blueprint node families are highly context-sensitive and may still require specialized commands.
+- UMG support covers initial widget-tree/layout/runtime helpers but not the full UMG authoring surface.
+- Animation Blueprints, Materials, Niagara, Behavior Trees, and State Trees are not covered as separate graph systems yet.
+- The command implementation is still concentrated in a large `.cpp` and should eventually be split by domain.
 
 ## Roadmap
 
-High-value next additions:
+High-value next work:
 
-- richer settings/UI exposure inside the editor
-- file queue fallback transport
-- standalone CLI executable
-- command schema docs/generated docs
+- richer compile diagnostics in command responses
+- split command implementation into smaller source files
+- standalone cross-shell CLI client
+- generated command schema/docs
 - remove/rename Blueprint variables
-- custom event node creation
-- event node creation by function/delegate
-- delegate bind/unbind helpers
-- component/SCS editing
-- UMG widget tree inspection/editing
-- Behavior Tree / StateTree asset operations
-- transaction grouping for multi-command edits
-- better compile diagnostics returned directly from command responses
+- more delegate unbind/clear helpers
+- richer array/map/set graph operations
+- more trace/collision and math node helpers
+- complete runtime UMG construction/property/brush helpers
+- Behavior Tree / StateTree / Animation Blueprint asset operations
+- transaction grouping with optional rollback semantics
+- optional file-queue or socket transport
