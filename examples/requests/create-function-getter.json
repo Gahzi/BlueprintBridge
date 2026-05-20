@@ -1,0 +1,9 @@
+{
+  "id": "create-function-getter-example",
+  "version": 1,
+  "command": "CreateFunctionGraph",
+  "params": {
+    "asset": "/Game/Example/BP_Example",
+    "function": "GetExampleState"
+  }
+}

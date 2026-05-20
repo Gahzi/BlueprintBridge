@@ -1,0 +1,42 @@
+# Unreal generated files
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+.vs/
+.vscode/
+.idea/
+
+# Build products
+*.dll
+*.pdb
+*.lib
+*.exp
+*.obj
+*.o
+*.a
+*.so
+*.dylib
+*.dSYM/
+
+# Unreal local/user files
+*.sln
+*.suo
+*.opensdf
+*.sdf
+*.VC.db
+*.VC.opendb
+*.user
+*.userprefs
+*.DotSettings.user
+
+# Logs/temp
+*.log
+*.tmp
+*.cache
+
+# Credentials / local config
+*.token
+*.secret
+.env
+Saved/BlueprintBridge/

@@ -1,0 +1,6 @@
+{
+  "id": "ping-example",
+  "version": 1,
+  "command": "Ping",
+  "params": {}
+}

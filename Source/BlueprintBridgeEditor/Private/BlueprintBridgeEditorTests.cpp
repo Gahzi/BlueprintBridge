@@ -1,0 +1,1867 @@
+// Copyright Odyssey Interactive. All Rights Reserved.
+
+#if WITH_DEV_AUTOMATION_TESTS
+
+#include "BlueprintBridgeInternal.h"
+
+#include "Blueprint/WidgetTree.h"
+#include "Components/BoxComponent.h"
+#include "Components/CanvasPanel.h"
+#include "Components/CanvasPanelSlot.h"
+#include "Components/SceneComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Components/TextBlock.h"
+#include "EdGraphSchema_K2.h"
+#include "Engine/Blueprint.h"
+#include "Engine/EngineTypes.h"
+#include "Engine/SCS_Node.h"
+#include "Engine/SimpleConstructionScript.h"
+#include "GameFramework/Actor.h"
+#include "GameFramework/Pawn.h"
+#include "K2Node_AddDelegate.h"
+#include "K2Node_ComponentBoundEvent.h"
+#include "K2Node_CustomEvent.h"
+#include "K2Node_DynamicCast.h"
+#include "K2Node_Event.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
+#include "K2Node_MacroInstance.h"
+#include "K2Node_MakeStruct.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_SpawnActorFromClass.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+#include "Misc/AutomationTest.h"
+#include "Serialization/JsonSerializer.h"
+#include "UObject/UnrealType.h"
+#include "WidgetBlueprint.h"
+
+namespace BlueprintBridgeTests
+{
+static constexpr TCHAR AuthSettingsSection[] = TEXT("/Script/BlueprintBridgeEditor.BlueprintBridge");
+
+static FString JsonToString(const TSharedRef<FJsonObject>& JsonObject)
+{
+	FString Output;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Output);
+	FJsonSerializer::Serialize(JsonObject, Writer);
+	return Output;
+}
+
+static TSharedRef<FJsonObject> MakeRequest(const FString& Command, const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedRef<FJsonObject> Request = MakeShared<FJsonObject>();
+	Request->SetStringField(TEXT("id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens));
+	Request->SetNumberField(TEXT("version"), 1);
+	Request->SetStringField(TEXT("command"), Command);
+	Request->SetObjectField(TEXT("params"), Params.IsValid() ? Params.ToSharedRef() : MakeShared<FJsonObject>());
+	return Request;
+}
+
+static TSharedRef<FJsonObject> ExecuteJsonRequest(const FString& Command, const TSharedPtr<FJsonObject>& Params)
+{
+	return BlueprintBridge::ExecuteRequest(JsonToString(MakeRequest(Command, Params)));
+}
+
+static bool ExpectSuccess(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
+{
+	bool bOk = false;
+	if (!Response->TryGetBoolField(TEXT("ok"), bOk) || !bOk)
+	{
+		const TSharedPtr<FJsonObject>* ErrorObject = nullptr;
+		FString ErrorCode;
+		FString ErrorMessage;
+		if (Response->TryGetObjectField(TEXT("error"), ErrorObject) && ErrorObject != nullptr && ErrorObject->IsValid())
+		{
+			(*ErrorObject)->TryGetStringField(TEXT("code"), ErrorCode);
+			(*ErrorObject)->TryGetStringField(TEXT("message"), ErrorMessage);
+			Test.AddError(FString::Printf(TEXT("Bridge request failed with %s: %s"), *ErrorCode, *ErrorMessage));
+		}
+
+		Test.TestTrue(TEXT("Response should contain ok=true."), false);
+		return false;
+	}
+
+	return Test.TestTrue(TEXT("Response should contain result."), Response->HasField(TEXT("result")));
+}
+
+static bool ExpectErrorCode(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response, const FString& ExpectedCode)
+{
+	bool bOk = true;
+	Test.TestTrue(TEXT("Response should contain ok=false."), Response->TryGetBoolField(TEXT("ok"), bOk) && !bOk);
+
+	const TSharedPtr<FJsonObject>* ErrorObject = nullptr;
+	if (!Test.TestTrue(TEXT("Response should contain error object."), Response->TryGetObjectField(TEXT("error"), ErrorObject) && ErrorObject != nullptr && ErrorObject->IsValid()))
+	{
+		return false;
+	}
+
+	FString ActualCode;
+	if (!Test.TestTrue(TEXT("Error should contain code."), (*ErrorObject)->TryGetStringField(TEXT("code"), ActualCode)))
+	{
+		return false;
+	}
+
+	return Test.TestEqual(TEXT("Error code should match."), ActualCode, ExpectedCode);
+}
+
+static const TSharedPtr<FJsonObject>* GetResultObject(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
+{
+	const TSharedPtr<FJsonObject>* ResultObject = nullptr;
+	Test.TestTrue(TEXT("Result should be an object."), Response->TryGetObjectField(TEXT("result"), ResultObject) && ResultObject != nullptr && ResultObject->IsValid());
+	return ResultObject;
+}
+
+static FString GetStringResult(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
+{
+	FString Result;
+	Test.TestTrue(TEXT("Result should be a string."), Response->TryGetStringField(TEXT("result"), Result));
+	return Result;
+}
+
+static const TSharedPtr<FJsonObject>* GetNodeObjectFromResponse(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
+{
+	const TSharedPtr<FJsonObject>* ResultObject = GetResultObject(Test, Response);
+	if (!ResultObject)
+	{
+		return nullptr;
+	}
+
+	const TSharedPtr<FJsonObject>* NodeObject = nullptr;
+	Test.TestTrue(TEXT("Result should contain a node object."), (*ResultObject)->TryGetObjectField(TEXT("node"), NodeObject) && NodeObject != nullptr && NodeObject->IsValid());
+	return NodeObject;
+}
+
+static FString GetNodeGuid(FAutomationTestBase& Test, const TSharedPtr<FJsonObject>& NodeObject)
+{
+	FString Guid;
+	if (NodeObject.IsValid())
+	{
+		Test.TestTrue(TEXT("Node object should contain guid."), NodeObject->TryGetStringField(TEXT("guid"), Guid));
+	}
+	return Guid;
+}
+
+static const TArray<TSharedPtr<FJsonValue>>* GetNodePins(FAutomationTestBase& Test, const TSharedPtr<FJsonObject>& NodeObject)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+	if (NodeObject.IsValid())
+	{
+		Test.TestTrue(TEXT("Node object should contain pins."), NodeObject->TryGetArrayField(TEXT("pins"), Pins) && Pins != nullptr);
+	}
+	return Pins;
+}
+
+static TSharedPtr<FJsonObject> FindPinObjectByName(const TSharedPtr<FJsonObject>& NodeObject, const FString& PinName)
+{
+	if (!NodeObject.IsValid())
+	{
+		return nullptr;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+	if (!NodeObject->TryGetArrayField(TEXT("pins"), Pins) || Pins == nullptr)
+	{
+		return nullptr;
+	}
+
+	for (const TSharedPtr<FJsonValue>& PinValue : *Pins)
+	{
+		const TSharedPtr<FJsonObject>* PinObject = nullptr;
+		if (!PinValue.IsValid() || !PinValue->TryGetObject(PinObject) || PinObject == nullptr || !PinObject->IsValid())
+		{
+			continue;
+		}
+
+		FString CurrentPinName;
+		if ((*PinObject)->TryGetStringField(TEXT("name"), CurrentPinName) && CurrentPinName == PinName)
+		{
+			return *PinObject;
+		}
+	}
+
+	return nullptr;
+}
+
+static FString FindPinName(const TSharedPtr<FJsonObject>& NodeObject, const FString& Direction, const FString& Category = FString(), const FString& NameContains = FString())
+{
+	if (!NodeObject.IsValid())
+	{
+		return FString();
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+	if (!NodeObject->TryGetArrayField(TEXT("pins"), Pins) || Pins == nullptr)
+	{
+		return FString();
+	}
+
+	for (const TSharedPtr<FJsonValue>& PinValue : *Pins)
+	{
+		const TSharedPtr<FJsonObject>* PinObject = nullptr;
+		if (!PinValue.IsValid() || !PinValue->TryGetObject(PinObject) || PinObject == nullptr || !PinObject->IsValid())
+		{
+			continue;
+		}
+
+		FString CurrentDirection;
+		FString CurrentCategory;
+		FString CurrentName;
+		(*PinObject)->TryGetStringField(TEXT("direction"), CurrentDirection);
+		(*PinObject)->TryGetStringField(TEXT("category"), CurrentCategory);
+		(*PinObject)->TryGetStringField(TEXT("name"), CurrentName);
+
+		if (!Direction.IsEmpty() && CurrentDirection != Direction)
+		{
+			continue;
+		}
+		if (!Category.IsEmpty() && CurrentCategory != Category)
+		{
+			continue;
+		}
+		if (!NameContains.IsEmpty() && !CurrentName.Contains(NameContains))
+		{
+			continue;
+		}
+
+		return CurrentName;
+	}
+
+	return FString();
+}
+
+static bool PinLinksToNode(const TSharedPtr<FJsonObject>& NodeObject, const FString& PinName, const FString& LinkedNodeGuid)
+{
+	const TSharedPtr<FJsonObject> PinObject = FindPinObjectByName(NodeObject, PinName);
+	if (!PinObject.IsValid())
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* LinkedTo = nullptr;
+	if (!PinObject->TryGetArrayField(TEXT("linkedTo"), LinkedTo) || LinkedTo == nullptr)
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& LinkValue : *LinkedTo)
+	{
+		const TSharedPtr<FJsonObject>* LinkObject = nullptr;
+		if (!LinkValue.IsValid() || !LinkValue->TryGetObject(LinkObject) || LinkObject == nullptr || !LinkObject->IsValid())
+		{
+			continue;
+		}
+
+		FString NodeGuid;
+		if ((*LinkObject)->TryGetStringField(TEXT("nodeGuid"), NodeGuid) && NodeGuid == LinkedNodeGuid)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+class FScopedAuthSettings final
+{
+public:
+	FScopedAuthSettings(bool bInRequireAuthToken, const FString& InAuthToken)
+	{
+		bHadRequireAuthToken = GConfig->GetBool(AuthSettingsSection, TEXT("bRequireAuthToken"), bOriginalRequireAuthToken, GEditorPerProjectIni);
+		bHadAuthToken = GConfig->GetString(AuthSettingsSection, TEXT("AuthToken"), OriginalAuthToken, GEditorPerProjectIni);
+
+		GConfig->SetBool(AuthSettingsSection, TEXT("bRequireAuthToken"), bInRequireAuthToken, GEditorPerProjectIni);
+		GConfig->SetString(AuthSettingsSection, TEXT("AuthToken"), *InAuthToken, GEditorPerProjectIni);
+		GConfig->Flush(false, GEditorPerProjectIni);
+	}
+
+	~FScopedAuthSettings()
+	{
+		if (bHadRequireAuthToken)
+		{
+			GConfig->SetBool(AuthSettingsSection, TEXT("bRequireAuthToken"), bOriginalRequireAuthToken, GEditorPerProjectIni);
+		}
+		else
+		{
+			GConfig->RemoveKey(AuthSettingsSection, TEXT("bRequireAuthToken"), GEditorPerProjectIni);
+		}
+
+		if (bHadAuthToken)
+		{
+			GConfig->SetString(AuthSettingsSection, TEXT("AuthToken"), *OriginalAuthToken, GEditorPerProjectIni);
+		}
+		else
+		{
+			GConfig->RemoveKey(AuthSettingsSection, TEXT("AuthToken"), GEditorPerProjectIni);
+		}
+
+		GConfig->Flush(false, GEditorPerProjectIni);
+	}
+
+private:
+	bool bHadRequireAuthToken = false;
+	bool bOriginalRequireAuthToken = false;
+	bool bHadAuthToken = false;
+	FString OriginalAuthToken;
+};
+
+struct FTestBlueprintAsset
+{
+	FString AssetPath;
+	TObjectPtr<UBlueprint> Blueprint = nullptr;
+};
+
+static UEdGraph* FindBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName)
+{
+	if (!Blueprint)
+	{
+		return nullptr;
+	}
+
+	for (UEdGraph* Graph : Blueprint->UbergraphPages)
+	{
+		if (Graph && Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
+		{
+			return Graph;
+		}
+	}
+
+	for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+	{
+		if (Graph && Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
+		{
+			return Graph;
+		}
+	}
+
+	for (UEdGraph* Graph : Blueprint->DelegateSignatureGraphs)
+	{
+		if (Graph && Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
+		{
+			return Graph;
+		}
+	}
+
+	return nullptr;
+}
+
+static FString GetPrimaryEventGraphName(UBlueprint* Blueprint)
+{
+	return Blueprint && Blueprint->UbergraphPages.Num() > 0 && Blueprint->UbergraphPages[0] ? Blueprint->UbergraphPages[0]->GetName() : TEXT("EventGraph");
+}
+
+static FTestBlueprintAsset CreateTestBlueprint(FAutomationTestBase& Test, const FString& Suffix)
+{
+	const FString AssetName = FString::Printf(TEXT("BP_BridgeTest_%s_%s"), *Suffix, *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString AssetPath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *AssetName);
+
+	UPackage* Package = CreatePackage(*AssetPath);
+	Test.TestNotNull(TEXT("CreatePackage should succeed."), Package);
+
+	UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
+		AActor::StaticClass(),
+		Package,
+		FName(*AssetName),
+		BPTYPE_Normal,
+		UBlueprint::StaticClass(),
+		UBlueprintGeneratedClass::StaticClass(),
+		TEXT("BlueprintBridgeTests"));
+	Test.TestNotNull(TEXT("CreateBlueprint should succeed."), Blueprint);
+
+	if (Blueprint)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	}
+
+	return { AssetPath, Blueprint };
+}
+
+static TSharedRef<FJsonObject> MakeAssetParams(const FString& AssetPath)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("asset"), AssetPath);
+	return Params;
+}
+
+static TSharedRef<FJsonObject> MakeGraphParams(const FString& AssetPath, const FString& GraphName)
+{
+	TSharedRef<FJsonObject> Params = MakeAssetParams(AssetPath);
+	Params->SetStringField(TEXT("graph"), GraphName);
+	return Params;
+}
+
+static TSharedRef<FJsonObject> DescribeGraphRequest(const FString& AssetPath, const FString& GraphName)
+{
+	return ExecuteJsonRequest(TEXT("DescribeGraph"), MakeGraphParams(AssetPath, GraphName));
+}
+
+static TSharedRef<FJsonObject> DescribeNodeRequest(const FString& AssetPath, const FString& GraphName, const FString& NodeGuid)
+{
+	TSharedRef<FJsonObject> Params = MakeGraphParams(AssetPath, GraphName);
+	Params->SetStringField(TEXT("node"), NodeGuid);
+	return ExecuteJsonRequest(TEXT("DescribeNode"), Params);
+}
+
+static TSharedRef<FJsonObject> CompileBlueprintRequest(const FString& AssetPath)
+{
+	return ExecuteJsonRequest(TEXT("CompileBlueprint"), MakeAssetParams(AssetPath));
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgePingTest, "BlueprintBridge.Protocol.Ping", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgePingTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Ping"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	return TestEqual(TEXT("Ping should return Pong."), BlueprintBridgeTests::GetStringResult(*this, Response), FString(TEXT("Pong")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeEditorInfoTest, "BlueprintBridge.Protocol.EditorInfo", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeEditorInfoTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> ProjectResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GetProjectName"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, ProjectResponse))
+	{
+		return false;
+	}
+	TestFalse(TEXT("Project name should not be empty."), BlueprintBridgeTests::GetStringResult(*this, ProjectResponse).IsEmpty());
+
+	const TSharedRef<FJsonObject> VersionResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GetEngineVersion"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, VersionResponse))
+	{
+		return false;
+	}
+	TestFalse(TEXT("Engine version should not be empty."), BlueprintBridgeTests::GetStringResult(*this, VersionResponse).IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeInvalidJsonTest, "BlueprintBridge.Protocol.InvalidJson", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeInvalidJsonTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> Response = BlueprintBridge::ExecuteRequest(TEXT("not-json"));
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("InvalidJson"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeUnknownCommandTest, "BlueprintBridge.Protocol.UnknownCommand", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeUnknownCommandTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DefinitelyUnknownCommand"), MakeShared<FJsonObject>());
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("UnknownCommand"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeUnauthorizedTest, "BlueprintBridge.Protocol.Unauthorized", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeUnauthorizedTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FScopedAuthSettings ScopedAuthSettings(true, TEXT("bridge-test-token"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Ping"), MakeShared<FJsonObject>());
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("Unauthorized"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeInspectionAndVariableReferenceTest, "BlueprintBridge.Blueprint.InspectionAndVariableReferences", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeInspectionAndVariableReferenceTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Inspect"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DescribeBlueprintParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	const TSharedRef<FJsonObject> DescribeBlueprintResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), DescribeBlueprintParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeBlueprintResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* BlueprintResult = BlueprintBridgeTests::GetResultObject(*this, DescribeBlueprintResponse);
+	if (!BlueprintResult)
+	{
+		return false;
+	}
+	TestTrue(TEXT("DescribeBlueprint should include variables."), (*BlueprintResult)->HasTypedField<EJson::Array>(TEXT("variables")));
+	TestTrue(TEXT("DescribeBlueprint should include graphs."), (*BlueprintResult)->HasTypedField<EJson::Array>(TEXT("graphs")));
+
+	TSharedRef<FJsonObject> AddGetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddGetParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	AddGetParams->SetNumberField(TEXT("x"), 100);
+	AddGetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> AddGetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetNode"), AddGetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddGetResponse))
+	{
+		return false;
+	}
+	const FString GetNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddGetResponse));
+
+	TSharedRef<FJsonObject> AddSetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddSetParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	AddSetParams->SetNumberField(TEXT("x"), 360);
+	AddSetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> AddSetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableSetNode"), AddSetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddSetResponse))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DescribeGraphResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, EventGraphName);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeGraphResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GraphResult = BlueprintBridgeTests::GetResultObject(*this, DescribeGraphResponse);
+	if (!GraphResult)
+	{
+		return false;
+	}
+	TestTrue(TEXT("DescribeGraph should include nodes."), (*GraphResult)->HasTypedField<EJson::Array>(TEXT("nodes")));
+
+	const TSharedRef<FJsonObject> DescribeNodeResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, GetNodeGuid);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeNodeResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> FindNodesParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	FindNodesParams->SetStringField(TEXT("graph"), EventGraphName);
+	FindNodesParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	const TSharedRef<FJsonObject> FindNodesResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindNodes"), FindNodesParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, FindNodesResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FindNodesResult = BlueprintBridgeTests::GetResultObject(*this, FindNodesResponse);
+	if (!FindNodesResult)
+	{
+		return false;
+	}
+	const TArray<TSharedPtr<FJsonValue>>* FoundNodes = nullptr;
+	TestTrue(TEXT("FindNodes should return a nodes array."), (*FindNodesResult)->TryGetArrayField(TEXT("nodes"), FoundNodes) && FoundNodes != nullptr);
+	TestTrue(TEXT("FindNodes should find at least two Health nodes."), FoundNodes && FoundNodes->Num() >= 2);
+
+	TSharedRef<FJsonObject> FindRefsParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	FindRefsParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	const TSharedRef<FJsonObject> FindRefsResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindVariableReferences"), FindRefsParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, FindRefsResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FindRefsResult = BlueprintBridgeTests::GetResultObject(*this, FindRefsResponse);
+	if (!FindRefsResult)
+	{
+		return false;
+	}
+	const TArray<TSharedPtr<FJsonValue>>* References = nullptr;
+	TestTrue(TEXT("FindVariableReferences should return references."), (*FindRefsResult)->TryGetArrayField(TEXT("references"), References) && References != nullptr);
+	TestTrue(TEXT("FindVariableReferences should find at least two references."), References && References->Num() >= 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeGraphNodeCommandTest, "BlueprintBridge.Blueprint.GraphNodeCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeGraphNodeCommandTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Nodes"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> BranchParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	BranchParams->SetNumberField(TEXT("x"), 100);
+	BranchParams->SetNumberField(TEXT("y"), 50);
+	const TSharedRef<FJsonObject> BranchResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBranchNode"), BranchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BranchResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CommentParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	CommentParams->SetStringField(TEXT("text"), TEXT("Bridge comment"));
+	CommentParams->SetNumberField(TEXT("x"), 40);
+	CommentParams->SetNumberField(TEXT("y"), 300);
+	CommentParams->SetNumberField(TEXT("width"), 500);
+	CommentParams->SetNumberField(TEXT("height"), 220);
+	const TSharedRef<FJsonObject> CommentResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddCommentNode"), CommentParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, CommentResponse))
+	{
+		return false;
+	}
+	const FString CommentNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *BlueprintBridgeTests::GetNodeObjectFromResponse(*this, CommentResponse));
+
+	TSharedRef<FJsonObject> RerouteParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	RerouteParams->SetNumberField(TEXT("x"), 600);
+	RerouteParams->SetNumberField(TEXT("y"), 80);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddRerouteNode"), RerouteParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SequenceParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	SequenceParams->SetNumberField(TEXT("x"), 820);
+	SequenceParams->SetNumberField(TEXT("y"), 40);
+	SequenceParams->SetNumberField(TEXT("extraOutputs"), 1);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddSequenceNode"), SequenceParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> EnumEqualityParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	EnumEqualityParams->SetNumberField(TEXT("x"), 1000);
+	EnumEqualityParams->SetNumberField(TEXT("y"), 220);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddEnumEqualityNode"), EnumEqualityParams)))
+	{
+		return false;
+	}
+
+	UEnum* NetRoleEnum = StaticEnum<ENetRole>();
+	TestNotNull(TEXT("ENetRole enum should exist."), NetRoleEnum);
+	TSharedRef<FJsonObject> EnumSwitchParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	EnumSwitchParams->SetStringField(TEXT("enum"), NetRoleEnum ? NetRoleEnum->GetPathName() : TEXT("/Script/Engine.ENetRole"));
+	EnumSwitchParams->SetNumberField(TEXT("x"), 1200);
+	EnumSwitchParams->SetNumberField(TEXT("y"), 220);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddEnumSwitchNode"), EnumSwitchParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CallNodeParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	CallNodeParams->SetStringField(TEXT("functionClass"), UKismetMathLibrary::StaticClass()->GetPathName());
+	CallNodeParams->SetStringField(TEXT("function"), TEXT("EqualEqual_IntInt"));
+	CallNodeParams->SetNumberField(TEXT("x"), 1400);
+	CallNodeParams->SetNumberField(TEXT("y"), 200);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddFunctionCallNode"), CallNodeParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> PositionParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	PositionParams->SetStringField(TEXT("node"), CommentNodeGuid);
+	PositionParams->SetNumberField(TEXT("x"), 222);
+	PositionParams->SetNumberField(TEXT("y"), 444);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetNodePosition"), PositionParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> PositionedCommentResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, CommentNodeGuid);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PositionedCommentResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* PositionedCommentResult = BlueprintBridgeTests::GetResultObject(*this, PositionedCommentResponse);
+	if (!PositionedCommentResult)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* CommentNodeObject = nullptr;
+	TestTrue(TEXT("DescribeNode should return a node object."), (*PositionedCommentResult)->TryGetObjectField(TEXT("node"), CommentNodeObject) && CommentNodeObject != nullptr && CommentNodeObject->IsValid());
+	if (CommentNodeObject && *CommentNodeObject)
+	{
+		double X = 0.0;
+		double Y = 0.0;
+		(*CommentNodeObject)->TryGetNumberField(TEXT("x"), X);
+		(*CommentNodeObject)->TryGetNumberField(TEXT("y"), Y);
+		TestEqual(TEXT("Comment node X should update."), static_cast<int32>(X), 222);
+		TestEqual(TEXT("Comment node Y should update."), static_cast<int32>(Y), 444);
+	}
+
+	TSharedRef<FJsonObject> DeleteNodeParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	DeleteNodeParams->SetStringField(TEXT("node"), CommentNodeGuid);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DeleteNode"), DeleteNodeParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DeletedNodeResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, CommentNodeGuid);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, DeletedNodeResponse, TEXT("NodeNotFound"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgePinEditingCommandTest, "BlueprintBridge.Blueprint.PinEditingCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgePinEditingCommandTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Pins"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddGetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddGetParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	AddGetParams->SetNumberField(TEXT("x"), 100);
+	AddGetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> AddGetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetNode"), AddGetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddGetResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GetNodeObject = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddGetResponse);
+	if (!GetNodeObject)
+	{
+		return false;
+	}
+	const FString GetNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *GetNodeObject);
+	const FString GetOutputPinName = BlueprintBridgeTests::FindPinName(*GetNodeObject, TEXT("Output"), TEXT("int"), TEXT("Health"));
+
+	TSharedRef<FJsonObject> AddCallParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddCallParams->SetStringField(TEXT("functionClass"), UKismetMathLibrary::StaticClass()->GetPathName());
+	AddCallParams->SetStringField(TEXT("function"), TEXT("EqualEqual_IntInt"));
+	AddCallParams->SetNumberField(TEXT("x"), 420);
+	AddCallParams->SetNumberField(TEXT("y"), 90);
+	const TSharedRef<FJsonObject> AddCallResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddFunctionCallNode"), AddCallParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddCallResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* CallNodeObject = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddCallResponse);
+	if (!CallNodeObject)
+	{
+		return false;
+	}
+	const FString CallNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *CallNodeObject);
+	const FString InputAPin = BlueprintBridgeTests::FindPinName(*CallNodeObject, TEXT("Input"), TEXT("int"), TEXT("A"));
+	const FString InputBPin = BlueprintBridgeTests::FindPinName(*CallNodeObject, TEXT("Input"), TEXT("int"), TEXT("B"));
+
+	TSharedRef<FJsonObject> ConnectParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ConnectParams->SetStringField(TEXT("fromNode"), GetNodeGuid);
+	ConnectParams->SetStringField(TEXT("fromPin"), GetOutputPinName);
+	ConnectParams->SetStringField(TEXT("toNode"), CallNodeGuid);
+	ConnectParams->SetStringField(TEXT("toPin"), InputAPin);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ConnectPins"), ConnectParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SetDefaultParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	SetDefaultParams->SetStringField(TEXT("node"), CallNodeGuid);
+	SetDefaultParams->SetStringField(TEXT("pin"), InputBPin);
+	SetDefaultParams->SetStringField(TEXT("value"), TEXT("5"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetPinDefault"), SetDefaultParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> MoveParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	MoveParams->SetStringField(TEXT("fromNode"), CallNodeGuid);
+	MoveParams->SetStringField(TEXT("fromPin"), InputAPin);
+	MoveParams->SetStringField(TEXT("toNode"), CallNodeGuid);
+	MoveParams->SetStringField(TEXT("toPin"), InputBPin);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("MovePinLinks"), MoveParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> AfterMoveDescribeResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, CallNodeGuid);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AfterMoveDescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* AfterMoveResult = BlueprintBridgeTests::GetResultObject(*this, AfterMoveDescribeResponse);
+	if (!AfterMoveResult)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* AfterMoveNodeObject = nullptr;
+	TestTrue(TEXT("DescribeNode should return node object after move."), (*AfterMoveResult)->TryGetObjectField(TEXT("node"), AfterMoveNodeObject) && AfterMoveNodeObject != nullptr && AfterMoveNodeObject->IsValid());
+	if (AfterMoveNodeObject && *AfterMoveNodeObject)
+	{
+		TestFalse(TEXT("Input A should no longer link to the getter node after MovePinLinks."), BlueprintBridgeTests::PinLinksToNode(*AfterMoveNodeObject, InputAPin, GetNodeGuid));
+		TestTrue(TEXT("Input B should link to the getter node after MovePinLinks."), BlueprintBridgeTests::PinLinksToNode(*AfterMoveNodeObject, InputBPin, GetNodeGuid));
+	}
+
+	TSharedRef<FJsonObject> BreakParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	BreakParams->SetStringField(TEXT("node"), CallNodeGuid);
+	BreakParams->SetStringField(TEXT("pin"), InputBPin);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("BreakPinLinks"), BreakParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddRerouteParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddRerouteParams->SetNumberField(TEXT("x"), 760);
+	AddRerouteParams->SetNumberField(TEXT("y"), 90);
+	const TSharedRef<FJsonObject> AddRerouteResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddRerouteNode"), AddRerouteParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddRerouteResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* RerouteNodeObject = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddRerouteResponse);
+	if (!RerouteNodeObject)
+	{
+		return false;
+	}
+	const FString RerouteNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *RerouteNodeObject);
+	const FString RerouteInputPin = BlueprintBridgeTests::FindPinName(*RerouteNodeObject, TEXT("Input"));
+
+	TSharedRef<FJsonObject> CopyTypeParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	CopyTypeParams->SetStringField(TEXT("fromNode"), CallNodeGuid);
+	CopyTypeParams->SetStringField(TEXT("fromPin"), InputAPin);
+	CopyTypeParams->SetStringField(TEXT("toNode"), RerouteNodeGuid);
+	CopyTypeParams->SetStringField(TEXT("toPin"), RerouteInputPin);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CopyPinType"), CopyTypeParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> RerouteDescribeResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, RerouteNodeGuid);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, RerouteDescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* RerouteDescribeResult = BlueprintBridgeTests::GetResultObject(*this, RerouteDescribeResponse);
+	if (!RerouteDescribeResult)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* RerouteDescribeNode = nullptr;
+	TestTrue(TEXT("DescribeNode should return reroute node."), (*RerouteDescribeResult)->TryGetObjectField(TEXT("node"), RerouteDescribeNode) && RerouteDescribeNode != nullptr && RerouteDescribeNode->IsValid());
+	if (RerouteDescribeNode && *RerouteDescribeNode)
+	{
+		const TSharedPtr<FJsonObject> PinObject = BlueprintBridgeTests::FindPinObjectByName(*RerouteDescribeNode, RerouteInputPin);
+		if (PinObject.IsValid())
+		{
+			FString Category;
+			PinObject->TryGetStringField(TEXT("category"), Category);
+			TestEqual(TEXT("CopyPinType should make the reroute pin an int pin."), Category, FString(TEXT("int")));
+		}
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFunctionGraphCommandTest, "BlueprintBridge.Blueprint.FunctionGraphCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFunctionGraphCommandTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Functions"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CreateFunctionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateFunctionParams->SetStringField(TEXT("function"), TEXT("BridgeFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateFunctionParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddInputParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeFunction"));
+	AddInputParams->SetStringField(TEXT("name"), TEXT("Enabled"));
+	AddInputParams->SetStringField(TEXT("category"), TEXT("bool"));
+	const TSharedRef<FJsonObject> AddInputResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddFunctionInput"), AddInputParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddInputResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* EntryNodeObject = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddInputResponse);
+	if (!EntryNodeObject)
+	{
+		return false;
+	}
+	const FString EntryNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *EntryNodeObject);
+	const FString EntryPinName = BlueprintBridgeTests::FindPinName(*EntryNodeObject, TEXT("Output"), TEXT("bool"), TEXT("Enabled"));
+
+	TSharedRef<FJsonObject> AddOutputParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeFunction"));
+	AddOutputParams->SetStringField(TEXT("name"), TEXT("HealthOut"));
+	AddOutputParams->SetStringField(TEXT("sourceVariable"), TEXT("Health"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddFunctionOutput"), AddOutputParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> EditPinParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeFunction"));
+	EditPinParams->SetStringField(TEXT("node"), EntryNodeGuid);
+	EditPinParams->SetStringField(TEXT("pin"), EntryPinName.IsEmpty() ? TEXT("Enabled") : EntryPinName);
+	EditPinParams->SetStringField(TEXT("newName"), TEXT("bEnabled"));
+	EditPinParams->SetStringField(TEXT("category"), TEXT("bool"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("EditUserDefinedPin"), EditPinParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DescribeFunctionGraphResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("BridgeFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeFunctionGraphResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> RenameGraphParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	RenameGraphParams->SetStringField(TEXT("graph"), TEXT("BridgeFunction"));
+	RenameGraphParams->SetStringField(TEXT("newName"), TEXT("BridgeFunctionRenamed"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RenameGraph"), RenameGraphParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> RenamedGraphDescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("BridgeFunctionRenamed"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, RenamedGraphDescribeResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> GetterFunctionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	GetterFunctionParams->SetStringField(TEXT("function"), TEXT("GetHealthViaBridge"));
+	GetterFunctionParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	const TSharedRef<FJsonObject> GetterFunctionResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetterFunction"), GetterFunctionParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, GetterFunctionResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GetterFunctionResult = BlueprintBridgeTests::GetResultObject(*this, GetterFunctionResponse);
+	if (!GetterFunctionResult)
+	{
+		return false;
+	}
+	FString CompileStatus;
+	TestTrue(TEXT("AddVariableGetterFunction should include compileStatus."), (*GetterFunctionResult)->TryGetStringField(TEXT("compileStatus"), CompileStatus));
+	TestTrue(TEXT("Getter function should compile successfully."), CompileStatus == TEXT("UpToDate") || CompileStatus == TEXT("UpToDateWithWarnings"));
+
+	TSharedRef<FJsonObject> DeleteGraphParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	DeleteGraphParams->SetStringField(TEXT("graph"), TEXT("BridgeFunctionRenamed"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DeleteGraph"), DeleteGraphParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DeletedGraphDescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("BridgeFunctionRenamed"));
+	return BlueprintBridgeTests::ExpectErrorCode(*this, DeletedGraphDescribeResponse, TEXT("GraphNotFound"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCustomEventAndEventGraphCommandTest, "BlueprintBridge.Blueprint.CustomEventAndEventGraphCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCustomEventAndEventGraphCommandTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Events"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CreateEventGraphParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateEventGraphParams->SetStringField(TEXT("graph"), TEXT("BridgeEvents"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateEventGraph"), CreateEventGraphParams)))
+	{
+		return false;
+	}
+
+	UEdGraph* EventGraph = BlueprintBridgeTests::FindBlueprintGraph(Asset.Blueprint, TEXT("BridgeEvents"));
+	TestNotNull(TEXT("BridgeEvents graph should exist."), EventGraph);
+	if (!EventGraph)
+	{
+		return false;
+	}
+
+	FGraphNodeCreator<UK2Node_CustomEvent> NodeCreator(*EventGraph);
+	UK2Node_CustomEvent* EventNode = NodeCreator.CreateNode();
+	EventNode->CustomFunctionName = TEXT("OldBridgeEvent");
+	EventNode->NodePosX = 100;
+	EventNode->NodePosY = 100;
+	NodeCreator.Finalize();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> RenameEventParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeEvents"));
+	RenameEventParams->SetStringField(TEXT("node"), EventNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+	RenameEventParams->SetStringField(TEXT("newName"), TEXT("RenamedBridgeEvent"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RenameCustomEvent"), RenameEventParams)))
+	{
+		return false;
+	}
+
+	return TestTrue(TEXT("RenameCustomEvent should rename the custom event close to the requested name."), EventNode->CustomFunctionName.ToString().StartsWith(TEXT("RenamedBridgeEvent")));
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeComponentEditingTest, "BlueprintBridge.Blueprint.ComponentEditing", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeComponentEditingTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Components"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddRootParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddRootParams->SetStringField(TEXT("name"), TEXT("BridgeRoot"));
+	AddRootParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.SceneComponent"));
+	const TSharedRef<FJsonObject> AddRootResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddRootParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddRootResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddChildParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddChildParams->SetStringField(TEXT("name"), TEXT("BridgeChild"));
+	AddChildParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.SceneComponent"));
+	AddChildParams->SetStringField(TEXT("parent"), TEXT("BridgeRoot"));
+	const TSharedRef<FJsonObject> AddChildResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddChildParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddChildResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> TransformParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	TransformParams->SetStringField(TEXT("name"), TEXT("BridgeChild"));
+	TSharedRef<FJsonObject> Location = MakeShared<FJsonObject>();
+	Location->SetNumberField(TEXT("x"), 10.0);
+	Location->SetNumberField(TEXT("y"), 20.0);
+	Location->SetNumberField(TEXT("z"), 30.0);
+	TransformParams->SetObjectField(TEXT("location"), Location);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetComponentTransform"), TransformParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> PropertyParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	PropertyParams->SetStringField(TEXT("name"), TEXT("BridgeChild"));
+	PropertyParams->SetStringField(TEXT("property"), TEXT("bHiddenInGame"));
+	PropertyParams->SetStringField(TEXT("value"), TEXT("true"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetComponentProperty"), PropertyParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeComponents"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+
+	USimpleConstructionScript* SCS = Asset.Blueprint->SimpleConstructionScript;
+	TestNotNull(TEXT("Blueprint should have an SCS."), SCS);
+	if (!SCS)
+	{
+		return false;
+	}
+
+	USCS_Node* ChildNode = nullptr;
+	for (USCS_Node* Node : SCS->GetAllNodes())
+	{
+		if (Node && Node->GetVariableName() == TEXT("BridgeChild"))
+		{
+			ChildNode = Node;
+			break;
+		}
+	}
+
+	TestNotNull(TEXT("Child component should exist."), ChildNode);
+	USceneComponent* ChildTemplate = ChildNode ? Cast<USceneComponent>(ChildNode->ComponentTemplate) : nullptr;
+	TestNotNull(TEXT("Child component template should be a scene component."), ChildTemplate);
+	if (!ChildTemplate)
+	{
+		return false;
+	}
+
+	FName ParentName = NAME_None;
+	for (USCS_Node* Node : SCS->GetAllNodes())
+	{
+		if (Node && Node->GetChildNodes().Contains(ChildNode))
+		{
+			ParentName = Node->GetVariableName();
+			break;
+		}
+	}
+	TestEqual(TEXT("Child component should have parent."), ParentName, FName(TEXT("BridgeRoot")));
+	TestEqual(TEXT("Relative location should be set."), ChildTemplate->GetRelativeLocation(), FVector(10.0, 20.0, 30.0));
+	TestTrue(TEXT("Component property should be set."), ChildTemplate->bHiddenInGame);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetLifecycleAndDefaultsTest, "BlueprintBridge.Blueprint.AssetLifecycleAndDefaults", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetLifecycleAndDefaultsTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Lifecycle"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> CompileResponse = BlueprintBridgeTests::CompileBlueprintRequest(Asset.AssetPath);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, CompileResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* CompileResult = BlueprintBridgeTests::GetResultObject(*this, CompileResponse);
+	if (!CompileResult)
+	{
+		return false;
+	}
+	FString CompileStatus;
+	TestTrue(TEXT("CompileBlueprint should include status."), (*CompileResult)->TryGetStringField(TEXT("status"), CompileStatus));
+	TestTrue(TEXT("CompileBlueprint should succeed."), CompileStatus == TEXT("UpToDate") || CompileStatus == TEXT("UpToDateWithWarnings"));
+
+	TSharedRef<FJsonObject> SetDefaultParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	SetDefaultParams->SetStringField(TEXT("property"), TEXT("Health"));
+	SetDefaultParams->SetStringField(TEXT("value"), TEXT("123"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetBlueprintDefault"), SetDefaultParams)))
+	{
+		return false;
+	}
+
+	Asset.Blueprint->GeneratedClass = Asset.Blueprint->GeneratedClass ? Asset.Blueprint->GeneratedClass : Asset.Blueprint->GeneratedClass;
+	UObject* CDO = Asset.Blueprint->GeneratedClass ? Asset.Blueprint->GeneratedClass->GetDefaultObject() : nullptr;
+	TestNotNull(TEXT("Compiled blueprint should have a CDO."), CDO);
+	if (CDO)
+	{
+		FProperty* Property = Asset.Blueprint->GeneratedClass->FindPropertyByName(TEXT("Health"));
+		TestNotNull(TEXT("Health property should exist on the generated class."), Property);
+		if (const FIntProperty* IntProperty = CastField<FIntProperty>(Property))
+		{
+			const int32 CurrentValue = IntProperty->GetPropertyValue_InContainer(CDO);
+			TestEqual(TEXT("SetBlueprintDefault should update the CDO default."), CurrentValue, 123);
+		}
+	}
+
+	const TSharedRef<FJsonObject> SaveResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SaveAsset"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, SaveResponse))
+	{
+		return false;
+	}
+	return TestEqual(TEXT("SaveAsset should return Saved."), BlueprintBridgeTests::GetStringResult(*this, SaveResponse), FString(TEXT("Saved")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCreateBlueprintAssetTest, "BlueprintBridge.Blueprint.CreateBlueprintAsset", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCreateBlueprintAssetTest::RunTest(const FString& Parameters)
+{
+	const FString AssetName = FString::Printf(TEXT("BP_BridgeCreated_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString AssetPath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *AssetName);
+
+	TSharedRef<FJsonObject> CreateParams = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	CreateParams->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+	const TSharedRef<FJsonObject> CreateResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintAsset"), CreateParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, CreateResponse))
+	{
+		return false;
+	}
+
+	UBlueprint* Blueprint = Cast<UBlueprint>(StaticLoadObject(UBlueprint::StaticClass(), nullptr, *FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName)));
+	TestNotNull(TEXT("CreateBlueprintAsset should create a loadable Blueprint."), Blueprint);
+	if (!Blueprint)
+	{
+		return false;
+	}
+
+	TestTrue(TEXT("Created Blueprint should use the requested parent class."), Blueprint->ParentClass == AActor::StaticClass());
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	return BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeDuplicateAssetTest, "BlueprintBridge.Blueprint.DuplicateAsset", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeDuplicateAssetTest::RunTest(const FString& Parameters)
+{
+	const FString SourceName = FString::Printf(TEXT("BP_BridgeDuplicateSource_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString SourcePath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *SourceName);
+	const FString DestName = FString::Printf(TEXT("BP_BridgeDuplicateDest_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString DestPath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *DestName);
+
+	TSharedRef<FJsonObject> CreateParams = BlueprintBridgeTests::MakeAssetParams(SourcePath);
+	CreateParams->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintAsset"), CreateParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(SourcePath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("ProjectileSpeed"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("real"));
+	AddVariableParams->SetStringField(TEXT("subCategory"), TEXT("float"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("1200.0"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DuplicateParams = MakeShared<FJsonObject>();
+	DuplicateParams->SetStringField(TEXT("sourceAsset"), SourcePath);
+	DuplicateParams->SetStringField(TEXT("destAsset"), DestPath);
+	const TSharedRef<FJsonObject> DuplicateResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DuplicateAsset"), DuplicateParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DuplicateResponse))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(DestPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	if (!DescribeResult)
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	if (!TestTrue(TEXT("Duplicated Blueprint should describe variables."), (*DescribeResult)->TryGetArrayField(TEXT("variables"), Variables) && Variables != nullptr))
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& VariableValue : *Variables)
+	{
+		const TSharedPtr<FJsonObject>* VariableObject = nullptr;
+		if (VariableValue.IsValid() && VariableValue->TryGetObject(VariableObject) && VariableObject != nullptr && VariableObject->IsValid())
+		{
+			FString VariableName;
+			if ((*VariableObject)->TryGetStringField(TEXT("name"), VariableName) && VariableName == TEXT("ProjectileSpeed"))
+			{
+				return true;
+			}
+		}
+	}
+
+	AddError(TEXT("Duplicated Blueprint should preserve source Blueprint variables."));
+	return false;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeGraphPrimitiveCommandsTest, "BlueprintBridge.Blueprint.GraphPrimitives", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeGraphPrimitiveCommandsTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("GraphPrimitives"));
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> CustomEventParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	CustomEventParams->SetStringField(TEXT("name"), TEXT("BridgeCustomEvent"));
+	CustomEventParams->SetNumberField(TEXT("x"), 100);
+	CustomEventParams->SetNumberField(TEXT("y"), 100);
+	TArray<TSharedPtr<FJsonValue>> CustomInputs;
+	TSharedRef<FJsonObject> CustomInput = MakeShared<FJsonObject>();
+	CustomInput->SetStringField(TEXT("name"), TEXT("Count"));
+	CustomInput->SetStringField(TEXT("category"), TEXT("int"));
+	CustomInputs.Add(MakeShared<FJsonValueObject>(CustomInput));
+	CustomEventParams->SetArrayField(TEXT("inputs"), CustomInputs);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddCustomEventNode"), CustomEventParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> EventParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	EventParams->SetStringField(TEXT("eventClass"), TEXT("/Script/Engine.Actor"));
+	EventParams->SetStringField(TEXT("event"), TEXT("ReceiveBeginPlay"));
+	EventParams->SetNumberField(TEXT("x"), 100);
+	EventParams->SetNumberField(TEXT("y"), 300);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddEventNode"), EventParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CastParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	CastParams->SetStringField(TEXT("targetClass"), TEXT("/Script/Engine.Pawn"));
+	CastParams->SetNumberField(TEXT("x"), 400);
+	CastParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddDynamicCastNode"), CastParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SpawnParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	SpawnParams->SetStringField(TEXT("actorClass"), TEXT("/Script/Engine.StaticMeshActor"));
+	SpawnParams->SetNumberField(TEXT("x"), 650);
+	SpawnParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddSpawnActorNode"), SpawnParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DispatcherParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	DispatcherParams->SetStringField(TEXT("name"), TEXT("OnBridgeEvent"));
+	TArray<TSharedPtr<FJsonValue>> DispatcherInputs;
+	TSharedRef<FJsonObject> DispatcherInput = MakeShared<FJsonObject>();
+	DispatcherInput->SetStringField(TEXT("name"), TEXT("Instigator"));
+	DispatcherInput->SetStringField(TEXT("category"), TEXT("object"));
+	DispatcherInput->SetStringField(TEXT("subCategoryObject"), TEXT("/Script/Engine.Actor"));
+	DispatcherInputs.Add(MakeShared<FJsonValueObject>(DispatcherInput));
+	DispatcherParams->SetArrayField(TEXT("inputs"), DispatcherInputs);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddEventDispatcher"), DispatcherParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddComponentParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddComponentParams->SetStringField(TEXT("name"), TEXT("TriggerBox"));
+	AddComponentParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.BoxComponent"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddComponentParams)))
+	{
+		return false;
+	}
+
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::CompileBlueprintRequest(Asset.AssetPath)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> ComponentEventParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ComponentEventParams->SetStringField(TEXT("component"), TEXT("TriggerBox"));
+	ComponentEventParams->SetStringField(TEXT("delegate"), TEXT("OnComponentBeginOverlap"));
+	ComponentEventParams->SetNumberField(TEXT("x"), 100);
+	ComponentEventParams->SetNumberField(TEXT("y"), 500);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponentEventNode"), ComponentEventParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DelegateBindParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	DelegateBindParams->SetStringField(TEXT("delegate"), TEXT("OnBridgeEvent"));
+	DelegateBindParams->SetNumberField(TEXT("x"), 400);
+	DelegateBindParams->SetNumberField(TEXT("y"), 500);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddDelegateBindNode"), DelegateBindParams)))
+	{
+		return false;
+	}
+
+	UEdGraph* EventGraph = BlueprintBridgeTests::FindBlueprintGraph(Asset.Blueprint, EventGraphName);
+	TestNotNull(TEXT("Event graph should exist."), EventGraph);
+	TestTrue(TEXT("Custom event should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_CustomEvent>(Node) && Cast<UK2Node_CustomEvent>(Node)->CustomFunctionName == TEXT("BridgeCustomEvent"); }));
+	TestTrue(TEXT("Native event node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_Event>(Node) && Cast<UK2Node_Event>(Node)->EventReference.GetMemberName() == TEXT("ReceiveBeginPlay"); }));
+	TestTrue(TEXT("Dynamic cast node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_DynamicCast>(Node) && Cast<UK2Node_DynamicCast>(Node)->TargetType == APawn::StaticClass(); }));
+	TestTrue(TEXT("Spawn actor node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_SpawnActorFromClass>(Node) != nullptr; }));
+	TestTrue(TEXT("Component event node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_ComponentBoundEvent>(Node) && Cast<UK2Node_ComponentBoundEvent>(Node)->DelegatePropertyName == TEXT("OnComponentBeginOverlap"); }));
+	TestTrue(TEXT("Delegate bind node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Cast<UK2Node_AddDelegate>(Node) && Cast<UK2Node_AddDelegate>(Node)->GetPropertyName() == TEXT("OnBridgeEvent"); }));
+	TestTrue(TEXT("Dispatcher signature graph should be present."), BlueprintBridgeTests::FindBlueprintGraph(Asset.Blueprint, TEXT("OnBridgeEvent")) != nullptr);
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeVariableFlagsTest, "BlueprintBridge.Blueprint.VariableFlags", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeVariableFlagsTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("VariableFlags"));
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("ClearedCount"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	AddVariableParams->SetStringField(TEXT("defaultValue"), TEXT("0"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> FlagsParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	FlagsParams->SetStringField(TEXT("variable"), TEXT("ClearedCount"));
+	FlagsParams->SetBoolField(TEXT("instanceEditable"), true);
+	FlagsParams->SetBoolField(TEXT("blueprintReadOnly"), true);
+	FlagsParams->SetBoolField(TEXT("exposeOnSpawn"), true);
+	FlagsParams->SetBoolField(TEXT("private"), true);
+	FlagsParams->SetStringField(TEXT("categoryName"), TEXT("Hoop Trial"));
+	FlagsParams->SetStringField(TEXT("tooltip"), TEXT("Number of hoops cleared."));
+	FlagsParams->SetStringField(TEXT("replication"), TEXT("RepNotify"));
+	FlagsParams->SetStringField(TEXT("repNotifyFunc"), TEXT("OnRep_ClearedCount"));
+	const TSharedRef<FJsonObject> FlagsResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetBlueprintVariableFlags"), FlagsParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, FlagsResponse))
+	{
+		return false;
+	}
+
+	const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Asset.Blueprint, TEXT("ClearedCount"));
+	if (!TestTrue(TEXT("Variable should exist."), VarIndex != INDEX_NONE))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddArrayVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddArrayVariableParams->SetStringField(TEXT("name"), TEXT("SpawnVolumes"));
+	AddArrayVariableParams->SetStringField(TEXT("category"), TEXT("object"));
+	AddArrayVariableParams->SetStringField(TEXT("subCategoryObject"), TEXT("/Script/Engine.Actor"));
+	AddArrayVariableParams->SetStringField(TEXT("containerType"), TEXT("Array"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddArrayVariableParams)))
+	{
+		return false;
+	}
+
+	const int32 ArrayVarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Asset.Blueprint, TEXT("SpawnVolumes"));
+	if (!TestTrue(TEXT("Array variable should exist."), ArrayVarIndex != INDEX_NONE))
+	{
+		return false;
+	}
+	TestEqual(TEXT("Array variable should use Array container type."), Asset.Blueprint->NewVariables[ArrayVarIndex].VarType.ContainerType, EPinContainerType::Array);
+
+	const FBPVariableDescription& Variable = Asset.Blueprint->NewVariables[VarIndex];
+	TestTrue(TEXT("Variable should be instance editable."), ((Variable.PropertyFlags & CPF_Edit) != 0) && ((Variable.PropertyFlags & CPF_DisableEditOnInstance) == 0));
+	TestTrue(TEXT("Variable should be Blueprint read only."), ((Variable.PropertyFlags & CPF_BlueprintReadOnly) != 0));
+	TestTrue(TEXT("Variable should be replicated."), ((Variable.PropertyFlags & CPF_Net) != 0));
+	TestTrue(TEXT("Variable should use RepNotify."), ((Variable.PropertyFlags & CPF_RepNotify) != 0));
+	TestEqual(TEXT("RepNotify function should be set."), Variable.RepNotifyFunc, FName(TEXT("OnRep_ClearedCount")));
+	TestEqual(TEXT("Category should be set."), Variable.Category.ToString(), FString(TEXT("Hoop Trial")));
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	if (!DescribeResult || !TestTrue(TEXT("DescribeBlueprint should include variables."), (*DescribeResult)->TryGetArrayField(TEXT("variables"), Variables) && Variables != nullptr))
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& VariableValue : *Variables)
+	{
+		const TSharedPtr<FJsonObject>* VariableObject = nullptr;
+		if (VariableValue.IsValid() && VariableValue->TryGetObject(VariableObject) && VariableObject != nullptr && VariableObject->IsValid())
+		{
+			FString Name;
+			(*VariableObject)->TryGetStringField(TEXT("name"), Name);
+			if (Name == TEXT("ClearedCount"))
+			{
+				bool bRepNotify = false;
+				FString RepNotifyFunc;
+				(*VariableObject)->TryGetBoolField(TEXT("repNotify"), bRepNotify);
+				(*VariableObject)->TryGetStringField(TEXT("repNotifyFunc"), RepNotifyFunc);
+				TestTrue(TEXT("DescribeBlueprint should expose RepNotify."), bRepNotify);
+				TestEqual(TEXT("DescribeBlueprint should expose RepNotify function."), RepNotifyFunc, FString(TEXT("OnRep_ClearedCount")));
+			}
+			else if (Name == TEXT("SpawnVolumes"))
+			{
+				FString ContainerType;
+				(*VariableObject)->TryGetStringField(TEXT("containerType"), ContainerType);
+				return TestEqual(TEXT("DescribeBlueprint should expose array container type."), ContainerType, FString(TEXT("Array")));
+			}
+		}
+	}
+
+	AddError(TEXT("DescribeBlueprint should include ClearedCount."));
+	return false;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeComponentSpecializedSettersTest, "BlueprintBridge.Blueprint.ComponentSpecializedSetters", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeComponentSpecializedSettersTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ComponentSetters"));
+
+	TSharedRef<FJsonObject> AddMeshParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddMeshParams->SetStringField(TEXT("name"), TEXT("MeshRoot"));
+	AddMeshParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.StaticMeshComponent"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddMeshParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddBoxParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddBoxParams->SetStringField(TEXT("name"), TEXT("TriggerBox"));
+	AddBoxParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.BoxComponent"));
+	AddBoxParams->SetStringField(TEXT("parent"), TEXT("MeshRoot"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddBoxParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> RootParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	RootParams->SetStringField(TEXT("name"), TEXT("MeshRoot"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetRootComponent"), RootParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> MeshParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	MeshParams->SetStringField(TEXT("name"), TEXT("MeshRoot"));
+	MeshParams->SetStringField(TEXT("mesh"), TEXT("/Engine/BasicShapes/Cube.Cube"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetStaticMesh"), MeshParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CollisionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CollisionParams->SetStringField(TEXT("name"), TEXT("TriggerBox"));
+	CollisionParams->SetStringField(TEXT("profile"), TEXT("OverlapAllDynamic"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetCollisionProfileName"), CollisionParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> ExtentParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	ExtentParams->SetStringField(TEXT("name"), TEXT("TriggerBox"));
+	TSharedRef<FJsonObject> ExtentObject = MakeShared<FJsonObject>();
+	ExtentObject->SetNumberField(TEXT("x"), 10.0);
+	ExtentObject->SetNumberField(TEXT("y"), 20.0);
+	ExtentObject->SetNumberField(TEXT("z"), 30.0);
+	ExtentParams->SetObjectField(TEXT("extent"), ExtentObject);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetBoxExtent"), ExtentParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> OverlapParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	OverlapParams->SetStringField(TEXT("name"), TEXT("TriggerBox"));
+	OverlapParams->SetBoolField(TEXT("generateOverlapEvents"), true);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetGenerateOverlapEvents"), OverlapParams)))
+	{
+		return false;
+	}
+
+	USCS_Node* MeshNode = Asset.Blueprint->SimpleConstructionScript ? Asset.Blueprint->SimpleConstructionScript->FindSCSNode(TEXT("MeshRoot")) : nullptr;
+	USCS_Node* BoxNode = Asset.Blueprint->SimpleConstructionScript ? Asset.Blueprint->SimpleConstructionScript->FindSCSNode(TEXT("TriggerBox")) : nullptr;
+	UStaticMeshComponent* MeshComponent = MeshNode ? Cast<UStaticMeshComponent>(MeshNode->ComponentTemplate) : nullptr;
+	UBoxComponent* BoxComponent = BoxNode ? Cast<UBoxComponent>(BoxNode->ComponentTemplate) : nullptr;
+
+	TestTrue(TEXT("MeshRoot should be a root node."), Asset.Blueprint->SimpleConstructionScript && MeshNode && Asset.Blueprint->SimpleConstructionScript->GetRootNodes().Contains(MeshNode));
+	TestTrue(TEXT("Static mesh should be assigned."), MeshComponent && MeshComponent->GetStaticMesh() != nullptr);
+	TestNotNull(TEXT("Box component should exist."), BoxComponent);
+	if (BoxComponent)
+	{
+		TestEqual(TEXT("Collision profile should be set."), BoxComponent->GetCollisionProfileName(), FName(TEXT("OverlapAllDynamic")));
+		TestEqual(TEXT("Box extent should be set."), BoxComponent->GetUnscaledBoxExtent(), FVector(10.0, 20.0, 30.0));
+		TestTrue(TEXT("Generate overlap events should be set."), BoxComponent->GetGenerateOverlapEvents());
+	}
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeControlFlowHelpersTest, "BlueprintBridge.Blueprint.ControlFlowHelpers", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeControlFlowHelpersTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ControlFlow"));
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> ForLoopParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ForLoopParams->SetNumberField(TEXT("x"), 100);
+	ForLoopParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddForLoopNode"), ForLoopParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> ForEachParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ForEachParams->SetNumberField(TEXT("x"), 350);
+	ForEachParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddForEachLoopNode"), ForEachParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AuthorityParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AuthorityParams->SetNumberField(TEXT("x"), 600);
+	AuthorityParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddAuthoritySwitchNode"), AuthorityParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> MakeStructParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	MakeStructParams->SetStringField(TEXT("struct"), TEXT("/Script/CoreUObject.Vector"));
+	MakeStructParams->SetNumberField(TEXT("x"), 100);
+	MakeStructParams->SetNumberField(TEXT("y"), 450);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddMakeStructNode"), MakeStructParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> BreakStructParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	BreakStructParams->SetStringField(TEXT("struct"), TEXT("/Script/CoreUObject.Vector"));
+	BreakStructParams->SetNumberField(TEXT("x"), 350);
+	BreakStructParams->SetNumberField(TEXT("y"), 450);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBreakStructNode"), BreakStructParams)))
+	{
+		return false;
+	}
+
+	UEdGraph* EventGraph = BlueprintBridgeTests::FindBlueprintGraph(Asset.Blueprint, EventGraphName);
+	TestNotNull(TEXT("Event graph should exist."), EventGraph);
+	TestTrue(TEXT("ForLoop macro should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { const UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(Node); return Macro && Macro->GetMacroGraph() && Macro->GetMacroGraph()->GetName().Equals(TEXT("ForLoop"), ESearchCase::IgnoreCase); }));
+	TestTrue(TEXT("ForEachLoop macro should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { const UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(Node); return Macro && Macro->GetMacroGraph() && Macro->GetMacroGraph()->GetName().Equals(TEXT("ForEachLoop"), ESearchCase::IgnoreCase); }));
+	TestTrue(TEXT("Authority switch macro should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { const UK2Node_MacroInstance* Macro = Cast<UK2Node_MacroInstance>(Node); return Macro && Macro->GetMacroGraph() && Macro->GetMacroGraph()->GetName().Contains(TEXT("Authority")); }));
+	TestTrue(TEXT("Make Vector node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { const UK2Node_MakeStruct* MakeStruct = Cast<UK2Node_MakeStruct>(Node); return MakeStruct && MakeStruct->StructType == TBaseStructure<FVector>::Get(); }));
+	TestTrue(TEXT("Break Vector node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { const UK2Node_BreakStruct* BreakStruct = Cast<UK2Node_BreakStruct>(Node); return BreakStruct && BreakStruct->StructType == TBaseStructure<FVector>::Get(); }));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeWidgetTreeCommandsTest, "BlueprintBridge.UMG.WidgetTreeCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeWidgetTreeCommandsTest::RunTest(const FString& Parameters)
+{
+	const FString AssetName = FString::Printf(TEXT("WBP_BridgeTest_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString AssetPath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *AssetName);
+
+	TSharedRef<FJsonObject> CreateParams = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateWidgetBlueprintAsset"), CreateParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> RootParams = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	RootParams->SetStringField(TEXT("name"), TEXT("RootCanvas"));
+	RootParams->SetStringField(TEXT("widgetClass"), TEXT("/Script/UMG.CanvasPanel"));
+	RootParams->SetBoolField(TEXT("root"), true);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddWidget"), RootParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> TextParams = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	TextParams->SetStringField(TEXT("name"), TEXT("TitleText"));
+	TextParams->SetStringField(TEXT("widgetClass"), TEXT("/Script/UMG.TextBlock"));
+	TextParams->SetStringField(TEXT("parent"), TEXT("RootCanvas"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddWidget"), TextParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SlotParams = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	SlotParams->SetStringField(TEXT("widget"), TEXT("TitleText"));
+	TSharedRef<FJsonObject> Position = MakeShared<FJsonObject>();
+	Position->SetNumberField(TEXT("x"), 24);
+	Position->SetNumberField(TEXT("y"), 36);
+	SlotParams->SetObjectField(TEXT("position"), Position);
+	TSharedRef<FJsonObject> Size = MakeShared<FJsonObject>();
+	Size->SetNumberField(TEXT("x"), 320);
+	Size->SetNumberField(TEXT("y"), 48);
+	SlotParams->SetObjectField(TEXT("size"), Size);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetWidgetSlotLayout"), SlotParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeWidgetTree"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* ResultObject = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	const TSharedPtr<FJsonObject>* WidgetTreeObject = nullptr;
+	TestTrue(TEXT("Result should contain widgetTree."), ResultObject && (*ResultObject)->TryGetObjectField(TEXT("widgetTree"), WidgetTreeObject) && WidgetTreeObject && WidgetTreeObject->IsValid());
+
+	FString RootName;
+	TestTrue(TEXT("Widget tree should report RootCanvas as root."), WidgetTreeObject && (*WidgetTreeObject)->TryGetStringField(TEXT("root"), RootName) && RootName == TEXT("RootCanvas"));
+
+	UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(StaticLoadObject(UWidgetBlueprint::StaticClass(), nullptr, *FString::Printf(TEXT("%s.%s"), *AssetPath, *AssetName)));
+	TestNotNull(TEXT("Created Widget Blueprint should load."), WidgetBlueprint);
+	TestTrue(TEXT("RootCanvas should be the root widget."), WidgetBlueprint && WidgetBlueprint->WidgetTree && Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget) && WidgetBlueprint->WidgetTree->RootWidget->GetName() == TEXT("RootCanvas"));
+	UTextBlock* TitleText = WidgetBlueprint && WidgetBlueprint->WidgetTree ? Cast<UTextBlock>(WidgetBlueprint->WidgetTree->FindWidget(TEXT("TitleText"))) : nullptr;
+	TestNotNull(TEXT("TitleText should exist."), TitleText);
+	TestEqual(TEXT("RootCanvas should have one child."), WidgetBlueprint && WidgetBlueprint->WidgetTree && Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget) ? Cast<UCanvasPanel>(WidgetBlueprint->WidgetTree->RootWidget)->GetChildrenCount() : INDEX_NONE, 1);
+	const UCanvasPanelSlot* TitleSlot = TitleText ? Cast<UCanvasPanelSlot>(TitleText->Slot) : nullptr;
+	TestTrue(TEXT("Canvas slot position should be set."), TitleSlot && TitleSlot->GetPosition().Equals(FVector2D(24, 36)));
+	TestTrue(TEXT("Canvas slot size should be set."), TitleSlot && TitleSlot->GetSize().Equals(FVector2D(320, 48)));
+
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::CompileBlueprintRequest(AssetPath)))
+	{
+		return false;
+	}
+
+	const BlueprintBridgeTests::FTestBlueprintAsset OwnerAsset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("CreateWidgetNode"));
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(OwnerAsset.Blueprint);
+	TSharedRef<FJsonObject> CreateWidgetNodeParams = BlueprintBridgeTests::MakeGraphParams(OwnerAsset.AssetPath, EventGraphName);
+	CreateWidgetNodeParams->SetStringField(TEXT("widgetClass"), FString::Printf(TEXT("%s.%s_C"), *AssetPath, *AssetName));
+	CreateWidgetNodeParams->SetNumberField(TEXT("x"), 100);
+	CreateWidgetNodeParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddCreateWidgetNode"), CreateWidgetNodeParams)))
+	{
+		return false;
+	}
+
+	UEdGraph* EventGraph = BlueprintBridgeTests::FindBlueprintGraph(OwnerAsset.Blueprint, EventGraphName);
+	TestTrue(TEXT("Create Widget node should be present."), EventGraph && EventGraph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Node && Node->GetClass()->GetPathName().Contains(TEXT("K2Node_CreateWidget")); }));
+
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeExtendedGraphHelpersTest, "BlueprintBridge.Blueprint.ExtendedGraphHelpers", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeExtendedGraphHelpersTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ExtendedGraphHelpers"));
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> IntArrayParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	IntArrayParams->SetStringField(TEXT("name"), TEXT("Numbers"));
+	IntArrayParams->SetStringField(TEXT("category"), UEdGraphSchema_K2::PC_Int.ToString());
+	IntArrayParams->SetStringField(TEXT("containerType"), TEXT("Array"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), IntArrayParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SelfParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	SelfParams->SetNumberField(TEXT("x"), -120);
+	SelfParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddSelfNode"), SelfParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> ArrayParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ArrayParams->SetStringField(TEXT("operation"), TEXT("Length"));
+	ArrayParams->SetNumberField(TEXT("x"), 100);
+	ArrayParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddArrayFunctionNode"), ArrayParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> TimerParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	TimerParams->SetStringField(TEXT("operation"), TEXT("SetByFunctionName"));
+	TimerParams->SetNumberField(TEXT("x"), 320);
+	TimerParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddTimerNode"), TimerParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> TraceParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	TraceParams->SetNumberField(TEXT("x"), 560);
+	TraceParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddLineTraceNode"), TraceParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> MathParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	MathParams->SetStringField(TEXT("function"), TEXT("RandomIntegerInRange"));
+	MathParams->SetNumberField(TEXT("x"), 820);
+	MathParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddMathNode"), MathParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DispatcherParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	DispatcherParams->SetStringField(TEXT("name"), TEXT("OnBridgeTest"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddEventDispatcher"), DispatcherParams)))
+	{
+		return false;
+	}
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::CompileBlueprintRequest(Asset.AssetPath)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> BroadcastParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	BroadcastParams->SetStringField(TEXT("delegate"), TEXT("OnBridgeTest"));
+	BroadcastParams->SetNumberField(TEXT("x"), 1060);
+	BroadcastParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddDelegateBroadcastNode"), BroadcastParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> BindParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	BindParams->SetStringField(TEXT("delegate"), TEXT("OnBridgeTest"));
+	BindParams->SetNumberField(TEXT("x"), 1280);
+	BindParams->SetNumberField(TEXT("y"), 100);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddDelegateBindNode"), BindParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DelegateParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	DelegateParams->SetNumberField(TEXT("x"), 1500);
+	DelegateParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> DelegateResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddCreateDelegateNode"), DelegateParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DelegateResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DelegateResult = BlueprintBridgeTests::GetResultObject(*this, DelegateResponse);
+	const TSharedPtr<FJsonObject>* DelegateNode = nullptr;
+	FString DelegateNodeGuid;
+	TestTrue(TEXT("Create delegate response should contain node."), DelegateResult && (*DelegateResult)->TryGetObjectField(TEXT("node"), DelegateNode) && DelegateNode && DelegateNode->IsValid());
+	TestTrue(TEXT("Create delegate node should have guid."), DelegateNode && (*DelegateNode)->TryGetStringField(TEXT("guid"), DelegateNodeGuid));
+
+	TSharedRef<FJsonObject> SetDelegateParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	SetDelegateParams->SetStringField(TEXT("node"), DelegateNodeGuid);
+	SetDelegateParams->SetStringField(TEXT("function"), TEXT("ReceiveBeginPlay"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetCreateDelegateFunction"), SetDelegateParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DescribeParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeGraph"), DescribeParams)));
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams)))
+	{
+		return false;
+	}
+
+	UEdGraph* EventGraph = BlueprintBridgeTests::FindBlueprintGraph(Asset.Blueprint, EventGraphName);
+	TestTrue(TEXT("Extended helper nodes should have been created."), EventGraph && EventGraph->Nodes.Num() >= 7);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetCommandErrorsTest, "BlueprintBridge.Blueprint.AssetCommandErrors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetCommandErrorsTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> MissingAssetParams = BlueprintBridgeTests::MakeAssetParams(TEXT("/Game/BlueprintBridgeTests/BP_DoesNotExist"));
+	const TSharedRef<FJsonObject> CheckoutResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CheckoutAsset"), MissingAssetParams);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, CheckoutResponse, TEXT("AssetNotFound"));
+}
+
+#endif
