@@ -1,0 +1,15 @@
+{
+  "id": "add-function-input-const-ref-example",
+  "version": 1,
+  "command": "AddFunctionInput",
+  "params": {
+    "asset": "/Game/Example/BP_Example",
+    "graph": "MyComputeScoreFunction",
+    "name": "AIGoal",
+    "category": "struct",
+    "subCategoryObject": "/Script/Biscuit.BiscuitAIGoal",
+    "byRef": true,
+    "const": true
+  },
+  "_comment": "byRef + const are required when the function is bound to a C++ DECLARE_DYNAMIC_DELEGATE_* whose corresponding parameter is `const FType&`. Without them the BP compiler inserts a CREATEDELEGATE_PROXYFUNCTION_N thunk that fails to propagate out-params back to C++. Works on EditUserDefinedPin too."
+}

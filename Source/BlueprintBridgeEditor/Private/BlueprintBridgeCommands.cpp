@@ -22,6 +22,8 @@
 #include "EdGraph/EdGraph.h"
 #include "EdGraphNode_Comment.h"
 #include "EdGraphSchema_K2.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "Engine/InheritableComponentHandler.h"
 #include "Engine/SCS_Node.h"
 #include "Engine/SimpleConstructionScript.h"
 #include "FileHelpers.h"
@@ -75,6 +77,7 @@
 #include "SourceControlHelpers.h"
 #include "EdGraph/EdGraphNodeUtils.h"
 #include "WidgetBlueprint.h"
+#include "UObject/UObjectIterator.h"
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -2175,6 +2178,23 @@ static UK2Node_FunctionEntry* FindFunctionEntryNode(UEdGraph* Graph)
 	return nullptr;
 }
 
+static void ApplyPinRefAndConstFlags(const TSharedPtr<FJsonObject>& Params, FEdGraphPinType& OutPinType)
+{
+	// Optional flags for matching C++ delegate / function signatures exactly.
+	// Required for BP functions bound to DECLARE_DYNAMIC_DELEGATE_* signatures with const-ref or by-ref params —
+	// without them, the BP compiler inserts a CREATEDELEGATE_PROXYFUNCTION_N thunk that fails to propagate out-params.
+	bool bByRef = false;
+	if (Params->TryGetBoolField(TEXT("byRef"), bByRef))
+	{
+		OutPinType.bIsReference = bByRef;
+	}
+	bool bIsConst = false;
+	if (Params->TryGetBoolField(TEXT("const"), bIsConst))
+	{
+		OutPinType.bIsConst = bIsConst;
+	}
+}
+
 static bool TryMakePinTypeFromParams(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FEdGraphPinType& OutPinType, FString& OutError)
 {
 	FString SourceVariable;
@@ -2185,6 +2205,7 @@ static bool TryMakePinTypeFromParams(UBlueprint* Blueprint, const TSharedPtr<FJs
 			OutError = FString::Printf(TEXT("Could not find source variable '%s'."), *SourceVariable);
 			return false;
 		}
+		ApplyPinRefAndConstFlags(Params, OutPinType);
 		return true;
 	}
 
@@ -2218,7 +2239,12 @@ static bool TryMakePinTypeFromParams(UBlueprint* Blueprint, const TSharedPtr<FJs
 		OutPinType.PinSubCategoryObject = SubCategoryObject;
 	}
 
-	return ApplyPinContainerType(Params, OutPinType, OutError);
+	if (!ApplyPinContainerType(Params, OutPinType, OutError))
+	{
+		return false;
+	}
+	ApplyPinRefAndConstFlags(Params, OutPinType);
+	return true;
 }
 
 static TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -3779,6 +3805,249 @@ static TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSha
 	return MakeSuccessMessage(Id, TEXT("DefaultSet"));
 }
 
+static TSharedRef<FJsonObject> DescribeSubobject(UObject* Subobject, const bool bIncludeProperties)
+{
+	TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();
+	Json->SetStringField(TEXT("name"), Subobject->GetName());
+	Json->SetStringField(TEXT("class"), Subobject->GetClass()->GetPathName());
+	Json->SetStringField(TEXT("path"), Subobject->GetPathName());
+	Json->SetStringField(TEXT("outer"), GetPathNameSafe(Subobject->GetOuter()));
+
+	if (bIncludeProperties)
+	{
+		TArray<TSharedPtr<FJsonValue>> Properties;
+		for (TFieldIterator<FProperty> It(Subobject->GetClass()); It; ++It)
+		{
+			FProperty* Property = *It;
+			if (!Property || !Property->HasAnyPropertyFlags(CPF_Edit))
+			{
+				continue;
+			}
+
+			FString Value;
+			Property->ExportText_InContainer(0, Value, Subobject, Subobject, Subobject, PPF_None);
+
+			TSharedRef<FJsonObject> PropertyJson = MakeShared<FJsonObject>();
+			PropertyJson->SetStringField(TEXT("name"), Property->GetName());
+			PropertyJson->SetStringField(TEXT("type"), Property->GetCPPType());
+			PropertyJson->SetStringField(TEXT("value"), Value);
+			Properties.Add(MakeShared<FJsonValueObject>(PropertyJson));
+		}
+		Json->SetArrayField(TEXT("properties"), Properties);
+	}
+
+	return Json;
+}
+
+static void GetBlueprintCDOSubobjects(UBlueprint* Blueprint, TArray<UObject*>& OutSubobjects)
+{
+	if (!Blueprint || !Blueprint->GeneratedClass)
+	{
+		return;
+	}
+
+	TSet<UObject*> Seen;
+	auto AddIncludingNested = [&OutSubobjects, &Seen](UObject* Root)
+	{
+		if (!Root)
+		{
+			return;
+		}
+		if (!Seen.Contains(Root))
+		{
+			Seen.Add(Root);
+			OutSubobjects.Add(Root);
+		}
+		ForEachObjectWithOuter(Root, [&OutSubobjects, &Seen](UObject* Object)
+		{
+			if (Object && !Seen.Contains(Object))
+			{
+				Seen.Add(Object);
+				OutSubobjects.Add(Object);
+			}
+		}, true);
+	};
+
+	if (UObject* CDO = Blueprint->GeneratedClass->GetDefaultObject())
+	{
+		AddIncludingNested(CDO);
+	}
+
+	// Walk the BPGC ancestry: components added in this BP or any ancestor BP live as
+	// component templates on the SCS or on the BPGC's InheritableComponentHandler (when overridden).
+	// ForEachObjectWithOuter(CDO) does not reach them because their Outer is the BPGC / SCS_Node / ICH.
+	for (UClass* Cursor = Blueprint->GeneratedClass; Cursor; Cursor = Cursor->GetSuperClass())
+	{
+		UBlueprintGeneratedClass* BPGC = Cast<UBlueprintGeneratedClass>(Cursor);
+		if (!BPGC)
+		{
+			continue;
+		}
+
+		if (BPGC->SimpleConstructionScript)
+		{
+			for (USCS_Node* Node : BPGC->SimpleConstructionScript->GetAllNodes())
+			{
+				if (Node)
+				{
+					AddIncludingNested(Node->ComponentTemplate);
+				}
+			}
+		}
+
+		if (UInheritableComponentHandler* ICH = BPGC->GetInheritableComponentHandler(false))
+		{
+			TArray<UActorComponent*> Templates;
+			ICH->GetAllTemplates(Templates);
+			for (UActorComponent* Template : Templates)
+			{
+				AddIncludingNested(Template);
+			}
+		}
+	}
+}
+
+static bool SubobjectMatchesIdentifier(const UObject* Subobject, const FString& Identifier)
+{
+	if (!Subobject || Identifier.IsEmpty())
+	{
+		return false;
+	}
+
+	const FString Name = Subobject->GetName();
+	const FString Path = Subobject->GetPathName();
+	return Name.Equals(Identifier, ESearchCase::IgnoreCase)
+		|| Path.Equals(Identifier, ESearchCase::IgnoreCase)
+		|| Path.EndsWith(FString::Printf(TEXT(":%s"), *Identifier), ESearchCase::IgnoreCase)
+		|| Path.EndsWith(FString::Printf(TEXT(".%s"), *Identifier), ESearchCase::IgnoreCase);
+}
+
+static bool SubobjectMatchesClassFilter(const UObject* Subobject, const FString& ClassPath)
+{
+	if (!Subobject || ClassPath.IsEmpty())
+	{
+		return true;
+	}
+
+	UClass* Class = LoadClassByPath(ClassPath);
+	return Class && Subobject->IsA(Class);
+}
+
+static TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeSubobjects requires params.asset."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint || !Blueprint->GeneratedClass)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load compiled Blueprint '%s'."), *AssetPath));
+	}
+
+	FString ClassPath;
+	Params->TryGetStringField(TEXT("subobjectClass"), ClassPath);
+	bool bIncludeProperties = false;
+	Params->TryGetBoolField(TEXT("includeProperties"), bIncludeProperties);
+
+	TArray<UObject*> Subobjects;
+	GetBlueprintCDOSubobjects(Blueprint, Subobjects);
+
+	TArray<TSharedPtr<FJsonValue>> SubobjectValues;
+	for (UObject* Subobject : Subobjects)
+	{
+		if (SubobjectMatchesClassFilter(Subobject, ClassPath))
+		{
+			SubobjectValues.Add(MakeShared<FJsonValueObject>(DescribeSubobject(Subobject, bIncludeProperties)));
+		}
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("subobjects"), SubobjectValues);
+	return MakeSuccess(Id, Result);
+}
+
+static TSharedRef<FJsonObject> SetSubobjectDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString SubobjectIdentifier;
+	FString PropertyName;
+	FString Value;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
+		!TryGetRequiredString(Params, TEXT("subobject"), SubobjectIdentifier) ||
+		!TryGetRequiredString(Params, TEXT("property"), PropertyName) ||
+		!TryGetRequiredString(Params, TEXT("value"), Value))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SetSubobjectDefault requires params.asset, params.subobject, params.property, and params.value."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint || !Blueprint->GeneratedClass)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load compiled Blueprint '%s'."), *AssetPath));
+	}
+
+	FString ClassPath;
+	Params->TryGetStringField(TEXT("subobjectClass"), ClassPath);
+
+	TArray<UObject*> Subobjects;
+	GetBlueprintCDOSubobjects(Blueprint, Subobjects);
+
+	TArray<UObject*> Matches;
+	for (UObject* Subobject : Subobjects)
+	{
+		if (SubobjectMatchesIdentifier(Subobject, SubobjectIdentifier) && SubobjectMatchesClassFilter(Subobject, ClassPath))
+		{
+			Matches.Add(Subobject);
+		}
+	}
+
+	if (Matches.IsEmpty())
+	{
+		return MakeBridgeError(Id, TEXT("SubobjectNotFound"), FString::Printf(TEXT("Could not find subobject '%s' on '%s'."), *SubobjectIdentifier, *AssetPath));
+	}
+	if (Matches.Num() > 1)
+	{
+		TArray<TSharedPtr<FJsonValue>> MatchValues;
+		for (UObject* Match : Matches)
+		{
+			MatchValues.Add(MakeShared<FJsonValueObject>(DescribeSubobject(Match, false)));
+		}
+		TSharedRef<FJsonObject> Error = MakeBridgeError(Id, TEXT("AmbiguousSubobject"), FString::Printf(TEXT("Found %d subobjects matching '%s'."), Matches.Num(), *SubobjectIdentifier));
+		Error->GetObjectField(TEXT("error"))->SetArrayField(TEXT("matches"), MatchValues);
+		return Error;
+	}
+
+	UObject* Target = Matches[0];
+	FProperty* Property = Target->GetClass()->FindPropertyByName(*PropertyName);
+	if (!Property)
+	{
+		return MakeBridgeError(Id, TEXT("PropertyNotFound"), FString::Printf(TEXT("Could not find property '%s' on subobject '%s'."), *PropertyName, *Target->GetPathName()));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "SetSubobjectDefault", "Blueprint Bridge: Set Subobject Default"));
+	Blueprint->Modify();
+	Target->Modify();
+
+	void* PropertyValue = Property->ContainerPtrToValuePtr<void>(Target);
+	const TCHAR* ImportResult = Property->ImportText_Direct(*Value, PropertyValue, Target, PPF_None);
+	if (!ImportResult)
+	{
+		return MakeBridgeError(Id, TEXT("ImportFailed"), FString::Printf(TEXT("Could not import '%s' into property '%s' on subobject '%s'."), *Value, *PropertyName, *Target->GetPathName()));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+	Blueprint->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("subobject"), Target->GetPathName());
+	Result->SetStringField(TEXT("property"), PropertyName);
+	Result->SetStringField(TEXT("value"), Value);
+	return MakeSuccess(Id, Result);
+}
+
 static FName NormalizePinCategory(const FString& Category)
 {
 	if (Category.Equals(TEXT("bool"), ESearchCase::IgnoreCase) || Category.Equals(TEXT("boolean"), ESearchCase::IgnoreCase))
@@ -4362,6 +4631,14 @@ static TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& Request
 	else if (Command.Equals(TEXT("SetBlueprintDefault"), ESearchCase::IgnoreCase))
 	{
 		return SetBlueprintDefault(Id, Params);
+	}
+	else if (Command.Equals(TEXT("DescribeSubobjects"), ESearchCase::IgnoreCase))
+	{
+		return DescribeSubobjects(Id, Params);
+	}
+	else if (Command.Equals(TEXT("SetSubobjectDefault"), ESearchCase::IgnoreCase))
+	{
+		return SetSubobjectDefault(Id, Params);
 	}
 	else if (Command.Equals(TEXT("SetBlueprintVariableFlags"), ESearchCase::IgnoreCase))
 	{

@@ -56,6 +56,19 @@ function New-RequestObject {
 			if ($RemainingArgs.Count -lt 3) { throw "set-blueprint-default requires: asset property value." }
 			return @{ id = $id; version = 1; command = "SetBlueprintDefault"; params = @{ asset = $RemainingArgs[0]; property = $RemainingArgs[1]; value = $RemainingArgs[2] } }
 		}
+		"describe-subobjects" {
+			if ($RemainingArgs.Count -lt 1) { throw "describe-subobjects requires: asset [subobjectClass] [includeProperties]." }
+			$params = @{ asset = $RemainingArgs[0] }
+			if ($RemainingArgs.Count -ge 2) { $params.subobjectClass = $RemainingArgs[1] }
+			if ($RemainingArgs.Count -ge 3) { $params.includeProperties = [System.Convert]::ToBoolean($RemainingArgs[2]) }
+			return @{ id = $id; version = 1; command = "DescribeSubobjects"; params = $params }
+		}
+		"set-subobject-default" {
+			if ($RemainingArgs.Count -lt 4) { throw "set-subobject-default requires: asset subobject property value [subobjectClass]." }
+			$params = @{ asset = $RemainingArgs[0]; subobject = $RemainingArgs[1]; property = $RemainingArgs[2]; value = $RemainingArgs[3] }
+			if ($RemainingArgs.Count -ge 5) { $params.subobjectClass = $RemainingArgs[4] }
+			return @{ id = $id; version = 1; command = "SetSubobjectDefault"; params = $params }
+		}
 		"add-blueprint-variable" {
 			if ($RemainingArgs.Count -lt 3) { throw "add-blueprint-variable requires: asset name category [defaultValue] [subCategoryObject]." }
 			$params = @{ asset = $RemainingArgs[0]; name = $RemainingArgs[1]; category = $RemainingArgs[2] }
@@ -63,7 +76,7 @@ function New-RequestObject {
 			if ($RemainingArgs.Count -ge 5) { $params.subCategoryObject = $RemainingArgs[4] }
 			return @{ id = $id; version = 1; command = "AddBlueprintVariable"; params = $params }
 		}
-		default { throw "Unknown command '$Command'. Use ping, project, engine-version, describe-blueprint, describe-graph, find-variable-references, migrate-weakpoint-enabled-bool-to-state, checkout-asset, compile-blueprint, save-asset, set-blueprint-default, add-blueprint-variable, -RequestJson, or -RequestFile." }
+		default { throw "Unknown command '$Command'. Use ping, project, engine-version, describe-blueprint, describe-graph, find-variable-references, migrate-weakpoint-enabled-bool-to-state, checkout-asset, compile-blueprint, save-asset, set-blueprint-default, describe-subobjects, set-subobject-default, add-blueprint-variable, -RequestJson, or -RequestFile." }
 	}
 }
 
