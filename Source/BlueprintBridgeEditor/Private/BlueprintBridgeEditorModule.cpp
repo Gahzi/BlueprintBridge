@@ -3,9 +3,11 @@
 #include "Modules/ModuleManager.h"
 
 #include "BlueprintBridgeInternal.h"
+#include "BlueprintBridgeSettings.h"
 #include "HAL/Runnable.h"
 #include "Serialization/JsonSerializer.h"
 #include "HAL/RunnableThread.h"
+#include "Misc/App.h"
 
 #if PLATFORM_WINDOWS
 #include "Windows/AllowWindowsPlatformTypes.h"
@@ -183,6 +185,11 @@ public:
 	void StartupModule() override
 	{
 #if PLATFORM_WINDOWS
+		if (!BlueprintBridge::IsServerEnabled() || IsRunningCommandlet() || (FApp::IsUnattended() && !BlueprintBridge::ShouldStartInUnattended()))
+		{
+			return;
+		}
+
 		PipeServer = MakeUnique<BlueprintBridge::FNamedPipeServer>();
 		if (PipeServer->Start())
 		{

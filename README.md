@@ -28,6 +28,9 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - pin linking, link movement, link breaking, pin defaults, type copying, safer pin lookup aliases, node movement, and node deletion
 - initial UMG widget-tree creation/editing and slot layout commands
 - batched request execution
+- command discovery through `ListCommands` and `DescribeCommand`
+- descriptive input schemas for registered commands
+- optional request validation against command schemas
 - automation coverage under the `BlueprintBridge` test namespace
 
 The plugin is still evolving. Some Blueprint systems remain context-sensitive and may need additional purpose-built primitives.
@@ -76,7 +79,8 @@ Protocol layer
     response object
     command name + params
 
-Command router
+Command registry
+    stores command metadata, risk, schemas, and handlers
     dispatches command names to C++ handlers
 
 Unreal operation layer
@@ -157,19 +161,35 @@ Config/DefaultEditorPerProjectUserSettings.ini
 Settings section:
 
 ```ini
-[/Script/BlueprintBridgeEditor.BlueprintBridge]
+[/Script/BlueprintBridgeEditor.BlueprintBridgeSettings]
+bEnableServer=true
 PipeName=BlueprintBridge
+bStartInUnattended=false
 bRequireAuthToken=false
 AuthToken=
+bValidateRequestsAgainstSchemas=false
+MaxBatchSize=0
 ```
 
 Settings:
 
+- `bEnableServer` — starts the named-pipe server when the editor starts.
 - `PipeName` — pipe name without the `\\.\pipe\` prefix.
+- `bStartInUnattended` — allows the server to start in unattended editor runs.
 - `bRequireAuthToken` — when `true`, every request must include `authToken`.
 - `AuthToken` — expected token value when auth is enabled.
+- `bValidateRequestsAgainstSchemas` — validates required fields and basic JSON types before running a command.
+- `MaxBatchSize` — maximum requests in a `Batch`; `0` means unlimited.
 
 If auth is enabled and a request omits `authToken` or sends the wrong token, BlueprintBridge returns an `Unauthorized` error.
+
+Schema validation is off by default to preserve existing client behavior.
+
+The legacy section is still read for compatibility:
+
+```ini
+[/Script/BlueprintBridgeEditor.BlueprintBridge]
+```
 
 ## Installation
 
@@ -255,6 +275,26 @@ Most graph commands use this common shape:
 - `Ping`
 - `GetProjectName`
 - `GetEngineVersion`
+
+### Command discovery
+
+#### `ListCommands`
+
+Returns registered command names, descriptions, categories, and risk levels.
+
+```json
+{}
+```
+
+#### `DescribeCommand`
+
+Returns metadata and schemas for one command.
+
+```json
+{
+  "command": "DescribeBlueprint"
+}
+```
 
 ### Batch execution
 
@@ -435,7 +475,7 @@ Sets Blueprint variable metadata and replication flags.
 ```json
 {
   "asset": "/Game/Path/BP_Asset",
-  "name": "SomeValue",
+  "variable": "SomeValue",
   "instanceEditable": true,
   "blueprintReadOnly": false,
   "exposeOnSpawn": true,
@@ -919,7 +959,7 @@ D:/Path/To/Engine/Binaries/Win64/UnrealEditor-Cmd.exe \
 
 Current test areas include:
 
-- protocol basics and auth
+- protocol basics, auth, command discovery, schemas, and schema validation
 - Blueprint inspection and variable references
 - graph/node/pin editing
 - function graph commands
@@ -969,8 +1009,7 @@ Do not paste GitHub credentials, tokens, or passwords into AI chats or logs. Use
 - Some Blueprint node families are highly context-sensitive and may still require specialized commands.
 - UMG support covers initial widget-tree/layout/runtime helpers but not the full UMG authoring surface.
 - Animation Blueprints, Materials, Niagara, Behavior Trees, and State Trees are not covered as separate graph systems yet.
-- The command implementation is still concentrated in a large `.cpp` and should eventually be split by domain.
-
+- Most command implementations are still concentrated in a large `.cpp` and should eventually be split by domain.
 ## Roadmap
 
 High-value next work:
@@ -978,7 +1017,7 @@ High-value next work:
 - richer compile diagnostics in command responses
 - split command implementation into smaller source files
 - standalone cross-shell CLI client
-- generated command schema/docs
+- richer schema detail and generated docs
 - remove/rename Blueprint variables
 - more delegate unbind/clear helpers
 - richer array/map/set graph operations

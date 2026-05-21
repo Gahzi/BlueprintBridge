@@ -2,6 +2,10 @@
 
 #include "Modules/ModuleManager.h"
 
+#include "BlueprintBridgeCommandHandlers.h"
+#include "BlueprintBridgeCommandRegistry.h"
+#include "BlueprintBridgeSettings.h"
+
 #include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
 #include "Async/Async.h"
@@ -91,33 +95,9 @@ DEFINE_LOG_CATEGORY_STATIC(LogBlueprintBridge, Log, All);
 
 namespace BlueprintBridge
 {
-static constexpr TCHAR SettingsSection[] = TEXT("/Script/BlueprintBridgeEditor.BlueprintBridge");
-
-static FString GetConfiguredPipeName()
-{
-	FString PipeName = TEXT("BlueprintBridge");
-	GConfig->GetString(SettingsSection, TEXT("PipeName"), PipeName, GEditorPerProjectIni);
-	PipeName = PipeName.TrimStartAndEnd();
-	return PipeName.IsEmpty() ? TEXT("BlueprintBridge") : PipeName;
-}
-
 FString GetPipeNamePath()
 {
 	return FString::Printf(TEXT("\\\\.\\pipe\\%s"), *GetConfiguredPipeName());
-}
-
-static bool IsAuthRequired()
-{
-	bool bRequireAuthToken = false;
-	GConfig->GetBool(SettingsSection, TEXT("bRequireAuthToken"), bRequireAuthToken, GEditorPerProjectIni);
-	return bRequireAuthToken;
-}
-
-static FString GetConfiguredAuthToken()
-{
-	FString AuthToken;
-	GConfig->GetString(SettingsSection, TEXT("AuthToken"), AuthToken, GEditorPerProjectIni);
-	return AuthToken;
 }
 
 static bool ValidateAuthToken(const TSharedPtr<FJsonObject>& Request)
@@ -374,7 +354,7 @@ static void AddWidgetTreeDescription(TSharedRef<FJsonObject> Result, UWidgetBlue
 	Result->SetObjectField(TEXT("widgetTree"), TreeJson);
 }
 
-static TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	if (!Params.IsValid() || !Params->HasTypedField<EJson::String>(TEXT("asset")))
 	{
@@ -522,7 +502,7 @@ static TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node)
 	return NodeJson;
 }
 
-static TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString GraphName;
@@ -559,7 +539,7 @@ static TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString VariableName;
@@ -851,7 +831,7 @@ static TSharedRef<FJsonObject> FinishGraphEdit(const FString& Id, UBlueprint* Bl
 	return FinishGraphEdit(Id, Blueprint, nullptr, Node);
 }
 
-static TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -876,7 +856,7 @@ static TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TShar
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddVariableSetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddVariableSetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -901,7 +881,7 @@ static TSharedRef<FJsonObject> AddVariableSetNode(const FString& Id, const TShar
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddBranchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddBranchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -920,7 +900,7 @@ static TSharedRef<FJsonObject> AddBranchNode(const FString& Id, const TSharedPtr
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddEnumEqualityNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddEnumEqualityNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -939,7 +919,7 @@ static TSharedRef<FJsonObject> AddEnumEqualityNode(const FString& Id, const TSha
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddFunctionCallNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddFunctionCallNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -992,7 +972,7 @@ static UFunction* FindFunctionForNodeCommand(const FString& ClassPath, const FSt
 	return FunctionClass ? FunctionClass->FindFunctionByName(*FunctionName) : nullptr;
 }
 
-static TSharedRef<FJsonObject> AddSelfNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddSelfNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1013,7 +993,7 @@ static TSharedRef<FJsonObject> AddSelfNode(const FString& Id, const TSharedPtr<F
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddArrayFunctionNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddArrayFunctionNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1066,7 +1046,7 @@ static TSharedRef<FJsonObject> AddArrayFunctionNode(const FString& Id, const TSh
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddTimerNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddTimerNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString Operation;
 	if (!TryGetRequiredString(Params, TEXT("operation"), Operation))
@@ -1101,7 +1081,7 @@ static TSharedRef<FJsonObject> AddTimerNode(const FString& Id, const TSharedPtr<
 	return AddFunctionCallNode(Id, Params);
 }
 
-static TSharedRef<FJsonObject> AddLineTraceNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddLineTraceNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString Operation;
 	Params->TryGetStringField(TEXT("operation"), Operation);
@@ -1111,7 +1091,7 @@ static TSharedRef<FJsonObject> AddLineTraceNode(const FString& Id, const TShared
 	return AddFunctionCallNode(Id, Params);
 }
 
-static TSharedRef<FJsonObject> AddMathNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddMathNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString FunctionName;
 	if (!TryGetRequiredString(Params, TEXT("function"), FunctionName))
@@ -1123,7 +1103,7 @@ static TSharedRef<FJsonObject> AddMathNode(const FString& Id, const TSharedPtr<F
 	return AddFunctionCallNode(Id, Params);
 }
 
-static TSharedRef<FJsonObject> AddWidgetFunctionNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddWidgetFunctionNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString WidgetClassPath;
 	FString FunctionName;
@@ -1170,7 +1150,7 @@ static bool AddUserDefinedOutputPinsFromArray(UBlueprint* Blueprint, UK2Node_Edi
 	return true;
 }
 
-static TSharedRef<FJsonObject> AddCustomEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddCustomEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1215,7 +1195,7 @@ static TSharedRef<FJsonObject> AddCustomEventNode(const FString& Id, const TShar
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1262,7 +1242,7 @@ static TSharedRef<FJsonObject> AddEventNode(const FString& Id, const TSharedPtr<
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddDynamicCastNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddDynamicCastNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1299,7 +1279,7 @@ static TSharedRef<FJsonObject> AddDynamicCastNode(const FString& Id, const TShar
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddSpawnActorNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddSpawnActorNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1345,7 +1325,7 @@ static TSharedRef<FJsonObject> AddSpawnActorNode(const FString& Id, const TShare
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddEventDispatcher(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddEventDispatcher(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString DispatcherName;
@@ -1425,7 +1405,7 @@ static TSharedRef<FJsonObject> AddEventDispatcher(const FString& Id, const TShar
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AddComponentEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddComponentEventNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1475,7 +1455,7 @@ static TSharedRef<FJsonObject> AddComponentEventNode(const FString& Id, const TS
 
 static FMulticastDelegateProperty* FindDelegatePropertyForCommand(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutError, UClass*& OutOwnerClass);
 
-static TSharedRef<FJsonObject> AddDelegateBindNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddDelegateBindNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1535,7 +1515,7 @@ static FMulticastDelegateProperty* FindDelegatePropertyForCommand(UBlueprint* Bl
 	return DelegateProperty;
 }
 
-static TSharedRef<FJsonObject> AddDelegateBroadcastNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddDelegateBroadcastNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1567,7 +1547,7 @@ static TSharedRef<FJsonObject> AddDelegateBroadcastNode(const FString& Id, const
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddCreateDelegateNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddCreateDelegateNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1594,7 +1574,7 @@ static TSharedRef<FJsonObject> AddCreateDelegateNode(const FString& Id, const TS
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> SetCreateDelegateFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetCreateDelegateFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1688,22 +1668,22 @@ static TSharedRef<FJsonObject> AddMacroInstanceNode(const FString& Id, const TSh
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddForLoopNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddForLoopNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddMacroInstanceNode(Id, Params, TEXT("ForLoop"));
 }
 
-static TSharedRef<FJsonObject> AddForEachLoopNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddForEachLoopNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddMacroInstanceNode(Id, Params, TEXT("ForEachLoop"));
 }
 
-static TSharedRef<FJsonObject> AddAuthoritySwitchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddAuthoritySwitchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddMacroInstanceNode(Id, Params, TEXT("Switch Has Authority"), TEXT("/Engine/EditorBlueprintResources/ActorMacros.ActorMacros"));
 }
 
-static TSharedRef<FJsonObject> AddCreateWidgetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddCreateWidgetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1810,17 +1790,17 @@ static TSharedRef<FJsonObject> AddStructNode(const FString& Id, const TSharedPtr
 	return FinishGraphEdit(Id, Blueprint, Graph, Node);
 }
 
-static TSharedRef<FJsonObject> AddMakeStructNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddMakeStructNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddStructNode(Id, Params, true);
 }
 
-static TSharedRef<FJsonObject> AddBreakStructNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddBreakStructNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddStructNode(Id, Params, false);
 }
 
-static TSharedRef<FJsonObject> ConnectPins(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> ConnectPins(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1861,7 +1841,7 @@ static TSharedRef<FJsonObject> ConnectPins(const FString& Id, const TSharedPtr<F
 	return FinishGraphEdit(Id, Blueprint, nullptr);
 }
 
-static TSharedRef<FJsonObject> MovePinLinksCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> MovePinLinksCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1895,7 +1875,7 @@ static TSharedRef<FJsonObject> MovePinLinksCommand(const FString& Id, const TSha
 	return FinishGraphEdit(Id, Blueprint, nullptr);
 }
 
-static TSharedRef<FJsonObject> SetPinDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetPinDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1926,7 +1906,7 @@ static TSharedRef<FJsonObject> SetPinDefault(const FString& Id, const TSharedPtr
 	return FinishGraphEdit(Id, Blueprint, nullptr);
 }
 
-static TSharedRef<FJsonObject> BreakPinLinks(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> BreakPinLinks(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1956,7 +1936,7 @@ static TSharedRef<FJsonObject> BreakPinLinks(const FString& Id, const TSharedPtr
 	return FinishGraphEdit(Id, Blueprint, nullptr);
 }
 
-static TSharedRef<FJsonObject> CopyPinType(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CopyPinType(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -1990,7 +1970,7 @@ static TSharedRef<FJsonObject> CopyPinType(const FString& Id, const TSharedPtr<F
 	return FinishGraphEdit(Id, Blueprint, ToPin->GetOwningNode());
 }
 
-static TSharedRef<FJsonObject> DeleteNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DeleteNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2077,7 +2057,7 @@ static UK2Node_FunctionResult* FindFunctionResultNode(UEdGraph* Graph)
 	return nullptr;
 }
 
-static TSharedRef<FJsonObject> AddVariableGetterFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddVariableGetterFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString FunctionName;
@@ -2247,7 +2227,7 @@ static bool TryMakePinTypeFromParams(UBlueprint* Blueprint, const TSharedPtr<FJs
 	return true;
 }
 
-static TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2274,7 +2254,7 @@ static TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSha
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -2343,7 +2323,7 @@ static TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJs
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString FunctionName;
@@ -2371,7 +2351,7 @@ static TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSha
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> CreateEventGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CreateEventGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString GraphName;
@@ -2455,17 +2435,17 @@ static TSharedRef<FJsonObject> AddFunctionPin(const FString& Id, const TSharedPt
 	return FinishGraphEdit(Id, Blueprint, Cast<UEdGraphNode>(Terminator));
 }
 
-static TSharedRef<FJsonObject> AddFunctionInput(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddFunctionInput(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddFunctionPin(Id, Params, false);
 }
 
-static TSharedRef<FJsonObject> AddFunctionOutput(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddFunctionOutput(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	return AddFunctionPin(Id, Params, true);
 }
 
-static TSharedRef<FJsonObject> RenameCustomEvent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> RenameCustomEvent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2500,7 +2480,7 @@ static TSharedRef<FJsonObject> RenameCustomEvent(const FString& Id, const TShare
 	return FinishGraphEdit(Id, Blueprint, Graph, EventNode);
 }
 
-static TSharedRef<FJsonObject> EditUserDefinedPin(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> EditUserDefinedPin(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2570,7 +2550,7 @@ static TSharedRef<FJsonObject> EditUserDefinedPin(const FString& Id, const TShar
 	return FinishGraphEdit(Id, Blueprint, Graph, EditableNode);
 }
 
-static TSharedRef<FJsonObject> DeleteGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DeleteGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString GraphName;
@@ -2592,7 +2572,7 @@ static TSharedRef<FJsonObject> DeleteGraph(const FString& Id, const TSharedPtr<F
 	return MakeSuccessMessage(Id, TEXT("GraphDeleted"));
 }
 
-static TSharedRef<FJsonObject> RenameGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> RenameGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString GraphName;
@@ -2618,7 +2598,7 @@ static TSharedRef<FJsonObject> RenameGraph(const FString& Id, const TSharedPtr<F
 	return MakeSuccessMessage(Id, TEXT("GraphRenamed"));
 }
 
-static TSharedRef<FJsonObject> SetNodePosition(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetNodePosition(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2649,7 +2629,7 @@ static TSharedRef<FJsonObject> SetNodePosition(const FString& Id, const TSharedP
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddCommentNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddCommentNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2674,7 +2654,7 @@ static TSharedRef<FJsonObject> AddCommentNode(const FString& Id, const TSharedPt
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddRerouteNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddRerouteNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2695,7 +2675,7 @@ static TSharedRef<FJsonObject> AddRerouteNode(const FString& Id, const TSharedPt
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddSequenceNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddSequenceNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2722,7 +2702,7 @@ static TSharedRef<FJsonObject> AddSequenceNode(const FString& Id, const TSharedP
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
-static TSharedRef<FJsonObject> AddEnumSwitchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddEnumSwitchNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph* Graph = nullptr;
@@ -2823,7 +2803,7 @@ static TSharedRef<FJsonObject> DescribeComponentNode(USCS_Node* Node)
 	return Result;
 }
 
-static TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -2851,7 +2831,7 @@ static TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TShar
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ComponentName;
@@ -2916,7 +2896,7 @@ static TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AttachComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AttachComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ComponentName;
@@ -2964,7 +2944,7 @@ static TSharedRef<FJsonObject> AttachComponent(const FString& Id, const TSharedP
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> SetComponentTransform(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetComponentTransform(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ComponentName;
@@ -3022,7 +3002,7 @@ static TSharedRef<FJsonObject> SetComponentTransform(const FString& Id, const TS
 	return MakeSuccessMessage(Id, TEXT("ComponentTransformSet"));
 }
 
-static TSharedRef<FJsonObject> SetComponentProperty(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetComponentProperty(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ComponentName;
@@ -3099,7 +3079,7 @@ static bool TryGetComponentTemplate(const FString& Id, const TSharedPtr<FJsonObj
 	return true;
 }
 
-static TSharedRef<FJsonObject> SetRootComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetRootComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ComponentName;
@@ -3142,7 +3122,7 @@ static TSharedRef<FJsonObject> SetRootComponent(const FString& Id, const TShared
 	return MakeSuccessMessage(Id, TEXT("RootComponentSet"));
 }
 
-static TSharedRef<FJsonObject> SetStaticMesh(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetStaticMesh(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString MeshPath;
 	if (!TryGetRequiredString(Params, TEXT("mesh"), MeshPath))
@@ -3179,7 +3159,7 @@ static TSharedRef<FJsonObject> SetStaticMesh(const FString& Id, const TSharedPtr
 	return MakeSuccessMessage(Id, TEXT("StaticMeshSet"));
 }
 
-static TSharedRef<FJsonObject> SetCollisionProfileName(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetCollisionProfileName(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString ProfileName;
 	if (!TryGetRequiredString(Params, TEXT("profile"), ProfileName))
@@ -3210,7 +3190,7 @@ static TSharedRef<FJsonObject> SetCollisionProfileName(const FString& Id, const 
 	return MakeSuccessMessage(Id, TEXT("CollisionProfileSet"));
 }
 
-static TSharedRef<FJsonObject> SetBoxExtent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetBoxExtent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	const TSharedPtr<FJsonObject>* ExtentObject = nullptr;
 	if (!Params.IsValid() || !Params->TryGetObjectField(TEXT("extent"), ExtentObject) || ExtentObject == nullptr || !ExtentObject->IsValid())
@@ -3242,7 +3222,7 @@ static TSharedRef<FJsonObject> SetBoxExtent(const FString& Id, const TSharedPtr<
 	return MakeSuccessMessage(Id, TEXT("BoxExtentSet"));
 }
 
-static TSharedRef<FJsonObject> SetGenerateOverlapEvents(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetGenerateOverlapEvents(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	bool bGenerateOverlapEvents = false;
 	if (!Params.IsValid() || !Params->TryGetBoolField(TEXT("generateOverlapEvents"), bGenerateOverlapEvents))
@@ -3273,7 +3253,7 @@ static TSharedRef<FJsonObject> SetGenerateOverlapEvents(const FString& Id, const
 	return MakeSuccessMessage(Id, TEXT("GenerateOverlapEventsSet"));
 }
 
-static TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ParentClassPath;
@@ -3332,7 +3312,7 @@ static TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSh
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> CreateWidgetBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CreateWidgetBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3394,7 +3374,7 @@ static TSharedRef<FJsonObject> CreateWidgetBlueprintAsset(const FString& Id, con
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3414,7 +3394,7 @@ static TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TShar
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AddWidget(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddWidget(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString WidgetName;
@@ -3484,7 +3464,7 @@ static TSharedRef<FJsonObject> AddWidget(const FString& Id, const TSharedPtr<FJs
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> SetRootWidget(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetRootWidget(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString WidgetName;
@@ -3518,7 +3498,7 @@ static TSharedRef<FJsonObject> SetRootWidget(const FString& Id, const TSharedPtr
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AddWidgetToParent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddWidgetToParent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString ParentName;
@@ -3555,7 +3535,7 @@ static TSharedRef<FJsonObject> AddWidgetToParent(const FString& Id, const TShare
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> SetWidgetSlotLayout(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetWidgetSlotLayout(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString WidgetName;
@@ -3624,7 +3604,7 @@ static TSharedRef<FJsonObject> SetWidgetSlotLayout(const FString& Id, const TSha
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> DuplicateAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DuplicateAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString SourceAssetPath;
 	FString DestAssetPath;
@@ -3672,7 +3652,7 @@ static TSharedRef<FJsonObject> DuplicateAsset(const FString& Id, const TSharedPt
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> CheckoutAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CheckoutAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3717,7 +3697,7 @@ static FString GetBlueprintStatusString(const EBlueprintStatus Status)
 	}
 }
 
-static TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3739,7 +3719,7 @@ static TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TShared
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> SaveAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SaveAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3764,7 +3744,7 @@ static TSharedRef<FJsonObject> SaveAsset(const FString& Id, const TSharedPtr<FJs
 	return MakeSuccessMessage(Id, TEXT("Saved"));
 }
 
-static TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString PropertyName;
@@ -3933,7 +3913,7 @@ static bool SubobjectMatchesClassFilter(const UObject* Subobject, const FString&
 	return Class && Subobject->IsA(Class);
 }
 
-static TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
@@ -3969,7 +3949,7 @@ static TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TShar
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> SetSubobjectDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetSubobjectDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString SubobjectIdentifier;
@@ -4089,7 +4069,7 @@ static FName NormalizePinCategory(const FString& Category)
 	return *Category;
 }
 
-static TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString VariableName;
@@ -4205,7 +4185,7 @@ static TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, cons
 	return MakeSuccess(Id, Result);
 }
 
-static TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString Name;
@@ -4267,6 +4247,229 @@ static TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSh
 	return MakeSuccessMessage(Id, TEXT("VariableAdded"));
 }
 
+
+static TSharedRef<FJsonObject> MakeCommandDescription(const ICommand& Command, const bool bIncludeSchemas)
+{
+	TSharedRef<FJsonObject> CommandObject = MakeShared<FJsonObject>();
+	CommandObject->SetStringField(TEXT("name"), Command.GetName());
+	CommandObject->SetStringField(TEXT("description"), Command.GetDescription());
+	CommandObject->SetStringField(TEXT("category"), Command.GetCategory());
+	CommandObject->SetStringField(TEXT("risk"), CommandRiskToString(Command.GetRisk()));
+
+	if (bIncludeSchemas)
+	{
+		if (TSharedPtr<FJsonObject> InputSchema = Command.GetInputJsonSchema())
+		{
+			CommandObject->SetObjectField(TEXT("inputSchema"), InputSchema.ToSharedRef());
+		}
+
+		if (TSharedPtr<FJsonObject> OutputSchema = Command.GetOutputJsonSchema())
+		{
+			CommandObject->SetObjectField(TEXT("outputSchema"), OutputSchema.ToSharedRef());
+		}
+	}
+
+	return CommandObject;
+}
+
+TSharedRef<FJsonObject> ListCommands(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	TArray<TSharedPtr<FJsonValue>> Commands;
+	for (const TSharedRef<ICommand>& Command : GetCommandRegistry().GetCommands())
+	{
+		Commands.Add(MakeShared<FJsonValueObject>(MakeCommandDescription(*Command, false)));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("commands"), Commands);
+	return MakeSuccess(Id, Result);
+}
+
+TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString CommandName;
+	if (!TryGetRequiredString(Params, TEXT("command"), CommandName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeCommand requires params.command."));
+	}
+
+	const TSharedPtr<ICommand> Command = GetCommandRegistry().FindCommand(CommandName);
+	if (!Command.IsValid())
+	{
+		return MakeBridgeError(Id, TEXT("CommandNotFound"), FString::Printf(TEXT("Command '%s' was not found."), *CommandName));
+	}
+
+	return MakeSuccess(Id, MakeCommandDescription(*Command, true));
+}
+
+TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+
+static TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& RequestText);
+
+TSharedRef<FJsonObject> PingCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	return MakeSuccessMessage(Id, TEXT("Pong"));
+}
+
+TSharedRef<FJsonObject> GetProjectNameCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedRef<FJsonObject> Response = MakeShared<FJsonObject>();
+	Response->SetStringField(TEXT("id"), Id);
+	Response->SetBoolField(TEXT("ok"), true);
+	Response->SetStringField(TEXT("result"), FApp::GetProjectName());
+	return Response;
+}
+
+TSharedRef<FJsonObject> GetEngineVersionCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	TSharedRef<FJsonObject> Response = MakeShared<FJsonObject>();
+	Response->SetStringField(TEXT("id"), Id);
+	Response->SetBoolField(TEXT("ok"), true);
+	Response->SetStringField(TEXT("result"), FEngineVersion::Current().ToString());
+	return Response;
+}
+
+TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	const TArray<TSharedPtr<FJsonValue>>* Requests = nullptr;
+	if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("requests"), Requests) || Requests == nullptr)
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("Batch requires params.requests."));
+	}
+
+	const int32 MaxBatchSize = GetMaxBatchSize();
+	if (MaxBatchSize > 0 && Requests->Num() > MaxBatchSize)
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), FString::Printf(TEXT("Batch request count %d exceeds MaxBatchSize %d."), Requests->Num(), MaxBatchSize));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Results;
+	for (const TSharedPtr<FJsonValue>& RequestValue : *Requests)
+	{
+		const TSharedPtr<FJsonObject>* ChildRequest = nullptr;
+		if (!RequestValue.IsValid() || !RequestValue->TryGetObject(ChildRequest) || ChildRequest == nullptr || !ChildRequest->IsValid())
+		{
+			Results.Add(MakeShared<FJsonValueObject>(MakeBridgeError(Id, TEXT("InvalidBatchRequest"), TEXT("Each batch request must be an object."))));
+			continue;
+		}
+
+		if (!(*ChildRequest)->HasField(TEXT("id")))
+		{
+			(*ChildRequest)->SetStringField(TEXT("id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens));
+		}
+		if (!(*ChildRequest)->HasField(TEXT("version")))
+		{
+			(*ChildRequest)->SetNumberField(TEXT("version"), 1);
+		}
+		Results.Add(MakeShared<FJsonValueObject>(ExecuteRequestOnGameThread(JsonToString((*ChildRequest).ToSharedRef()))));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetArrayField(TEXT("responses"), Results);
+	return MakeSuccess(Id, Result);
+}
+
+static bool DoesJsonValueMatchType(const TSharedPtr<FJsonValue>& Value, const FString& ExpectedType)
+{
+	if (!Value.IsValid())
+	{
+		return false;
+	}
+
+	if (ExpectedType.Equals(TEXT("string"), ESearchCase::IgnoreCase))
+	{
+		return Value->Type == EJson::String;
+	}
+	if (ExpectedType.Equals(TEXT("number"), ESearchCase::IgnoreCase))
+	{
+		return Value->Type == EJson::Number;
+	}
+	if (ExpectedType.Equals(TEXT("boolean"), ESearchCase::IgnoreCase))
+	{
+		return Value->Type == EJson::Boolean;
+	}
+	if (ExpectedType.Equals(TEXT("object"), ESearchCase::IgnoreCase))
+	{
+		return Value->Type == EJson::Object;
+	}
+	if (ExpectedType.Equals(TEXT("array"), ESearchCase::IgnoreCase))
+	{
+		return Value->Type == EJson::Array;
+	}
+
+	return true;
+}
+
+static bool ValidateCommandParamsAgainstSchema(const FString& CommandName, const TSharedPtr<FJsonObject>& Params, const TSharedPtr<FJsonObject>& Schema, FString& OutError)
+{
+	if (!Schema.IsValid())
+	{
+		return true;
+	}
+
+	FString SchemaType;
+	if (Schema->TryGetStringField(TEXT("type"), SchemaType) && !SchemaType.Equals(TEXT("object"), ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* RequiredFields = nullptr;
+	if (Schema->TryGetArrayField(TEXT("required"), RequiredFields) && RequiredFields != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& RequiredField : *RequiredFields)
+		{
+			FString FieldName;
+			if (RequiredField.IsValid() && RequiredField->TryGetString(FieldName) && (!Params.IsValid() || !Params->HasField(FieldName)))
+			{
+				OutError = FString::Printf(TEXT("%s requires params.%s."), *CommandName, *FieldName);
+				return false;
+			}
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* Properties = nullptr;
+	if (!Schema->TryGetObjectField(TEXT("properties"), Properties) || Properties == nullptr || !Properties->IsValid() || !Params.IsValid())
+	{
+		return true;
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& PropertyPair : (*Properties)->Values)
+	{
+		const TSharedPtr<FJsonValue>* ParamValue = Params->Values.Find(PropertyPair.Key);
+		if (!ParamValue || !ParamValue->IsValid())
+		{
+			continue;
+		}
+
+		const TSharedPtr<FJsonObject>* PropertySchema = nullptr;
+		if (!PropertyPair.Value.IsValid() || !PropertyPair.Value->TryGetObject(PropertySchema) || PropertySchema == nullptr || !PropertySchema->IsValid())
+		{
+			continue;
+		}
+
+		FString ExpectedType;
+		if ((*PropertySchema)->TryGetStringField(TEXT("type"), ExpectedType) && !DoesJsonValueMatchType(*ParamValue, ExpectedType))
+		{
+			OutError = FString::Printf(TEXT("%s params.%s must be a %s."), *CommandName, *PropertyPair.Key, *ExpectedType);
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static void EnsureCommandsRegistered()
+{
+	static bool bRegistered = false;
+	if (bRegistered)
+	{
+		return;
+	}
+
+	bRegistered = true;
+	RegisterBlueprintBridgeCommands();
+}
+
 static TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& RequestText)
 {
 	TSharedPtr<FJsonObject> Request;
@@ -4287,373 +4490,22 @@ static TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& Request
 	Request->TryGetObjectField(TEXT("params"), ParamsPtr);
 	const TSharedPtr<FJsonObject> Params = ParamsPtr ? *ParamsPtr : nullptr;
 
-	TSharedRef<FJsonObject> Response = MakeShared<FJsonObject>();
-	Response->SetStringField(TEXT("id"), Id);
-	Response->SetBoolField(TEXT("ok"), true);
-
-	if (Command.Equals(TEXT("Batch"), ESearchCase::IgnoreCase))
+	EnsureCommandsRegistered();
+	if (const TSharedPtr<ICommand> RegisteredCommand = GetCommandRegistry().FindCommand(Command))
 	{
-		const TArray<TSharedPtr<FJsonValue>>* Requests = nullptr;
-		if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("requests"), Requests) || Requests == nullptr)
+		if (ShouldValidateRequestsAgainstSchemas())
 		{
-			return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("Batch requires params.requests."));
+			FString ValidationError;
+			if (!ValidateCommandParamsAgainstSchema(RegisteredCommand->GetName(), Params, RegisteredCommand->GetInputJsonSchema(), ValidationError))
+			{
+				return MakeBridgeError(Id, TEXT("InvalidParams"), ValidationError);
+			}
 		}
 
-		TArray<TSharedPtr<FJsonValue>> Results;
-		for (const TSharedPtr<FJsonValue>& RequestValue : *Requests)
-		{
-			const TSharedPtr<FJsonObject>* ChildRequest = nullptr;
-			if (!RequestValue.IsValid() || !RequestValue->TryGetObject(ChildRequest) || ChildRequest == nullptr || !ChildRequest->IsValid())
-			{
-				Results.Add(MakeShared<FJsonValueObject>(MakeBridgeError(Id, TEXT("InvalidBatchRequest"), TEXT("Each batch request must be an object."))));
-				continue;
-			}
-
-			if (!(*ChildRequest)->HasField(TEXT("id")))
-			{
-				(*ChildRequest)->SetStringField(TEXT("id"), FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens));
-			}
-			if (!(*ChildRequest)->HasField(TEXT("version")))
-			{
-				(*ChildRequest)->SetNumberField(TEXT("version"), 1);
-			}
-			Results.Add(MakeShared<FJsonValueObject>(ExecuteRequestOnGameThread(JsonToString((*ChildRequest).ToSharedRef()))));
-		}
-
-		TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-		Result->SetArrayField(TEXT("responses"), Results);
-		return MakeSuccess(Id, Result);
-	}
-	else if (Command.Equals(TEXT("Ping"), ESearchCase::IgnoreCase))
-	{
-		Response->SetStringField(TEXT("result"), TEXT("Pong"));
-	}
-	else if (Command.Equals(TEXT("GetProjectName"), ESearchCase::IgnoreCase))
-	{
-		Response->SetStringField(TEXT("result"), FApp::GetProjectName());
-	}
-	else if (Command.Equals(TEXT("GetEngineVersion"), ESearchCase::IgnoreCase))
-	{
-		Response->SetStringField(TEXT("result"), FEngineVersion::Current().ToString());
-	}
-	else if (Command.Equals(TEXT("DescribeBlueprint"), ESearchCase::IgnoreCase))
-	{
-		return DescribeBlueprint(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DescribeGraph"), ESearchCase::IgnoreCase))
-	{
-		return DescribeGraph(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DescribeNode"), ESearchCase::IgnoreCase))
-	{
-		return DescribeNodeCommand(Id, Params);
-	}
-	else if (Command.Equals(TEXT("FindNodes"), ESearchCase::IgnoreCase))
-	{
-		return FindNodes(Id, Params);
-	}
-	else if (Command.Equals(TEXT("FindVariableReferences"), ESearchCase::IgnoreCase))
-	{
-		return FindVariableReferences(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DescribeComponents"), ESearchCase::IgnoreCase))
-	{
-		return DescribeComponents(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddComponent"), ESearchCase::IgnoreCase))
-	{
-		return AddComponent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AttachComponent"), ESearchCase::IgnoreCase))
-	{
-		return AttachComponent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetComponentTransform"), ESearchCase::IgnoreCase))
-	{
-		return SetComponentTransform(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetComponentProperty"), ESearchCase::IgnoreCase))
-	{
-		return SetComponentProperty(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetRootComponent"), ESearchCase::IgnoreCase))
-	{
-		return SetRootComponent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetStaticMesh"), ESearchCase::IgnoreCase))
-	{
-		return SetStaticMesh(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetCollisionProfileName"), ESearchCase::IgnoreCase))
-	{
-		return SetCollisionProfileName(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetBoxExtent"), ESearchCase::IgnoreCase))
-	{
-		return SetBoxExtent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetGenerateOverlapEvents"), ESearchCase::IgnoreCase))
-	{
-		return SetGenerateOverlapEvents(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddVariableGetNode"), ESearchCase::IgnoreCase))
-	{
-		return AddVariableGetNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddVariableSetNode"), ESearchCase::IgnoreCase))
-	{
-		return AddVariableSetNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CreateFunctionGraph"), ESearchCase::IgnoreCase))
-	{
-		return CreateFunctionGraph(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CreateEventGraph"), ESearchCase::IgnoreCase))
-	{
-		return CreateEventGraph(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddFunctionInput"), ESearchCase::IgnoreCase))
-	{
-		return AddFunctionInput(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddFunctionOutput"), ESearchCase::IgnoreCase))
-	{
-		return AddFunctionOutput(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DeleteGraph"), ESearchCase::IgnoreCase))
-	{
-		return DeleteGraph(Id, Params);
-	}
-	else if (Command.Equals(TEXT("RenameCustomEvent"), ESearchCase::IgnoreCase))
-	{
-		return RenameCustomEvent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("EditUserDefinedPin"), ESearchCase::IgnoreCase))
-	{
-		return EditUserDefinedPin(Id, Params);
-	}
-	else if (Command.Equals(TEXT("RenameGraph"), ESearchCase::IgnoreCase))
-	{
-		return RenameGraph(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddVariableGetterFunction"), ESearchCase::IgnoreCase))
-	{
-		return AddVariableGetterFunction(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddBranchNode"), ESearchCase::IgnoreCase))
-	{
-		return AddBranchNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddSequenceNode"), ESearchCase::IgnoreCase))
-	{
-		return AddSequenceNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddRerouteNode"), ESearchCase::IgnoreCase))
-	{
-		return AddRerouteNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddCommentNode"), ESearchCase::IgnoreCase))
-	{
-		return AddCommentNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddEnumSwitchNode"), ESearchCase::IgnoreCase))
-	{
-		return AddEnumSwitchNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddEnumEqualityNode"), ESearchCase::IgnoreCase))
-	{
-		return AddEnumEqualityNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddFunctionCallNode"), ESearchCase::IgnoreCase))
-	{
-		return AddFunctionCallNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddSelfNode"), ESearchCase::IgnoreCase))
-	{
-		return AddSelfNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddArrayFunctionNode"), ESearchCase::IgnoreCase))
-	{
-		return AddArrayFunctionNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddTimerNode"), ESearchCase::IgnoreCase))
-	{
-		return AddTimerNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddLineTraceNode"), ESearchCase::IgnoreCase))
-	{
-		return AddLineTraceNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddMathNode"), ESearchCase::IgnoreCase))
-	{
-		return AddMathNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddWidgetFunctionNode"), ESearchCase::IgnoreCase))
-	{
-		return AddWidgetFunctionNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddCustomEventNode"), ESearchCase::IgnoreCase))
-	{
-		return AddCustomEventNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddEventNode"), ESearchCase::IgnoreCase))
-	{
-		return AddEventNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddDynamicCastNode"), ESearchCase::IgnoreCase))
-	{
-		return AddDynamicCastNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddSpawnActorNode"), ESearchCase::IgnoreCase))
-	{
-		return AddSpawnActorNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddEventDispatcher"), ESearchCase::IgnoreCase))
-	{
-		return AddEventDispatcher(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddComponentEventNode"), ESearchCase::IgnoreCase))
-	{
-		return AddComponentEventNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddDelegateBindNode"), ESearchCase::IgnoreCase))
-	{
-		return AddDelegateBindNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddDelegateBroadcastNode"), ESearchCase::IgnoreCase))
-	{
-		return AddDelegateBroadcastNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddCreateDelegateNode"), ESearchCase::IgnoreCase))
-	{
-		return AddCreateDelegateNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetCreateDelegateFunction"), ESearchCase::IgnoreCase))
-	{
-		return SetCreateDelegateFunction(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddForLoopNode"), ESearchCase::IgnoreCase))
-	{
-		return AddForLoopNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddForEachLoopNode"), ESearchCase::IgnoreCase))
-	{
-		return AddForEachLoopNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddAuthoritySwitchNode"), ESearchCase::IgnoreCase))
-	{
-		return AddAuthoritySwitchNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddMakeStructNode"), ESearchCase::IgnoreCase))
-	{
-		return AddMakeStructNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddBreakStructNode"), ESearchCase::IgnoreCase))
-	{
-		return AddBreakStructNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddCreateWidgetNode"), ESearchCase::IgnoreCase))
-	{
-		return AddCreateWidgetNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("ConnectPins"), ESearchCase::IgnoreCase))
-	{
-		return ConnectPins(Id, Params);
-	}
-	else if (Command.Equals(TEXT("MovePinLinks"), ESearchCase::IgnoreCase))
-	{
-		return MovePinLinksCommand(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetPinDefault"), ESearchCase::IgnoreCase))
-	{
-		return SetPinDefault(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetNodePosition"), ESearchCase::IgnoreCase))
-	{
-		return SetNodePosition(Id, Params);
-	}
-	else if (Command.Equals(TEXT("BreakPinLinks"), ESearchCase::IgnoreCase))
-	{
-		return BreakPinLinks(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CopyPinType"), ESearchCase::IgnoreCase))
-	{
-		return CopyPinType(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DeleteNode"), ESearchCase::IgnoreCase))
-	{
-		return DeleteNode(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CreateBlueprintAsset"), ESearchCase::IgnoreCase))
-	{
-		return CreateBlueprintAsset(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CreateWidgetBlueprintAsset"), ESearchCase::IgnoreCase))
-	{
-		return CreateWidgetBlueprintAsset(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DescribeWidgetTree"), ESearchCase::IgnoreCase))
-	{
-		return DescribeWidgetTree(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddWidget"), ESearchCase::IgnoreCase))
-	{
-		return AddWidget(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetRootWidget"), ESearchCase::IgnoreCase))
-	{
-		return SetRootWidget(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddWidgetToParent"), ESearchCase::IgnoreCase))
-	{
-		return AddWidgetToParent(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetWidgetSlotLayout"), ESearchCase::IgnoreCase))
-	{
-		return SetWidgetSlotLayout(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DuplicateAsset"), ESearchCase::IgnoreCase))
-	{
-		return DuplicateAsset(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CheckoutAsset"), ESearchCase::IgnoreCase))
-	{
-		return CheckoutAsset(Id, Params);
-	}
-	else if (Command.Equals(TEXT("CompileBlueprint"), ESearchCase::IgnoreCase))
-	{
-		return CompileBlueprint(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SaveAsset"), ESearchCase::IgnoreCase))
-	{
-		return SaveAsset(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetBlueprintDefault"), ESearchCase::IgnoreCase))
-	{
-		return SetBlueprintDefault(Id, Params);
-	}
-	else if (Command.Equals(TEXT("DescribeSubobjects"), ESearchCase::IgnoreCase))
-	{
-		return DescribeSubobjects(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetSubobjectDefault"), ESearchCase::IgnoreCase))
-	{
-		return SetSubobjectDefault(Id, Params);
-	}
-	else if (Command.Equals(TEXT("SetBlueprintVariableFlags"), ESearchCase::IgnoreCase))
-	{
-		return SetBlueprintVariableFlags(Id, Params);
-	}
-	else if (Command.Equals(TEXT("AddBlueprintVariable"), ESearchCase::IgnoreCase))
-	{
-		return AddBlueprintVariable(Id, Params);
-	}
-	else
-	{
-		return MakeBridgeError(Id, TEXT("UnknownCommand"), FString::Printf(TEXT("Unknown command '%s'."), *Command));
+		return RegisteredCommand->Execute(Id, Params);
 	}
 
-	return Response;
+	return MakeBridgeError(Id, TEXT("UnknownCommand"), FString::Printf(TEXT("Unknown command '%s'."), *Command));
 }
 
 TSharedRef<FJsonObject> ExecuteRequest(const FString& RequestText)

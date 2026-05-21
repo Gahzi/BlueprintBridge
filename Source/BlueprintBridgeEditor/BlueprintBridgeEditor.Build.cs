@@ -16,6 +16,7 @@ public class BlueprintBridgeEditor : ModuleRules
 				"BlueprintGraph",
 				"Core",
 				"CoreUObject",
+				"DeveloperSettings",
 				"Engine",
 				"Json",
 				"JsonUtilities",

@@ -106,6 +106,19 @@ static bool ExpectErrorCode(FAutomationTestBase& Test, const TSharedRef<FJsonObj
 	return Test.TestEqual(TEXT("Error code should match."), ActualCode, ExpectedCode);
 }
 
+static FString GetErrorMessage(const TSharedRef<FJsonObject>& Response)
+{
+	const TSharedPtr<FJsonObject>* ErrorObject = nullptr;
+	if (Response->TryGetObjectField(TEXT("error"), ErrorObject) && ErrorObject != nullptr && ErrorObject->IsValid())
+	{
+		FString Message;
+		(*ErrorObject)->TryGetStringField(TEXT("message"), Message);
+		return Message;
+	}
+
+	return FString();
+}
+
 static const TSharedPtr<FJsonObject>* GetResultObject(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
 {
 	const TSharedPtr<FJsonObject>* ResultObject = nullptr;
@@ -118,6 +131,46 @@ static FString GetStringResult(FAutomationTestBase& Test, const TSharedRef<FJson
 	FString Result;
 	Test.TestTrue(TEXT("Result should be a string."), Response->TryGetStringField(TEXT("result"), Result));
 	return Result;
+}
+
+static bool GetCommandRequiredFields(FAutomationTestBase& Test, const FString& CommandName, TSet<FString>& OutRequiredFields)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("command"), CommandName);
+	const TSharedRef<FJsonObject> Response = ExecuteJsonRequest(TEXT("DescribeCommand"), Params);
+	if (!ExpectSuccess(Test, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = GetResultObject(Test, Response);
+	if (!Result)
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* InputSchema = nullptr;
+	if (!Test.TestTrue(TEXT("Command should contain input schema."), (*Result)->TryGetObjectField(TEXT("inputSchema"), InputSchema) && InputSchema != nullptr && InputSchema->IsValid()))
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* RequiredFields = nullptr;
+	if (!(*InputSchema)->TryGetArrayField(TEXT("required"), RequiredFields) || RequiredFields == nullptr)
+	{
+		return true;
+	}
+
+	for (const TSharedPtr<FJsonValue>& RequiredField : *RequiredFields)
+	{
+		FString FieldName;
+		if (RequiredField.IsValid() && RequiredField->TryGetString(FieldName))
+		{
+			OutRequiredFields.Add(FieldName);
+		}
+	}
+
+	return true;
 }
 
 static const TSharedPtr<FJsonObject>* GetNodeObjectFromResponse(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
@@ -306,6 +359,37 @@ private:
 	FString OriginalAuthToken;
 };
 
+class FScopedBoolSetting final
+{
+public:
+	FScopedBoolSetting(const TCHAR* InKey, const bool bInValue)
+		: Key(InKey)
+	{
+		bHadValue = GConfig->GetBool(AuthSettingsSection, Key, bOriginalValue, GEditorPerProjectIni);
+		GConfig->SetBool(AuthSettingsSection, Key, bInValue, GEditorPerProjectIni);
+		GConfig->Flush(false, GEditorPerProjectIni);
+	}
+
+	~FScopedBoolSetting()
+	{
+		if (bHadValue)
+		{
+			GConfig->SetBool(AuthSettingsSection, Key, bOriginalValue, GEditorPerProjectIni);
+		}
+		else
+		{
+			GConfig->RemoveKey(AuthSettingsSection, Key, GEditorPerProjectIni);
+		}
+
+		GConfig->Flush(false, GEditorPerProjectIni);
+	}
+
+private:
+	const TCHAR* Key = nullptr;
+	bool bHadValue = false;
+	bool bOriginalValue = false;
+};
+
 struct FTestBlueprintAsset
 {
 	FString AssetPath;
@@ -456,6 +540,217 @@ bool FBlueprintBridgeUnknownCommandTest::RunTest(const FString& Parameters)
 {
 	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DefinitelyUnknownCommand"), MakeShared<FJsonObject>());
 	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("UnknownCommand"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCaseInsensitiveCommandTest, "BlueprintBridge.Protocol.CaseInsensitiveCommand", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCaseInsensitiveCommandTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ping"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	return TestEqual(TEXT("Lowercase ping should return Pong."), BlueprintBridgeTests::GetStringResult(*this, Response), FString(TEXT("Pong")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeListCommandsTest, "BlueprintBridge.Protocol.ListCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeListCommandsTest::RunTest(const FString& Parameters)
+{
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ListCommands"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Commands = nullptr;
+	if (!TestTrue(TEXT("ListCommands should return commands array."), (*Result)->TryGetArrayField(TEXT("commands"), Commands) && Commands != nullptr))
+	{
+		return false;
+	}
+
+	bool bFoundPing = false;
+	bool bFoundDescribeBlueprint = false;
+	bool bFoundDescribeCommand = false;
+	for (const TSharedPtr<FJsonValue>& CommandValue : *Commands)
+	{
+		const TSharedPtr<FJsonObject>* CommandObject = nullptr;
+		if (!TestTrue(TEXT("Each command should be an object."), CommandValue.IsValid() && CommandValue->TryGetObject(CommandObject) && CommandObject != nullptr && CommandObject->IsValid()))
+		{
+			return false;
+		}
+
+		FString Name;
+		FString Description;
+		FString Category;
+		FString Risk;
+		TestTrue(TEXT("Command should contain name."), (*CommandObject)->TryGetStringField(TEXT("name"), Name) && !Name.IsEmpty());
+		TestTrue(TEXT("Command should contain description."), (*CommandObject)->TryGetStringField(TEXT("description"), Description) && !Description.IsEmpty());
+		TestTrue(TEXT("Command should contain category."), (*CommandObject)->TryGetStringField(TEXT("category"), Category) && !Category.IsEmpty());
+		TestTrue(TEXT("Command should contain risk."), (*CommandObject)->TryGetStringField(TEXT("risk"), Risk) && !Risk.IsEmpty());
+
+		bFoundPing |= Name == TEXT("Ping");
+		bFoundDescribeBlueprint |= Name == TEXT("DescribeBlueprint");
+		bFoundDescribeCommand |= Name == TEXT("DescribeCommand");
+	}
+
+	TestTrue(TEXT("ListCommands should include Ping."), bFoundPing);
+	TestTrue(TEXT("ListCommands should include DescribeBlueprint."), bFoundDescribeBlueprint);
+	return TestTrue(TEXT("ListCommands should include DescribeCommand."), bFoundDescribeCommand);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeDescribeCommandTest, "BlueprintBridge.Protocol.DescribeCommand", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeDescribeCommandTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("command"), TEXT("ping"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeCommand"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+
+	FString Name;
+	FString Risk;
+	TestTrue(TEXT("DescribeCommand should return canonical command name."), (*Result)->TryGetStringField(TEXT("name"), Name) && Name == TEXT("Ping"));
+	TestTrue(TEXT("DescribeCommand should return command risk."), (*Result)->TryGetStringField(TEXT("risk"), Risk) && Risk == TEXT("ReadOnly"));
+
+	const TSharedPtr<FJsonObject>* InputSchema = nullptr;
+	if (!TestTrue(TEXT("DescribeCommand should return input schema."), (*Result)->TryGetObjectField(TEXT("inputSchema"), InputSchema) && InputSchema != nullptr && InputSchema->IsValid()))
+	{
+		return false;
+	}
+
+	FString SchemaType;
+	return TestTrue(TEXT("Input schema should be an object schema."), (*InputSchema)->TryGetStringField(TEXT("type"), SchemaType) && SchemaType == TEXT("object"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCommandSchemaTest, "BlueprintBridge.Protocol.CommandSchemas", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
+{
+	auto ExpectRequiredFields = [this](const FString& CommandName, const TArray<FString>& ExpectedFields)
+	{
+		TSet<FString> RequiredFields;
+		if (!BlueprintBridgeTests::GetCommandRequiredFields(*this, CommandName, RequiredFields))
+		{
+			return false;
+		}
+
+		bool bAllFound = true;
+		for (const FString& ExpectedField : ExpectedFields)
+		{
+			bAllFound &= TestTrue(FString::Printf(TEXT("%s schema should require %s."), *CommandName, *ExpectedField), RequiredFields.Contains(ExpectedField));
+		}
+		return bAllFound;
+	};
+
+	bool bSuccess = true;
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeCommand"), { TEXT("command") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeBlueprint"), { TEXT("asset") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeGraph"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeNode"), { TEXT("asset"), TEXT("graph"), TEXT("node") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindVariableReferences"), { TEXT("asset"), TEXT("variable") });
+	bSuccess &= ExpectRequiredFields(TEXT("ConnectPins"), { TEXT("asset"), TEXT("graph"), TEXT("fromNode"), TEXT("fromPin"), TEXT("toNode"), TEXT("toPin") });
+	bSuccess &= ExpectRequiredFields(TEXT("SetPinDefault"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin"), TEXT("value") });
+	bSuccess &= ExpectRequiredFields(TEXT("SetNodePosition"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("x"), TEXT("y") });
+	bSuccess &= ExpectRequiredFields(TEXT("AddComponent"), { TEXT("asset"), TEXT("name"), TEXT("componentClass") });
+	bSuccess &= ExpectRequiredFields(TEXT("AddFunctionCallNode"), { TEXT("asset"), TEXT("graph"), TEXT("x"), TEXT("y"), TEXT("functionClass"), TEXT("function") });
+	bSuccess &= ExpectRequiredFields(TEXT("AddWidget"), { TEXT("asset"), TEXT("name"), TEXT("widgetClass") });
+	bSuccess &= ExpectRequiredFields(TEXT("AddBlueprintVariable"), { TEXT("asset"), TEXT("name"), TEXT("category") });
+
+	const TSharedRef<FJsonObject> ListResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ListCommands"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, ListResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* ListResult = BlueprintBridgeTests::GetResultObject(*this, ListResponse);
+	const TArray<TSharedPtr<FJsonValue>>* Commands = nullptr;
+	if (!ListResult || !TestTrue(TEXT("ListCommands should return command list."), (*ListResult)->TryGetArrayField(TEXT("commands"), Commands) && Commands != nullptr))
+	{
+		return false;
+	}
+
+	for (const TSharedPtr<FJsonValue>& CommandValue : *Commands)
+	{
+		const TSharedPtr<FJsonObject>* CommandObject = nullptr;
+		if (!TestTrue(TEXT("Command list item should be an object."), CommandValue.IsValid() && CommandValue->TryGetObject(CommandObject) && CommandObject != nullptr && CommandObject->IsValid()))
+		{
+			return false;
+		}
+
+		FString CommandName;
+		if (!TestTrue(TEXT("Command list item should contain a name."), (*CommandObject)->TryGetStringField(TEXT("name"), CommandName) && !CommandName.IsEmpty()))
+		{
+			return false;
+		}
+
+		TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+		Params->SetStringField(TEXT("command"), CommandName);
+		const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeCommand"), Params);
+		if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+		{
+			return false;
+		}
+
+		const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+		const TSharedPtr<FJsonObject>* InputSchema = nullptr;
+		if (!DescribeResult || !TestTrue(FString::Printf(TEXT("%s should include inputSchema."), *CommandName), (*DescribeResult)->TryGetObjectField(TEXT("inputSchema"), InputSchema) && InputSchema != nullptr && InputSchema->IsValid()))
+		{
+			return false;
+		}
+
+		FString SchemaType;
+		bSuccess &= TestTrue(FString::Printf(TEXT("%s inputSchema should be an object."), *CommandName), (*InputSchema)->TryGetStringField(TEXT("type"), SchemaType) && SchemaType == TEXT("object"));
+		const TSharedPtr<FJsonObject>* Properties = nullptr;
+		bSuccess &= TestTrue(FString::Printf(TEXT("%s inputSchema should include properties."), *CommandName), (*InputSchema)->TryGetObjectField(TEXT("properties"), Properties) && Properties != nullptr && Properties->IsValid());
+	}
+
+	return bSuccess;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSchemaValidationTest, "BlueprintBridge.Protocol.SchemaValidation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSchemaValidationTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FScopedBoolSetting ScopedValidation(TEXT("bValidateRequestsAgainstSchemas"), true);
+
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("asset"), TEXT("/Game/DoesNotMatter"));
+	Params->SetNumberField(TEXT("graph"), 12.0);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraph"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("InvalidParams")))
+	{
+		return false;
+	}
+
+	return TestTrue(TEXT("Validation error should mention graph type."), BlueprintBridgeTests::GetErrorMessage(Response).Contains(TEXT("params.graph must be a string")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeDescribeUnknownCommandTest, "BlueprintBridge.Protocol.DescribeUnknownCommand", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeDescribeUnknownCommandTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("command"), TEXT("DefinitelyUnknownCommand"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeCommand"), Params);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("CommandNotFound"));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeUnauthorizedTest, "BlueprintBridge.Protocol.Unauthorized", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
