@@ -232,7 +232,7 @@ BlueprintBridge commands require a live Unreal Editor process. Headless `UnrealE
 This project includes a PowerShell helper script at:
 
 ```text
-Tools/BlueprintBridge/blueprintbridge.ps1
+Tools/PowerShell/blueprintbridge.ps1
 ```
 
 Example commands:
@@ -266,6 +266,16 @@ When calling from Git Bash/MSYS, disable path conversion so Unreal `/Game/...` p
 ```bash
 MSYS_NO_PATHCONV=1 powershell.exe -ExecutionPolicy Bypass -File D:/Path/To/blueprintbridge.ps1 describe-blueprint /Game/Example/BP_Example
 ```
+
+## Python client
+
+A small direct named-pipe client is available at:
+
+```text
+Tools/Python/blueprintbridge_client.py
+```
+
+It is intended for scripted agents that want to avoid shell path rewriting and reuse helpers such as `describe_function`, `duplicate_function_graph`, and `batch`.
 
 ## Core command reference
 
@@ -331,6 +341,7 @@ Executes a list of normal requests and returns per-request responses.
 
 ```json
 {
+  "rollbackOnFailure": true,
   "requests": [
     {
       "id": "describe",
@@ -341,6 +352,8 @@ Executes a list of normal requests and returns per-request responses.
   ]
 }
 ```
+
+`rollbackOnFailure` wraps the batch in an editor transaction and cancels it after the first failed child request.
 
 ### Blueprint and graph inspection
 
@@ -395,6 +408,74 @@ Returns graph nodes, pin names, pin directions, pin types, pin container types, 
   "variable": "ExampleState"
 }
 ```
+
+#### `AnalyzeGraph`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "ScoreSlam"
+}
+```
+
+Reports simple exec reachability plus disconnected/orphaned node classifications.
+
+### Reflection
+
+Reflection commands inspect Unreal metadata before graph mutation.
+
+#### `DescribeFunction`
+
+```json
+{
+  "class": "/Script/Engine.Actor",
+  "function": "K2_GetActorLocation"
+}
+```
+
+Returns function flags, `isPureNode`, `hasExecPins`, metadata, and reflected params with pin types/ref/const flags.
+
+#### `FindFunctions`
+
+```json
+{
+  "class": "/Script/Engine.Actor",
+  "nameContains": "Location",
+  "blueprintCallableOnly": true,
+  "includeInherited": true
+}
+```
+
+#### `DescribeClass`
+
+```json
+{
+  "class": "/Script/Engine.Actor",
+  "includeFunctions": true,
+  "includeProperties": false,
+  "includeDelegates": true
+}
+```
+
+#### `DescribeProperty`
+
+```json
+{
+  "class": "/Script/Engine.Actor",
+  "property": "PrimaryActorTick"
+}
+```
+
+#### `DescribeDelegate`
+
+```json
+{
+  "class": "/Script/Engine.Actor",
+  "delegate": "OnDestroyed"
+}
+```
+
+Returns the delegate property and signature params for binding-compatible Blueprint function creation.
 
 ### Asset, source control, compile, save
 
@@ -496,6 +577,8 @@ Supported container values:
 `Map` is currently rejected.
 
 Legacy `isArray: true` is also accepted.
+
+`AddBlueprintVariable` also accepts the same editor-facing flag fields as `SetBlueprintVariableFlags` (`instanceEditable`, `blueprintReadOnly`, `exposeOnSpawn`, `private`, `categoryName`, `tooltip`, `replication`, and `repNotifyFunc`) so common variables can be created and exposed in one request.
 
 #### `SetBlueprintVariableFlags`
 
@@ -629,16 +712,36 @@ Example:
 ### Graph management
 
 - `CreateFunctionGraph`
+- `DuplicateFunctionGraph`
 - `CreateEventGraph`
 - `DeleteGraph`
 - `RenameGraph`
 - `AddFunctionInput`
 - `AddFunctionOutput`
 - `EditUserDefinedPin`
+- `SetUserDefinedPinFlags`
 - `RenameCustomEvent`
 - `AddVariableGetterFunction`
 
-Function input/output pin type params use the same `category`, `subCategory`, `subCategoryObject`, and `containerType` fields as variables.
+Function input/output pin type params use the same `category`, `subCategory`, `subCategoryObject`, and `containerType` fields as variables. Function pins also accept `byRef` and `isConst` (`const` is still accepted as a legacy alias).
+
+`DuplicateFunctionGraph` clones an existing function graph inside a Blueprint and can optionally apply exact name maps to duplicated function pins and variable references:
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "sourceGraph": "ScoreRangedAttack",
+  "newGraph": "ScoreSlam",
+  "renames": {
+    "RangedAttackConfig": "SlamConfig",
+    "bCanRangedAttack": "bCanSlam"
+  }
+}
+```
+
+Use `pinRenames` or `variableRenames` when you only want one side of that behavior. `renames` applies to both user-defined function pins and local/self variable references. Set `strictRenames: true` to fail on unmatched rename keys, rename collisions, or missing self-variable targets; the result includes applied/unmatched/collision reports for non-strict runs.
+
+Use `SetUserDefinedPinFlags` for simple `byRef` / `isConst` changes without re-specifying the whole pin type.
 
 ### Node creation
 
@@ -963,6 +1066,51 @@ Supports Canvas slot position, size, anchors, alignment, and HorizontalBox/Verti
 ```
 
 Then use `DescribeGraph` to find the result node GUID and connect pins with `ConnectPins`.
+
+## Tips for scripted clients
+
+External clients (agents, scripts, CI jobs) drive BlueprintBridge through opaque JSON. The habits below keep round-trips low and avoid recurring dead ends. For exact common request shapes, see [`docs/blueprint_bridge_commands.md`](docs/blueprint_bridge_commands.md).
+
+### Resolve schemas before scripting, not by guessing
+
+The shortest path to a correct `params` shape is `DescribeCommand`, the generated reference produced by `GenerateCommandDocs`, or the checked-in quick reference in `docs/blueprint_bridge_commands.md`. Param names are not always obvious from the command name. Common mismatches that have bitten clients:
+
+- `AddVariableGetNode` / `AddVariableSetNode` take `variable`, not `name`.
+- `AddMakeStructNode` / `AddBreakStructNode` take `struct`, not `structType`.
+- `SetBlueprintVariableFlags` takes `variable`, not `name`.
+- Function pin params accept `byRef` and `isConst` (`const` is accepted as a legacy alias; avoid `bByRef` / `bIsConst`). These matter when the function will be bound to a `DECLARE_DYNAMIC_DELEGATE_*` that includes ref or const-ref params — getting them wrong causes the Blueprint compiler to insert a `CREATEDELEGATE_PROXYFUNCTION_N` thunk that silently drops out-params.
+
+### Confirm pure vs impure before wiring exec
+
+A `UFUNCTION(BlueprintCallable)` declared `const` on a C++ method is generally rendered as a pure node — no `execute` / `then` pins — even without `BlueprintPure`. Wiring exec to such a node fails with `PinNotFound`. Before assuming a `CallFunction` node sits in the exec chain, either read the C++ `UFUNCTION` declaration or call `DescribeGraph` after `AddFunctionCallNode` and inspect the produced pins.
+
+### Do not cargo-cult orphan nodes from a reference graph
+
+When mirroring an existing graph as a template, trace execute and data reachability before copying every node. Reference graphs sometimes contain dead branches (e.g., a `Set X` whose `execute` is unconnected, left over after a refactor). They compile cleanly but do nothing; faithfully replicating them produces a graph that *looks* right and silently misbehaves.
+
+### Create variables with flags in one call
+
+`AddBlueprintVariable` accepts `instanceEditable`, replication, category, tooltip, and related flag fields directly. `SetBlueprintVariableFlags` remains available for later changes to existing variables.
+
+### Verify pin defaults after authoring
+
+`AddFunctionOutput` creates the return-node pin but does not populate its default value. If the function relies on a non-empty default (a description string, `bOutIsValid=true`, etc.), follow up with `SetPinDefault`. Blueprint compiles fine with empty defaults — verification requires a `DescribeGraph` spot-check.
+
+`EditUserDefinedPin` reconstructs the owning node and resets the edited pin's stored `PinDefaultValue` when the type changes. Re-apply defaults afterward, and expect nearby reroute nodes to need a `DescribeGraph` check if the pin topology changed.
+
+### Use `Batch` for multi-node assembly
+
+When building a graph with many nodes and connections, prefer `Batch` over a serial stream of requests. A serial failure mid-stream leaves orphan nodes in the graph that you have to find and `DeleteNode` before retrying. `Batch` plus a single retry is the cleaner default for non-trivial graph construction.
+
+### PowerShell helper compatibility
+
+On Windows, invoke BlueprintBridge through the PowerShell helper or a direct named-pipe client, not Bash. Git-for-Windows Bash can rewrite Unreal package paths like `/Game/...` into host file-system paths before the bridge sees them.
+
+`-RequestJson` / `-RequestFile` use `ConvertFrom-Json -AsHashtable`, which requires PowerShell 7+. On Windows PowerShell 5.1, either use the positional command forms (`blueprintbridge.ps1 describe-blueprint /Game/...`) or write a small client that frames the request bytes directly over the named pipe.
+
+### Reuse rather than rebuild when the pattern repeats
+
+If you find yourself constructing a near-identical function graph for the Nth time (typical for per-ability scoring functions, per-state handlers, etc.), prefer `DuplicateFunctionGraph` with `renames` for functions within the same Blueprint, or `DuplicateAsset` on a template Blueprint when the whole asset is reusable. Rebuilding 15+ nodes via individual node and connection calls is the slowest path.
 
 ## Automation tests
 

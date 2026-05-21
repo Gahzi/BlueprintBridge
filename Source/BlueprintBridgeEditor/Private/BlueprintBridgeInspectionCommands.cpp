@@ -184,6 +184,8 @@ TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node)
 		PinJson->SetStringField(TEXT("subCategory"), Pin->PinType.PinSubCategory.ToString());
 		PinJson->SetStringField(TEXT("subCategoryObject"), Pin->PinType.PinSubCategoryObject.IsValid() ? Pin->PinType.PinSubCategoryObject->GetPathName() : TEXT(""));
 		PinJson->SetStringField(TEXT("containerType"), PinContainerTypeToString(Pin->PinType));
+		PinJson->SetBoolField(TEXT("byRef"), Pin->PinType.bIsReference);
+		PinJson->SetBoolField(TEXT("isConst"), Pin->PinType.bIsConst);
 		PinJson->SetStringField(TEXT("defaultValue"), Pin->DefaultValue);
 
 		TArray<TSharedPtr<FJsonValue>> LinkedTo;

@@ -702,11 +702,19 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeGraph"), { TEXT("asset"), TEXT("graph") });
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeNode"), { TEXT("asset"), TEXT("graph"), TEXT("node") });
 	bSuccess &= ExpectRequiredFields(TEXT("FindVariableReferences"), { TEXT("asset"), TEXT("variable") });
+	bSuccess &= ExpectRequiredFields(TEXT("AnalyzeGraph"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeClass"), { TEXT("class") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindFunctions"), { TEXT("class") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeFunction"), { TEXT("class"), TEXT("function") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeProperty"), { TEXT("class"), TEXT("property") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeDelegate"), { TEXT("class"), TEXT("delegate") });
 	bSuccess &= ExpectRequiredFields(TEXT("ConnectPins"), { TEXT("asset"), TEXT("graph"), TEXT("fromNode"), TEXT("fromPin"), TEXT("toNode"), TEXT("toPin") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetPinDefault"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin"), TEXT("value") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetNodePosition"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("x"), TEXT("y") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddComponent"), { TEXT("asset"), TEXT("name"), TEXT("componentClass") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddFunctionCallNode"), { TEXT("asset"), TEXT("graph"), TEXT("x"), TEXT("y"), TEXT("functionClass"), TEXT("function") });
+	bSuccess &= ExpectRequiredFields(TEXT("DuplicateFunctionGraph"), { TEXT("asset"), TEXT("sourceGraph"), TEXT("newGraph") });
+	bSuccess &= ExpectRequiredFields(TEXT("SetUserDefinedPinFlags"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddWidget"), { TEXT("asset"), TEXT("name"), TEXT("widgetClass") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddBlueprintVariable"), { TEXT("asset"), TEXT("name"), TEXT("category") });
 
@@ -759,6 +767,65 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	}
 
 	return bSuccess;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeReflectionCommandTest, "BlueprintBridge.Protocol.ReflectionCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeReflectionCommandTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> FunctionParams = MakeShared<FJsonObject>();
+	FunctionParams->SetStringField(TEXT("class"), TEXT("/Script/Engine.KismetMathLibrary"));
+	FunctionParams->SetStringField(TEXT("function"), TEXT("Add_DoubleDouble"));
+	const TSharedRef<FJsonObject> FunctionResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeFunction"), FunctionParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, FunctionResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* FunctionResult = BlueprintBridgeTests::GetResultObject(*this, FunctionResponse);
+	if (!FunctionResult)
+	{
+		return false;
+	}
+
+	bool bIsPureNode = false;
+	bool bHasExecPins = true;
+	TestTrue(TEXT("DescribeFunction should report pure math node."), (*FunctionResult)->TryGetBoolField(TEXT("isPureNode"), bIsPureNode) && bIsPureNode);
+	TestTrue(TEXT("DescribeFunction should report no exec pins for pure math node."), (*FunctionResult)->TryGetBoolField(TEXT("hasExecPins"), bHasExecPins) && !bHasExecPins);
+	const TArray<TSharedPtr<FJsonValue>>* FunctionParamsArray = nullptr;
+	TestTrue(TEXT("DescribeFunction should return params."), (*FunctionResult)->TryGetArrayField(TEXT("params"), FunctionParamsArray) && FunctionParamsArray != nullptr && FunctionParamsArray->Num() > 0);
+
+	TSharedRef<FJsonObject> FindParams = MakeShared<FJsonObject>();
+	FindParams->SetStringField(TEXT("class"), TEXT("/Script/Engine.KismetMathLibrary"));
+	FindParams->SetStringField(TEXT("nameContains"), TEXT("Float"));
+	FindParams->SetBoolField(TEXT("blueprintCallableOnly"), true);
+	const TSharedRef<FJsonObject> FindResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindFunctions"), FindParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, FindResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> PropertyParams = MakeShared<FJsonObject>();
+	PropertyParams->SetStringField(TEXT("class"), TEXT("/Script/Engine.Actor"));
+	PropertyParams->SetStringField(TEXT("property"), TEXT("PrimaryActorTick"));
+	const TSharedRef<FJsonObject> PropertyResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeProperty"), PropertyParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PropertyResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> DelegateParams = MakeShared<FJsonObject>();
+	DelegateParams->SetStringField(TEXT("class"), TEXT("/Script/Engine.Actor"));
+	DelegateParams->SetStringField(TEXT("delegate"), TEXT("OnDestroyed"));
+	const TSharedRef<FJsonObject> DelegateResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeDelegate"), DelegateParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DelegateResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DelegateResult = BlueprintBridgeTests::GetResultObject(*this, DelegateResponse);
+	const TSharedPtr<FJsonObject>* Signature = nullptr;
+	return DelegateResult && TestTrue(TEXT("DescribeDelegate should include signature."), (*DelegateResult)->TryGetObjectField(TEXT("signature"), Signature) && Signature != nullptr && Signature->IsValid());
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSchemaValidationTest, "BlueprintBridge.Protocol.SchemaValidation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1263,11 +1330,73 @@ bool FBlueprintBridgeFunctionGraphCommandTest::RunTest(const FString& Parameters
 		return false;
 	}
 
+	TSharedRef<FJsonObject> PinFlagsParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeFunction"));
+	PinFlagsParams->SetStringField(TEXT("node"), EntryNodeGuid);
+	PinFlagsParams->SetStringField(TEXT("pin"), TEXT("bEnabled"));
+	PinFlagsParams->SetBoolField(TEXT("byRef"), true);
+	PinFlagsParams->SetBoolField(TEXT("isConst"), true);
+	const TSharedRef<FJsonObject> PinFlagsResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SetUserDefinedPinFlags"), PinFlagsParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PinFlagsResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* PinFlagsNode = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, PinFlagsResponse);
+	const TSharedPtr<FJsonObject> FlaggedPin = PinFlagsNode ? BlueprintBridgeTests::FindPinObjectByName(*PinFlagsNode, TEXT("bEnabled")) : nullptr;
+	bool bByRef = false;
+	bool bIsConst = false;
+	TestTrue(TEXT("SetUserDefinedPinFlags should set byRef."), FlaggedPin.IsValid() && FlaggedPin->TryGetBoolField(TEXT("byRef"), bByRef) && bByRef);
+	TestTrue(TEXT("SetUserDefinedPinFlags should set isConst."), FlaggedPin.IsValid() && FlaggedPin->TryGetBoolField(TEXT("isConst"), bIsConst) && bIsConst);
+
 	const TSharedRef<FJsonObject> DescribeFunctionGraphResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("BridgeFunction"));
 	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeFunctionGraphResponse))
 	{
 		return false;
 	}
+
+	TSharedRef<FJsonObject> AnalyzeParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("BridgeFunction"));
+	const TSharedRef<FJsonObject> AnalyzeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AnalyzeGraph"), AnalyzeParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AnalyzeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* AnalyzeResult = BlueprintBridgeTests::GetResultObject(*this, AnalyzeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* AnalyzedNodes = nullptr;
+	TestTrue(TEXT("AnalyzeGraph should return nodes."), AnalyzeResult && (*AnalyzeResult)->TryGetArrayField(TEXT("nodes"), AnalyzedNodes) && AnalyzedNodes != nullptr && AnalyzedNodes->Num() > 0);
+
+	TSharedRef<FJsonObject> DuplicateFunctionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	DuplicateFunctionParams->SetStringField(TEXT("sourceGraph"), TEXT("BridgeFunction"));
+	DuplicateFunctionParams->SetStringField(TEXT("newGraph"), TEXT("BridgeFunctionCopy"));
+	TSharedRef<FJsonObject> PinRenames = MakeShared<FJsonObject>();
+	PinRenames->SetStringField(TEXT("bEnabled"), TEXT("bCopied"));
+	DuplicateFunctionParams->SetObjectField(TEXT("pinRenames"), PinRenames);
+	const TSharedRef<FJsonObject> DuplicateFunctionResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DuplicateFunctionGraph"), DuplicateFunctionParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DuplicateFunctionResponse))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> DuplicateDescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("BridgeFunctionCopy"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DuplicateDescribeResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* DuplicateResult = BlueprintBridgeTests::GetResultObject(*this, DuplicateDescribeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* DuplicateNodes = nullptr;
+	bool bFoundCopiedPin = false;
+	if (DuplicateResult && (*DuplicateResult)->TryGetArrayField(TEXT("nodes"), DuplicateNodes) && DuplicateNodes != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *DuplicateNodes)
+		{
+			const TSharedPtr<FJsonObject>* NodeObject = nullptr;
+			if (NodeValue.IsValid() && NodeValue->TryGetObject(NodeObject) && NodeObject != nullptr && NodeObject->IsValid())
+			{
+				bFoundCopiedPin |= BlueprintBridgeTests::FindPinObjectByName(*NodeObject, TEXT("bCopied")).IsValid();
+			}
+		}
+	}
+	TestTrue(TEXT("Duplicated function should apply pin renames."), bFoundCopiedPin);
 
 	TSharedRef<FJsonObject> RenameGraphParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
 	RenameGraphParams->SetStringField(TEXT("graph"), TEXT("BridgeFunction"));
@@ -1766,6 +1895,16 @@ bool FBlueprintBridgeVariableFlagsTest::RunTest(const FString& Parameters)
 		return false;
 	}
 
+	TSharedRef<FJsonObject> AddCombinedFlagsParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddCombinedFlagsParams->SetStringField(TEXT("name"), TEXT("AddedEditable"));
+	AddCombinedFlagsParams->SetStringField(TEXT("category"), TEXT("bool"));
+	AddCombinedFlagsParams->SetBoolField(TEXT("instanceEditable"), true);
+	AddCombinedFlagsParams->SetBoolField(TEXT("blueprintReadOnly"), true);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddCombinedFlagsParams)))
+	{
+		return false;
+	}
+
 	TSharedRef<FJsonObject> AddArrayVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
 	AddArrayVariableParams->SetStringField(TEXT("name"), TEXT("SpawnVolumes"));
 	AddArrayVariableParams->SetStringField(TEXT("category"), TEXT("object"));
@@ -1775,6 +1914,14 @@ bool FBlueprintBridgeVariableFlagsTest::RunTest(const FString& Parameters)
 	{
 		return false;
 	}
+
+	const int32 AddedFlagsVarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Asset.Blueprint, TEXT("AddedEditable"));
+	if (!TestTrue(TEXT("AddBlueprintVariable flags variable should exist."), AddedFlagsVarIndex != INDEX_NONE))
+	{
+		return false;
+	}
+	TestTrue(TEXT("AddBlueprintVariable should apply instanceEditable."), ((Asset.Blueprint->NewVariables[AddedFlagsVarIndex].PropertyFlags & CPF_Edit) != 0) && ((Asset.Blueprint->NewVariables[AddedFlagsVarIndex].PropertyFlags & CPF_DisableEditOnInstance) == 0));
+	TestTrue(TEXT("AddBlueprintVariable should apply blueprintReadOnly."), ((Asset.Blueprint->NewVariables[AddedFlagsVarIndex].PropertyFlags & CPF_BlueprintReadOnly) != 0));
 
 	const int32 ArrayVarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Asset.Blueprint, TEXT("SpawnVolumes"));
 	if (!TestTrue(TEXT("Array variable should exist."), ArrayVarIndex != INDEX_NONE))

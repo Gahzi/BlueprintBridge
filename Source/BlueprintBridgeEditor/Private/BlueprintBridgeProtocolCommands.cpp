@@ -99,6 +99,15 @@ TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonOb
 		return MakeBridgeError(Id, TEXT("InvalidParams"), FString::Printf(TEXT("Batch request count %d exceeds MaxBatchSize %d."), Requests->Num(), MaxBatchSize));
 	}
 
+	bool bRollbackOnFailure = false;
+	Params->TryGetBoolField(TEXT("rollbackOnFailure"), bRollbackOnFailure);
+	TUniquePtr<FScopedTransaction> Transaction;
+	if (bRollbackOnFailure)
+	{
+		Transaction = MakeUnique<FScopedTransaction>(NSLOCTEXT("BlueprintBridge", "BatchRollback", "Blueprint Bridge: Batch"));
+	}
+
+	bool bFailed = false;
 	TArray<TSharedPtr<FJsonValue>> Results;
 	for (const TSharedPtr<FJsonValue>& RequestValue : *Requests)
 	{
@@ -106,6 +115,11 @@ TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonOb
 		if (!RequestValue.IsValid() || !RequestValue->TryGetObject(ChildRequest) || ChildRequest == nullptr || !ChildRequest->IsValid())
 		{
 			Results.Add(MakeShared<FJsonValueObject>(MakeBridgeError(Id, TEXT("InvalidBatchRequest"), TEXT("Each batch request must be an object."))));
+			if (bRollbackOnFailure)
+			{
+				bFailed = true;
+				break;
+			}
 			continue;
 		}
 
@@ -117,11 +131,25 @@ TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonOb
 		{
 			(*ChildRequest)->SetNumberField(TEXT("version"), 1);
 		}
-		Results.Add(MakeShared<FJsonValueObject>(ExecuteRequestOnGameThread(JsonToString((*ChildRequest).ToSharedRef()))));
+		TSharedRef<FJsonObject> ChildResponse = ExecuteRequestOnGameThread(JsonToString((*ChildRequest).ToSharedRef()));
+		Results.Add(MakeShared<FJsonValueObject>(ChildResponse));
+
+		bool bChildOk = true;
+		if (bRollbackOnFailure && ChildResponse->TryGetBoolField(TEXT("ok"), bChildOk) && !bChildOk)
+		{
+			bFailed = true;
+			break;
+		}
+	}
+
+	if (bFailed && Transaction.IsValid())
+	{
+		Transaction->Cancel();
 	}
 
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetArrayField(TEXT("responses"), Results);
+	Result->SetBoolField(TEXT("rolledBack"), bFailed && bRollbackOnFailure);
 	return MakeSuccess(Id, Result);
 }
 } // namespace BlueprintBridge

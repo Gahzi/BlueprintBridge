@@ -329,31 +329,8 @@ FName NormalizePinCategory(const FString& Category)
 	return *Category;
 }
 
-TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedPtr<FJsonObject> ApplyBlueprintVariableFlagsFromParams(const FString& Id, UBlueprint* Blueprint, FBPVariableDescription& Variable, const FString& VariableName, const TSharedPtr<FJsonObject>& Params)
 {
-	FString AssetPath;
-	FString VariableName;
-	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("variable"), VariableName))
-	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SetBlueprintVariableFlags requires params.asset and params.variable."));
-	}
-
-	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint)
-	{
-		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
-	}
-
-	const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *VariableName);
-	if (VarIndex == INDEX_NONE)
-	{
-		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not find variable '%s'."), *VariableName));
-	}
-
-	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "SetBlueprintVariableFlags", "Blueprint Bridge: Set Blueprint Variable Flags"));
-	Blueprint->Modify();
-	FBPVariableDescription& Variable = Blueprint->NewVariables[VarIndex];
-
 	bool bValue = false;
 	if (Params->TryGetBoolField(TEXT("instanceEditable"), bValue))
 	{
@@ -432,6 +409,38 @@ TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TShar
 		}
 	}
 
+	return nullptr;
+}
+
+TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString VariableName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("variable"), VariableName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SetBlueprintVariableFlags requires params.asset and params.variable."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *VariableName);
+	if (VarIndex == INDEX_NONE)
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not find variable '%s'."), *VariableName));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "SetBlueprintVariableFlags", "Blueprint Bridge: Set Blueprint Variable Flags"));
+	Blueprint->Modify();
+	FBPVariableDescription& Variable = Blueprint->NewVariables[VarIndex];
+	if (const TSharedPtr<FJsonObject> Error = ApplyBlueprintVariableFlagsFromParams(Id, Blueprint, Variable, VariableName, Params))
+	{
+		return Error.ToSharedRef();
+	}
+
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 	Blueprint->GetOutermost()->MarkPackageDirty();
 
@@ -500,6 +509,15 @@ TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr
 	if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, *Name, PinType, DefaultValue))
 	{
 		return MakeBridgeError(Id, TEXT("AddVariableFailed"), FString::Printf(TEXT("Could not add variable '%s'."), *Name));
+	}
+
+	const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *Name);
+	if (VarIndex != INDEX_NONE)
+	{
+		if (const TSharedPtr<FJsonObject> Error = ApplyBlueprintVariableFlagsFromParams(Id, Blueprint, Blueprint->NewVariables[VarIndex], Name, Params))
+		{
+			return Error.ToSharedRef();
+		}
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);

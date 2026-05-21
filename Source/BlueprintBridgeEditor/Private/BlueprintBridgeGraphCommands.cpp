@@ -1579,7 +1579,7 @@ void ApplyPinRefAndConstFlags(const TSharedPtr<FJsonObject>& Params, FEdGraphPin
 		OutPinType.bIsReference = bByRef;
 	}
 	bool bIsConst = false;
-	if (Params->TryGetBoolField(TEXT("const"), bIsConst))
+	if (Params->TryGetBoolField(TEXT("isConst"), bIsConst) || Params->TryGetBoolField(TEXT("const"), bIsConst))
 	{
 		OutPinType.bIsConst = bIsConst;
 	}
@@ -1733,6 +1733,137 @@ TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObjec
 	return MakeSuccess(Id, Result);
 }
 
+TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString GraphName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("graph"), GraphName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AnalyzeGraph requires params.asset and params.graph."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	UEdGraph* Graph = FindBlueprintGraph(Blueprint, GraphName);
+	if (!Graph)
+	{
+		return MakeBridgeError(Id, TEXT("GraphNotFound"), FString::Printf(TEXT("Could not find graph '%s' on '%s'."), *GraphName, *AssetPath));
+	}
+
+	TSet<UEdGraphNode*> ExecReachable;
+	TArray<UEdGraphNode*> Pending;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+
+		bool bHasExecInput = false;
+		bool bHasExecOutput = false;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				continue;
+			}
+			bHasExecInput |= Pin->Direction == EGPD_Input;
+			bHasExecOutput |= Pin->Direction == EGPD_Output;
+		}
+
+		if (Node->IsA<UK2Node_FunctionEntry>() || Node->IsA<UK2Node_Event>() || Node->IsA<UK2Node_CustomEvent>() || (bHasExecOutput && !bHasExecInput))
+		{
+			ExecReachable.Add(Node);
+			Pending.Add(Node);
+		}
+	}
+
+	while (!Pending.IsEmpty())
+	{
+		UEdGraphNode* Node = Pending.Pop(EAllowShrinking::No);
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				continue;
+			}
+
+			for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+			{
+				UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+				if (LinkedNode && !ExecReachable.Contains(LinkedNode))
+				{
+					ExecReachable.Add(LinkedNode);
+					Pending.Add(LinkedNode);
+				}
+			}
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Nodes;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+
+		bool bHasExecInput = false;
+		bool bHasExecOutput = false;
+		bool bDataConnected = false;
+		bool bAnyConnection = false;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin)
+			{
+				continue;
+			}
+
+			const bool bIsExec = Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+			bHasExecInput |= bIsExec && Pin->Direction == EGPD_Input;
+			bHasExecOutput |= bIsExec && Pin->Direction == EGPD_Output;
+			bAnyConnection |= Pin->LinkedTo.Num() > 0;
+			bDataConnected |= !bIsExec && Pin->LinkedTo.Num() > 0;
+		}
+
+		const bool bExecReachable = ExecReachable.Contains(Node);
+		FString Classification = TEXT("Reachable");
+		if (!bExecReachable && bAnyConnection)
+		{
+			Classification = TEXT("OrphanedBranch");
+		}
+		else if (!bExecReachable && !bAnyConnection)
+		{
+			Classification = TEXT("Disconnected");
+		}
+		else if (bExecReachable && !bHasExecInput && !bHasExecOutput && bDataConnected)
+		{
+			Classification = TEXT("DataOnlyReachable");
+		}
+
+		TSharedRef<FJsonObject> NodeJson = MakeShared<FJsonObject>();
+		NodeJson->SetStringField(TEXT("guid"), Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+		NodeJson->SetStringField(TEXT("title"), Node->GetNodeTitle(ENodeTitleType::ListView).ToString());
+		NodeJson->SetStringField(TEXT("class"), Node->GetClass()->GetPathName());
+		NodeJson->SetBoolField(TEXT("execReachable"), bExecReachable);
+		NodeJson->SetBoolField(TEXT("hasExecInput"), bHasExecInput);
+		NodeJson->SetBoolField(TEXT("hasExecOutput"), bHasExecOutput);
+		NodeJson->SetBoolField(TEXT("dataConnected"), bDataConnected);
+		NodeJson->SetStringField(TEXT("classification"), Classification);
+		Nodes.Add(MakeShared<FJsonValueObject>(NodeJson));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	Result->SetStringField(TEXT("graph"), Graph->GetName());
+	Result->SetArrayField(TEXT("nodes"), Nodes);
+	return MakeSuccess(Id, Result);
+}
+
 TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -1758,6 +1889,407 @@ TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSharedPtr<
 	FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, Graph, true, nullptr);
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("graph"), Graph->GetName());
+	return MakeSuccess(Id, Result);
+}
+
+void AddStringMapFromObject(const TSharedPtr<FJsonObject>& Params, const FString& FieldName, TMap<FName, FName>& OutMap)
+{
+	const TSharedPtr<FJsonObject>* Object = nullptr;
+	if (!Params.IsValid() || !Params->TryGetObjectField(FieldName, Object) || Object == nullptr || !Object->IsValid())
+	{
+		return;
+	}
+
+	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : (*Object)->Values)
+	{
+		FString NewName;
+		if (Pair.Value.IsValid() && Pair.Value->TryGetString(NewName) && !Pair.Key.IsEmpty() && !NewName.IsEmpty())
+		{
+			OutMap.Add(*Pair.Key, *NewName);
+		}
+	}
+}
+
+int32 ApplyUserPinRenames(UEdGraph* Graph, const TMap<FName, FName>& Renames)
+{
+	if (!Graph || Renames.IsEmpty())
+	{
+		return 0;
+	}
+
+	int32 RenameCount = 0;
+	TArray<UK2Node_EditablePinBase*> EditableNodes;
+	Graph->GetNodesOfClass<UK2Node_EditablePinBase>(EditableNodes);
+	for (UK2Node_EditablePinBase* EditableNode : EditableNodes)
+	{
+		if (!EditableNode)
+		{
+			continue;
+		}
+
+		for (const TPair<FName, FName>& Rename : Renames)
+		{
+			TSharedPtr<FUserPinInfo>* UserPinInfo = EditableNode->UserDefinedPins.FindByPredicate([&Rename](const TSharedPtr<FUserPinInfo>& Candidate)
+			{
+				return Candidate.IsValid() && Candidate->PinName == Rename.Key;
+			});
+			if (!UserPinInfo)
+			{
+				continue;
+			}
+
+			EditableNode->Modify();
+			const ERenamePinResult RenameResult = EditableNode->RenameUserDefinedPin(Rename.Key, Rename.Value, false);
+			if (RenameResult != ERenamePinResult_NameCollision)
+			{
+				(*UserPinInfo)->PinName = Rename.Value;
+				++RenameCount;
+			}
+		}
+		EditableNode->ReconstructNode();
+	}
+	return RenameCount;
+}
+
+int32 ApplyVariableReferenceRenames(UBlueprint* Blueprint, UEdGraph* Graph, const TMap<FName, FName>& Renames)
+{
+	if (!Blueprint || !Graph || Renames.IsEmpty())
+	{
+		return 0;
+	}
+
+	int32 RenameCount = 0;
+	TArray<UK2Node_Variable*> VariableNodes;
+	Graph->GetNodesOfClass<UK2Node_Variable>(VariableNodes);
+	for (UK2Node_Variable* VariableNode : VariableNodes)
+	{
+		if (!VariableNode)
+		{
+			continue;
+		}
+
+		const FName* NewName = Renames.Find(VariableNode->GetVarName());
+		if (!NewName)
+		{
+			continue;
+		}
+
+		VariableNode->Modify();
+		if (VariableNode->VariableReference.IsLocalScope())
+		{
+			VariableNode->VariableReference.SetLocalMember(*NewName, Graph->GetName(), VariableNode->VariableReference.GetMemberGuid());
+		}
+		else if (VariableNode->VariableReference.IsSelfContext())
+		{
+			const FGuid VariableGuid = FBlueprintEditorUtils::FindMemberVariableGuidByName(Blueprint, *NewName);
+			VariableNode->VariableReference.SetSelfMember(*NewName, VariableGuid);
+		}
+		else
+		{
+			continue;
+		}
+		VariableNode->ReconstructNode();
+		++RenameCount;
+	}
+	return RenameCount;
+}
+
+struct FRenameReport
+{
+	int32 AppliedCount = 0;
+	TSet<FName> MatchedKeys;
+	TArray<TSharedPtr<FJsonValue>> Applied;
+	TArray<TSharedPtr<FJsonValue>> Unmatched;
+	TArray<TSharedPtr<FJsonValue>> Collisions;
+	TArray<TSharedPtr<FJsonValue>> MissingTargets;
+};
+
+TSharedRef<FJsonObject> MakeRenameJson(const FName From, const FName To, UEdGraphNode* Node = nullptr)
+{
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("from"), From.ToString());
+	Result->SetStringField(TEXT("to"), To.ToString());
+	if (Node)
+	{
+		Result->SetStringField(TEXT("nodeGuid"), Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+	}
+	return Result;
+}
+
+TSharedRef<FJsonObject> MakeRenameReportJson(const FRenameReport& Report, const TMap<FName, FName>& RequestedRenames)
+{
+	FRenameReport ReportWithUnmatched = Report;
+	for (const TPair<FName, FName>& Rename : RequestedRenames)
+	{
+		if (!ReportWithUnmatched.MatchedKeys.Contains(Rename.Key))
+		{
+			ReportWithUnmatched.Unmatched.Add(MakeShared<FJsonValueObject>(MakeRenameJson(Rename.Key, Rename.Value)));
+		}
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetNumberField(TEXT("count"), ReportWithUnmatched.AppliedCount);
+	Result->SetArrayField(TEXT("applied"), ReportWithUnmatched.Applied);
+	Result->SetArrayField(TEXT("unmatched"), ReportWithUnmatched.Unmatched);
+	Result->SetArrayField(TEXT("collisions"), ReportWithUnmatched.Collisions);
+	Result->SetArrayField(TEXT("missingTargets"), ReportWithUnmatched.MissingTargets);
+	return Result;
+}
+
+FRenameReport ApplyUserPinRenamesWithReport(UEdGraph* Graph, const TMap<FName, FName>& Renames)
+{
+	FRenameReport Report;
+	if (!Graph || Renames.IsEmpty())
+	{
+		return Report;
+	}
+
+	TArray<UK2Node_EditablePinBase*> EditableNodes;
+	Graph->GetNodesOfClass<UK2Node_EditablePinBase>(EditableNodes);
+	for (UK2Node_EditablePinBase* EditableNode : EditableNodes)
+	{
+		if (!EditableNode)
+		{
+			continue;
+		}
+
+		bool bChanged = false;
+		for (const TPair<FName, FName>& Rename : Renames)
+		{
+			TSharedPtr<FUserPinInfo>* UserPinInfo = EditableNode->UserDefinedPins.FindByPredicate([&Rename](const TSharedPtr<FUserPinInfo>& Candidate)
+			{
+				return Candidate.IsValid() && Candidate->PinName == Rename.Key;
+			});
+			if (!UserPinInfo)
+			{
+				continue;
+			}
+
+			Report.MatchedKeys.Add(Rename.Key);
+			const bool bTargetExists = EditableNode->UserDefinedPins.ContainsByPredicate([&Rename](const TSharedPtr<FUserPinInfo>& Candidate)
+			{
+				return Candidate.IsValid() && Candidate->PinName == Rename.Value;
+			});
+			if (bTargetExists)
+			{
+				Report.Collisions.Add(MakeShared<FJsonValueObject>(MakeRenameJson(Rename.Key, Rename.Value, EditableNode)));
+				continue;
+			}
+
+			EditableNode->Modify();
+			const ERenamePinResult RenameResult = EditableNode->RenameUserDefinedPin(Rename.Key, Rename.Value, false);
+			if (RenameResult == ERenamePinResult_NameCollision)
+			{
+				Report.Collisions.Add(MakeShared<FJsonValueObject>(MakeRenameJson(Rename.Key, Rename.Value, EditableNode)));
+				continue;
+			}
+
+			(*UserPinInfo)->PinName = Rename.Value;
+			++Report.AppliedCount;
+			bChanged = true;
+			Report.Applied.Add(MakeShared<FJsonValueObject>(MakeRenameJson(Rename.Key, Rename.Value, EditableNode)));
+		}
+		if (bChanged)
+		{
+			EditableNode->ReconstructNode();
+		}
+	}
+	return Report;
+}
+
+FRenameReport ApplyVariableReferenceRenamesWithReport(UBlueprint* Blueprint, UEdGraph* Graph, const TMap<FName, FName>& Renames)
+{
+	FRenameReport Report;
+	if (!Blueprint || !Graph || Renames.IsEmpty())
+	{
+		return Report;
+	}
+
+	if (UK2Node_FunctionEntry* EntryNode = FindFunctionEntryNode(Graph))
+	{
+		for (FBPVariableDescription& LocalVariable : EntryNode->LocalVariables)
+		{
+			const FName* NewName = Renames.Find(LocalVariable.VarName);
+			if (!NewName)
+			{
+				continue;
+			}
+
+			Report.MatchedKeys.Add(LocalVariable.VarName);
+			const bool bCollision = EntryNode->LocalVariables.ContainsByPredicate([NewName](const FBPVariableDescription& Candidate)
+			{
+				return Candidate.VarName == *NewName;
+			});
+			if (bCollision)
+			{
+				Report.Collisions.Add(MakeShared<FJsonValueObject>(MakeRenameJson(LocalVariable.VarName, *NewName, EntryNode)));
+				continue;
+			}
+
+			const FName OldName = LocalVariable.VarName;
+			EntryNode->Modify();
+			LocalVariable.VarName = *NewName;
+			++Report.AppliedCount;
+			Report.Applied.Add(MakeShared<FJsonValueObject>(MakeRenameJson(OldName, *NewName, EntryNode)));
+		}
+	}
+
+	TArray<UK2Node_Variable*> VariableNodes;
+	Graph->GetNodesOfClass<UK2Node_Variable>(VariableNodes);
+	for (UK2Node_Variable* VariableNode : VariableNodes)
+	{
+		if (!VariableNode)
+		{
+			continue;
+		}
+
+		const FName OldName = VariableNode->GetVarName();
+		const FName* NewName = Renames.Find(OldName);
+		if (!NewName)
+		{
+			continue;
+		}
+
+		Report.MatchedKeys.Add(OldName);
+		VariableNode->Modify();
+		if (VariableNode->VariableReference.IsLocalScope())
+		{
+			VariableNode->VariableReference.SetLocalMember(*NewName, Graph->GetName(), VariableNode->VariableReference.GetMemberGuid());
+		}
+		else if (VariableNode->VariableReference.IsSelfContext())
+		{
+			const FGuid VariableGuid = FBlueprintEditorUtils::FindMemberVariableGuidByName(Blueprint, *NewName);
+			if (!VariableGuid.IsValid())
+			{
+				Report.MissingTargets.Add(MakeShared<FJsonValueObject>(MakeRenameJson(OldName, *NewName, VariableNode)));
+				continue;
+			}
+			VariableNode->VariableReference.SetSelfMember(*NewName, VariableGuid);
+		}
+		else
+		{
+			continue;
+		}
+		VariableNode->ReconstructNode();
+		++Report.AppliedCount;
+		Report.Applied.Add(MakeShared<FJsonValueObject>(MakeRenameJson(OldName, *NewName, VariableNode)));
+	}
+	return Report;
+}
+
+bool RenameReportHasStrictFailure(const FRenameReport& Report, const TMap<FName, FName>& RequestedRenames)
+{
+	if (Report.Collisions.Num() > 0 || Report.MissingTargets.Num() > 0)
+	{
+		return true;
+	}
+
+	for (const TPair<FName, FName>& Rename : RequestedRenames)
+	{
+		if (!Report.MatchedKeys.Contains(Rename.Key))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+TSharedRef<FJsonObject> DuplicateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString SourceGraphName;
+	FString NewGraphName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
+		!TryGetRequiredString(Params, TEXT("sourceGraph"), SourceGraphName) ||
+		!TryGetRequiredString(Params, TEXT("newGraph"), NewGraphName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DuplicateFunctionGraph requires params.asset, params.sourceGraph, and params.newGraph."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	UEdGraph* SourceGraph = FindBlueprintGraph(Blueprint, SourceGraphName);
+	if (!SourceGraph || !Blueprint->FunctionGraphs.Contains(SourceGraph))
+	{
+		return MakeBridgeError(Id, TEXT("GraphNotFound"), FString::Printf(TEXT("Could not find function graph '%s' on '%s'."), *SourceGraphName, *AssetPath));
+	}
+	if (FindBlueprintGraph(Blueprint, NewGraphName))
+	{
+		return MakeBridgeError(Id, TEXT("GraphAlreadyExists"), FString::Printf(TEXT("Graph '%s' already exists."), *NewGraphName));
+	}
+	if (!SourceGraph->GetSchema() || !SourceGraph->GetSchema()->CanDuplicateGraph(SourceGraph))
+	{
+		return MakeBridgeError(Id, TEXT("DuplicateGraphUnsupported"), FString::Printf(TEXT("Graph '%s' cannot be duplicated by its schema."), *SourceGraphName));
+	}
+
+	TMap<FName, FName> PinRenames;
+	TMap<FName, FName> VariableRenames;
+	AddStringMapFromObject(Params, TEXT("renames"), PinRenames);
+	AddStringMapFromObject(Params, TEXT("renames"), VariableRenames);
+	AddStringMapFromObject(Params, TEXT("pinRenames"), PinRenames);
+	AddStringMapFromObject(Params, TEXT("variableRenames"), VariableRenames);
+
+	bool bStrictRenames = false;
+	bool bCompile = false;
+	Params->TryGetBoolField(TEXT("strictRenames"), bStrictRenames);
+	Params->TryGetBoolField(TEXT("compile"), bCompile);
+
+	FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "DuplicateFunctionGraph", "Blueprint Bridge: Duplicate Function Graph"));
+	Blueprint->Modify();
+	UEdGraph* DuplicatedGraph = SourceGraph->GetSchema()->DuplicateGraph(SourceGraph);
+	if (!DuplicatedGraph)
+	{
+		return MakeBridgeError(Id, TEXT("DuplicateGraphFailed"), FString::Printf(TEXT("Could not duplicate function graph '%s'."), *SourceGraphName));
+	}
+
+	DuplicatedGraph->Modify();
+	for (UEdGraphNode* Node : DuplicatedGraph->Nodes)
+	{
+		if (Node)
+		{
+			Node->CreateNewGuid();
+		}
+	}
+
+	Blueprint->FunctionGraphs.Add(DuplicatedGraph);
+	FBlueprintEditorUtils::RenameGraph(DuplicatedGraph, NewGraphName);
+	const FRenameReport UserPinRenameReport = ApplyUserPinRenamesWithReport(DuplicatedGraph, PinRenames);
+	const FRenameReport VariableRenameReport = ApplyVariableReferenceRenamesWithReport(Blueprint, DuplicatedGraph, VariableRenames);
+
+	if (bStrictRenames && (RenameReportHasStrictFailure(UserPinRenameReport, PinRenames) || RenameReportHasStrictFailure(VariableRenameReport, VariableRenames)))
+	{
+		Blueprint->FunctionGraphs.Remove(DuplicatedGraph);
+		DuplicatedGraph->MarkAsGarbage();
+		Transaction.Cancel();
+		return MakeBridgeError(Id, TEXT("StrictRenameFailed"), FString::Printf(TEXT("One or more renames could not be applied while duplicating '%s'."), *SourceGraphName));
+	}
+
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	Blueprint->GetOutermost()->MarkPackageDirty();
+	if (bCompile)
+	{
+		FKismetEditorUtilities::CompileBlueprint(Blueprint);
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("sourceGraph"), SourceGraphName);
+	Result->SetStringField(TEXT("graph"), DuplicatedGraph->GetName());
+	Result->SetNumberField(TEXT("pinRenameCount"), UserPinRenameReport.AppliedCount);
+	Result->SetNumberField(TEXT("variableRenameCount"), VariableRenameReport.AppliedCount);
+	Result->SetObjectField(TEXT("pinRenames"), MakeRenameReportJson(UserPinRenameReport, PinRenames));
+	Result->SetObjectField(TEXT("variableRenames"), MakeRenameReportJson(VariableRenameReport, VariableRenames));
+	if (bCompile)
+	{
+		Result->SetStringField(TEXT("compileStatus"), GetBlueprintStatusString(Blueprint->Status));
+	}
+	if (UK2Node_FunctionEntry* EntryNode = FindFunctionEntryNode(DuplicatedGraph))
+	{
+		Result->SetObjectField(TEXT("entryNode"), DescribeNode(EntryNode));
+	}
 	return MakeSuccess(Id, Result);
 }
 
@@ -1954,6 +2486,55 @@ TSharedRef<FJsonObject> EditUserDefinedPin(const FString& Id, const TSharedPtr<F
 		(*UserPinInfo)->PinDefaultValue.Reset();
 	}
 
+	EditableNode->ReconstructNode();
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	Blueprint->GetOutermost()->MarkPackageDirty();
+	return FinishGraphEdit(Id, Blueprint, Graph, EditableNode);
+}
+
+TSharedRef<FJsonObject> SetUserDefinedPinFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	TSharedRef<FJsonObject> Error = MakeShared<FJsonObject>();
+	if (!TryLoadGraphForEdit(Id, Params, Blueprint, Graph, Error))
+	{
+		return Error;
+	}
+
+	FString NodeGuid;
+	FString PinName;
+	if (!TryGetRequiredString(Params, TEXT("node"), NodeGuid) || !TryGetRequiredString(Params, TEXT("pin"), PinName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SetUserDefinedPinFlags requires params.node and params.pin."));
+	}
+
+	UK2Node_EditablePinBase* EditableNode = Cast<UK2Node_EditablePinBase>(FindNodeByGuid(Graph, NodeGuid));
+	if (!EditableNode)
+	{
+		return MakeBridgeError(Id, TEXT("NodeNotFound"), FString::Printf(TEXT("Could not find editable pin node '%s'."), *NodeGuid));
+	}
+
+	TSharedPtr<FUserPinInfo>* UserPinInfo = EditableNode->UserDefinedPins.FindByPredicate([&PinName](const TSharedPtr<FUserPinInfo>& Candidate)
+	{
+		return Candidate.IsValid() && Candidate->PinName == *PinName;
+	});
+	if (!UserPinInfo)
+	{
+		return MakeBridgeError(Id, TEXT("PinNotFound"), FString::Printf(TEXT("Could not find user-defined pin '%s'."), *PinName));
+	}
+
+	if (!Params->HasField(TEXT("byRef")) && !Params->HasField(TEXT("isConst")) && !Params->HasField(TEXT("const")))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SetUserDefinedPinFlags requires at least one of params.byRef or params.isConst."));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "SetUserDefinedPinFlags", "Blueprint Bridge: Set User Defined Pin Flags"));
+	Blueprint->Modify();
+	Graph->Modify();
+	EditableNode->Modify();
+
+	ApplyPinRefAndConstFlags(Params, (*UserPinInfo)->PinType);
 	EditableNode->ReconstructNode();
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 	Blueprint->GetOutermost()->MarkPackageDirty();

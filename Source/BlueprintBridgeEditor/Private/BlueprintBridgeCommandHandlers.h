@@ -19,6 +19,12 @@ TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonO
 TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeClass(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindFunctions(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeProperty(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeDelegate(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TSharedPtr<FJsonObject>& Params);
@@ -32,12 +38,14 @@ TSharedRef<FJsonObject> SetCollisionProfileName(const FString& Id, const TShared
 TSharedRef<FJsonObject> SetBoxExtent(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetGenerateOverlapEvents(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CreateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DuplicateFunctionGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CreateEventGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddFunctionInput(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddFunctionOutput(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DeleteGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> RenameCustomEvent(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> EditUserDefinedPin(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> SetUserDefinedPinFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> RenameGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddVariableGetterFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params);

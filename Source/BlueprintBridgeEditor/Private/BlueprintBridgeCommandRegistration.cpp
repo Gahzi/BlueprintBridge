@@ -100,13 +100,15 @@ static FSchemaBuilder AddPinTypeFields(FSchemaBuilder Builder)
 		.OptionalStringEnum(TEXT("containerType"), TEXT("Optional container type."), { TEXT("None"), TEXT("Array"), TEXT("Set") })
 		.OptionalBoolean(TEXT("isArray"), TEXT("Legacy shortcut for containerType=Array."))
 		.OptionalBoolean(TEXT("byRef"), TEXT("Whether the pin should be passed by reference."))
-		.OptionalBoolean(TEXT("const"), TEXT("Whether the reference pin should be const."));
+		.OptionalBoolean(TEXT("isConst"), TEXT("Whether the reference pin should be const."))
+		.OptionalBoolean(TEXT("const"), TEXT("Legacy alias for isConst."));
 }
 
 static TSharedPtr<FJsonObject> MakeBatchSchema()
 {
 	return FSchemaBuilder::Object()
 		.RequiredArray(TEXT("requests"), TEXT("Bridge request objects to execute."))
+		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to cancel the enclosing editor transaction if a child request fails."))
 		.Build();
 }
 
@@ -246,6 +248,57 @@ static TSharedPtr<FJsonObject> MakeFindVariableReferencesSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeAnalyzeGraphSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("includeDataReachability"), TEXT("Reserved for future data-flow analysis. Current analysis reports data connectivity."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeClassSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.OptionalBoolean(TEXT("includeFunctions"), TEXT("Whether to include reflected function summaries."))
+		.OptionalBoolean(TEXT("includeProperties"), TEXT("Whether to include reflected property summaries."))
+		.OptionalBoolean(TEXT("includeDelegates"), TEXT("Whether to include reflected delegate summaries."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindFunctionsSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.OptionalString(TEXT("nameContains"), TEXT("Optional case-insensitive function name substring filter."))
+		.OptionalBoolean(TEXT("blueprintCallableOnly"), TEXT("Whether to only include Blueprint-callable/pure functions."))
+		.OptionalBoolean(TEXT("includeInherited"), TEXT("Whether to include inherited functions. Defaults true."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeFunctionSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.RequiredString(TEXT("function"), TEXT("Function name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribePropertySchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.RequiredString(TEXT("property"), TEXT("Property name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeDelegateSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.RequiredString(TEXT("delegate"), TEXT("Delegate property name."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeDescribeSubobjectsSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
@@ -336,6 +389,19 @@ static TSharedPtr<FJsonObject> MakeCreateFunctionGraphSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeDuplicateFunctionGraphSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("sourceGraph"), TEXT("Function graph to duplicate."))
+		.RequiredString(TEXT("newGraph"), TEXT("New function graph name."))
+		.OptionalObject(TEXT("renames"), TEXT("Optional exact name map applied to user-defined function pins and local/self variable references."))
+		.OptionalObject(TEXT("pinRenames"), TEXT("Optional exact name map applied to user-defined function pins."))
+		.OptionalObject(TEXT("variableRenames"), TEXT("Optional exact name map applied to local/self variable references."))
+		.OptionalBoolean(TEXT("strictRenames"), TEXT("Whether unmatched rename keys or rename collisions should fail the command."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile the Blueprint after duplicating."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeAddFunctionPinSchema()
 {
 	return AddPinTypeFields(AddAssetGraph(FSchemaBuilder::Object())
@@ -357,6 +423,17 @@ static TSharedPtr<FJsonObject> MakeEditUserDefinedPinSchema()
 		.RequiredString(TEXT("node"), TEXT("Editable node GUID."))
 		.RequiredString(TEXT("pin"), TEXT("Existing pin name."))
 		.OptionalString(TEXT("newName"), TEXT("Optional new pin name.")))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeSetUserDefinedPinFlagsSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("node"), TEXT("Editable node GUID."))
+		.RequiredString(TEXT("pin"), TEXT("Existing user-defined pin name."))
+		.OptionalBoolean(TEXT("byRef"), TEXT("Whether the pin should be passed by reference."))
+		.OptionalBoolean(TEXT("isConst"), TEXT("Whether the reference pin should be const."))
+		.OptionalBoolean(TEXT("const"), TEXT("Legacy alias for isConst."))
 		.Build();
 }
 
@@ -678,6 +755,14 @@ static TSharedPtr<FJsonObject> MakeAddBlueprintVariableSchema()
 		.OptionalStringEnum(TEXT("containerType"), TEXT("Optional container type."), { TEXT("None"), TEXT("Array"), TEXT("Set") })
 		.OptionalBoolean(TEXT("isArray"), TEXT("Legacy shortcut for containerType=Array."))
 		.OptionalString(TEXT("defaultValue"), TEXT("Optional default value as text."))
+		.OptionalBoolean(TEXT("instanceEditable"), TEXT("Whether the variable is instance editable."))
+		.OptionalBoolean(TEXT("blueprintReadOnly"), TEXT("Whether the variable is Blueprint read-only."))
+		.OptionalBoolean(TEXT("exposeOnSpawn"), TEXT("Whether the variable is exposed on spawn."))
+		.OptionalBoolean(TEXT("private"), TEXT("Whether the variable is private."))
+		.OptionalString(TEXT("categoryName"), TEXT("Variable category name."))
+		.OptionalString(TEXT("tooltip"), TEXT("Variable tooltip."))
+		.OptionalStringEnum(TEXT("replication"), TEXT("Replication mode."), { TEXT("None"), TEXT("Replicated"), TEXT("RepNotify") })
+		.OptionalString(TEXT("repNotifyFunc"), TEXT("RepNotify function name when replication is RepNotify."))
 		.Build();
 }
 
@@ -696,6 +781,12 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DescribeNode"), TEXT("Returns a single Blueprint graph node description."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeNodeSchema(), &DescribeNodeCommand, MakeDescribeNodeOutputSchema());
 	RegisterCommand(TEXT("FindNodes"), TEXT("Finds Blueprint graph nodes matching optional filters."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesSchema(), &FindNodes, MakeFindNodesOutputSchema());
 	RegisterCommand(TEXT("FindVariableReferences"), TEXT("Finds get/set nodes referencing a Blueprint variable."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindVariableReferencesSchema(), &FindVariableReferences);
+	RegisterCommand(TEXT("AnalyzeGraph"), TEXT("Reports simple exec reachability and disconnected/orphaned graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAnalyzeGraphSchema(), &AnalyzeGraph);
+	RegisterCommand(TEXT("DescribeClass"), TEXT("Returns reflected class metadata and optional function/property/delegate summaries."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeClassSchema(), &DescribeClass);
+	RegisterCommand(TEXT("FindFunctions"), TEXT("Finds reflected functions on a class."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeFindFunctionsSchema(), &FindFunctions);
+	RegisterCommand(TEXT("DescribeFunction"), TEXT("Returns reflected function flags, node purity, metadata, and params."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeFunctionSchema(), &DescribeFunction);
+	RegisterCommand(TEXT("DescribeProperty"), TEXT("Returns reflected property type, flags, metadata, and pin type."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribePropertySchema(), &DescribeProperty);
+	RegisterCommand(TEXT("DescribeDelegate"), TEXT("Returns reflected delegate property and signature metadata."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeDelegateSchema(), &DescribeDelegate);
 	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeComponents);
 	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeWidgetTree);
 	RegisterCommand(TEXT("DescribeSubobjects"), TEXT("Returns Blueprint subobject data."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubobjectsSchema(), &DescribeSubobjects);
@@ -711,12 +802,14 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("SetGenerateOverlapEvents"), TEXT("Sets primitive component overlap generation."), TEXT("ComponentEditing"), ECommandRisk::ModifiesAsset, MakeSetGenerateOverlapEventsSchema(), &SetGenerateOverlapEvents);
 
 	RegisterCommand(TEXT("CreateFunctionGraph"), TEXT("Creates a user function graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeCreateFunctionGraphSchema(), &CreateFunctionGraph);
+	RegisterCommand(TEXT("DuplicateFunctionGraph"), TEXT("Duplicates a user function graph, optionally renaming pins and variable references."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeDuplicateFunctionGraphSchema(), &DuplicateFunctionGraph);
 	RegisterCommand(TEXT("CreateEventGraph"), TEXT("Creates an event graph page."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAssetGraphSchema(), &CreateEventGraph);
 	RegisterCommand(TEXT("AddFunctionInput"), TEXT("Adds an input pin to a function graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAddFunctionPinSchema(), &AddFunctionInput);
 	RegisterCommand(TEXT("AddFunctionOutput"), TEXT("Adds an output pin to a function graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAddFunctionPinSchema(), &AddFunctionOutput);
 	RegisterCommand(TEXT("DeleteGraph"), TEXT("Deletes a Blueprint graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAssetGraphSchema(), &DeleteGraph);
 	RegisterCommand(TEXT("RenameCustomEvent"), TEXT("Renames a custom event node."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeRenameCustomEventSchema(), &RenameCustomEvent);
 	RegisterCommand(TEXT("EditUserDefinedPin"), TEXT("Edits a user-defined event or function pin."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeEditUserDefinedPinSchema(), &EditUserDefinedPin);
+	RegisterCommand(TEXT("SetUserDefinedPinFlags"), TEXT("Edits byRef/isConst on a user-defined event or function pin."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeSetUserDefinedPinFlagsSchema(), &SetUserDefinedPinFlags);
 	RegisterCommand(TEXT("RenameGraph"), TEXT("Renames a Blueprint graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeRenameGraphSchema(), &RenameGraph);
 	RegisterCommand(TEXT("AddVariableGetterFunction"), TEXT("Creates a function that returns a Blueprint variable."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAddVariableGetterFunctionSchema(), &AddVariableGetterFunction);
 
