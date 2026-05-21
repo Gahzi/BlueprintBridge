@@ -29,7 +29,8 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - initial UMG widget-tree creation/editing and slot layout commands
 - batched request execution
 - command discovery through `ListCommands` and `DescribeCommand`
-- descriptive input schemas for registered commands
+- descriptive input and selected output schemas for registered commands
+- generated JSON/Markdown command schema documentation through `GenerateCommandDocs`
 - optional request validation against command schemas
 - automation coverage under the `BlueprintBridge` test namespace
 
@@ -307,6 +308,21 @@ Returns metadata and schemas for one command.
 
 Command schemas are descriptive by default. If `bValidateRequestsAgainstSchemas` is enabled, BlueprintBridge checks required fields and basic JSON types before running a command. Unknown fields are currently allowed.
 
+Selected stable read-only commands also expose descriptive `outputSchema` data: `Ping`, `ListCommands`, `DescribeCommand`, `DescribeBlueprint`, `DescribeGraph`, `DescribeNode`, and `FindNodes`.
+
+#### `GenerateCommandDocs`
+
+Generates command schema documentation from the runtime command registry. By default it writes both files under `Saved/BlueprintBridge`:
+
+```json
+{
+  "format": "both",
+  "directory": "D:/Optional/Output/Directory"
+}
+```
+
+Supported `format` values are `both`, `json`, and `markdown`. The result includes generated file paths and `commandCount`.
+
 ### Batch execution
 
 #### `Batch`
@@ -423,11 +439,13 @@ Compiles a Blueprint and returns structured status fields:
 {
   "status": "UpToDate",
   "success": true,
+  "errorCount": 0,
+  "warningCount": 0,
   "messages": []
 }
 ```
 
-`messages` is reserved for richer compiler diagnostics.
+`messages` contains Blueprint compiler diagnostics when available. Each diagnostic includes `severity` and `message`, plus optional graph context such as `graph`, `nodeGuid`, `nodeName`, `pinId`, and `pinName` when Unreal attaches graph tokens to the compiler message.
 
 #### `SaveAsset`
 

@@ -18,9 +18,10 @@ static void RegisterCommand(
 	const TCHAR* Category,
 	const ECommandRisk Risk,
 	TSharedPtr<FJsonObject> InputSchema,
-	FFunctionCommand::FHandler Handler)
+	FFunctionCommand::FHandler Handler,
+	TSharedPtr<FJsonObject> OutputSchema = nullptr)
 {
-	const TSharedRef<FFunctionCommand> Command = MakeShared<FFunctionCommand>(Name, Description, Category, Risk, InputSchema.IsValid() ? InputSchema : MakeEmptyObjectSchema(), MoveTemp(Handler));
+	const TSharedRef<FFunctionCommand> Command = MakeShared<FFunctionCommand>(Name, Description, Category, Risk, InputSchema.IsValid() ? InputSchema : MakeEmptyObjectSchema(), OutputSchema, MoveTemp(Handler));
 	ensureMsgf(GetCommandRegistry().AddCommand(Command), TEXT("Failed to register Blueprint Bridge command '%s'."), Name);
 }
 
@@ -113,6 +114,101 @@ static TSharedPtr<FJsonObject> MakeDescribeCommandSchema()
 {
 	return FSchemaBuilder::Object()
 		.RequiredString(TEXT("command"), TEXT("Command name to describe."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeGenerateCommandDocsSchema()
+{
+	return FSchemaBuilder::Object()
+		.OptionalString(TEXT("directory"), TEXT("Optional output directory. Defaults to Project/Saved/BlueprintBridge."))
+		.OptionalStringEnum(TEXT("format"), TEXT("Documentation format to generate."), { TEXT("both"), TEXT("json"), TEXT("markdown") })
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeTypeSchema(const TCHAR* Type, const TCHAR* Description)
+{
+	TSharedRef<FJsonObject> Schema = MakeShared<FJsonObject>();
+	Schema->SetStringField(TEXT("type"), Type);
+	Schema->SetStringField(TEXT("description"), Description);
+	return Schema;
+}
+
+static TSharedPtr<FJsonObject> MakePingOutputSchema()
+{
+	return MakeTypeSchema(TEXT("string"), TEXT("Pong response string."));
+}
+
+static TSharedPtr<FJsonObject> MakeListCommandsOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredArray(TEXT("commands"), TEXT("Registered command summaries with name, description, category, and risk."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeCommandOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("name"), TEXT("Canonical command name."))
+		.RequiredString(TEXT("description"), TEXT("Command description."))
+		.RequiredString(TEXT("category"), TEXT("Command category."))
+		.RequiredString(TEXT("risk"), TEXT("Risk classification."))
+		.OptionalObject(TEXT("inputSchema"), TEXT("Descriptive JSON schema for params."))
+		.OptionalObject(TEXT("outputSchema"), TEXT("Descriptive JSON schema for result."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeGenerateCommandDocsOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.OptionalString(TEXT("jsonPath"), TEXT("Generated JSON schema document path."))
+		.OptionalString(TEXT("markdownPath"), TEXT("Generated Markdown reference document path."))
+		.RequiredNumber(TEXT("commandCount"), TEXT("Number of commands documented."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeBlueprintOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("asset"), TEXT("Requested Blueprint asset path."))
+		.RequiredString(TEXT("name"), TEXT("Blueprint asset name."))
+		.RequiredString(TEXT("parentClass"), TEXT("Blueprint parent class path."))
+		.RequiredArray(TEXT("variables"), TEXT("Blueprint variables with type, flags, and replication metadata."))
+		.RequiredArray(TEXT("graphs"), TEXT("Blueprint graph names."))
+		.OptionalObject(TEXT("widgetTree"), TEXT("Widget tree description for Widget Blueprints."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeGraphOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("asset"), TEXT("Requested Blueprint asset path."))
+		.RequiredString(TEXT("graph"), TEXT("Resolved graph name."))
+		.RequiredArray(TEXT("nodes"), TEXT("Graph node descriptions including pins, defaults, links, and positions."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeNodeOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredObject(TEXT("node"), TEXT("Graph node description including pins, defaults, links, and position."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindNodesOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredArray(TEXT("nodes"), TEXT("Matching graph node descriptions. Each match includes the owning graph name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeCompileBlueprintOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("status"), TEXT("Post-compile Blueprint status."))
+		.RequiredBoolean(TEXT("success"), TEXT("Whether compile completed without errors."))
+		.RequiredNumber(TEXT("errorCount"), TEXT("Number of compiler errors captured."))
+		.RequiredNumber(TEXT("warningCount"), TEXT("Number of compiler warnings captured."))
+		.RequiredArray(TEXT("messages"), TEXT("Compiler diagnostics with severity, message, and optional node or pin references."))
 		.Build();
 }
 
@@ -588,16 +684,17 @@ static TSharedPtr<FJsonObject> MakeAddBlueprintVariableSchema()
 void RegisterBlueprintBridgeCommands()
 {
 	RegisterCommand(TEXT("Batch"), TEXT("Executes multiple bridge requests and returns their responses."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeBatchSchema(), &BatchCommand);
-	RegisterCommand(TEXT("Ping"), TEXT("Returns Pong."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &PingCommand);
-	RegisterCommand(TEXT("GetProjectName"), TEXT("Returns the current Unreal project name."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetProjectNameCommand);
-	RegisterCommand(TEXT("GetEngineVersion"), TEXT("Returns the current engine version string."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetEngineVersionCommand);
-	RegisterCommand(TEXT("ListCommands"), TEXT("Lists registered Blueprint Bridge commands."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &ListCommands);
-	RegisterCommand(TEXT("DescribeCommand"), TEXT("Returns metadata and schemas for a registered command."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeDescribeCommandSchema(), &DescribeCommand);
+	RegisterCommand(TEXT("Ping"), TEXT("Returns Pong."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &PingCommand, MakePingOutputSchema());
+	RegisterCommand(TEXT("GetProjectName"), TEXT("Returns the current Unreal project name."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetProjectNameCommand, MakeTypeSchema(TEXT("string"), TEXT("Current Unreal project name.")));
+	RegisterCommand(TEXT("GetEngineVersion"), TEXT("Returns the current engine version string."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetEngineVersionCommand, MakeTypeSchema(TEXT("string"), TEXT("Current Unreal Engine version string.")));
+	RegisterCommand(TEXT("ListCommands"), TEXT("Lists registered Blueprint Bridge commands."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &ListCommands, MakeListCommandsOutputSchema());
+	RegisterCommand(TEXT("DescribeCommand"), TEXT("Returns metadata and schemas for a registered command."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeDescribeCommandSchema(), &DescribeCommand, MakeDescribeCommandOutputSchema());
+	RegisterCommand(TEXT("GenerateCommandDocs"), TEXT("Generates JSON and/or Markdown command schema documentation."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeGenerateCommandDocsSchema(), &GenerateCommandDocs, MakeGenerateCommandDocsOutputSchema());
 
-	RegisterCommand(TEXT("DescribeBlueprint"), TEXT("Returns parent class, variables, and graph names for a Blueprint."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeBlueprint);
-	RegisterCommand(TEXT("DescribeGraph"), TEXT("Returns nodes, pins, defaults, links, and positions for a Blueprint graph."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetGraphSchema(), &DescribeGraph);
-	RegisterCommand(TEXT("DescribeNode"), TEXT("Returns a single Blueprint graph node description."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeNodeSchema(), &DescribeNodeCommand);
-	RegisterCommand(TEXT("FindNodes"), TEXT("Finds Blueprint graph nodes matching optional filters."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesSchema(), &FindNodes);
+	RegisterCommand(TEXT("DescribeBlueprint"), TEXT("Returns parent class, variables, and graph names for a Blueprint."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeBlueprint, MakeDescribeBlueprintOutputSchema());
+	RegisterCommand(TEXT("DescribeGraph"), TEXT("Returns nodes, pins, defaults, links, and positions for a Blueprint graph."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetGraphSchema(), &DescribeGraph, MakeDescribeGraphOutputSchema());
+	RegisterCommand(TEXT("DescribeNode"), TEXT("Returns a single Blueprint graph node description."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeNodeSchema(), &DescribeNodeCommand, MakeDescribeNodeOutputSchema());
+	RegisterCommand(TEXT("FindNodes"), TEXT("Finds Blueprint graph nodes matching optional filters."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesSchema(), &FindNodes, MakeFindNodesOutputSchema());
 	RegisterCommand(TEXT("FindVariableReferences"), TEXT("Finds get/set nodes referencing a Blueprint variable."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindVariableReferencesSchema(), &FindVariableReferences);
 	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeComponents);
 	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeWidgetTree);
@@ -667,7 +764,7 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("CreateWidgetBlueprintAsset"), TEXT("Creates a Widget Blueprint asset."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeCreateWidgetBlueprintAssetSchema(), &CreateWidgetBlueprintAsset);
 	RegisterCommand(TEXT("DuplicateAsset"), TEXT("Duplicates an editor asset."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeDuplicateAssetSchema(), &DuplicateAsset);
 	RegisterCommand(TEXT("CheckoutAsset"), TEXT("Checks out an asset through source control."), TEXT("SourceControl"), ECommandRisk::SourceControl, MakeAssetSchema(), &CheckoutAsset);
-	RegisterCommand(TEXT("CompileBlueprint"), TEXT("Compiles a Blueprint asset."), TEXT("Asset"), ECommandRisk::ModifiesAsset, MakeAssetSchema(), &CompileBlueprint);
+	RegisterCommand(TEXT("CompileBlueprint"), TEXT("Compiles a Blueprint asset."), TEXT("Asset"), ECommandRisk::ModifiesAsset, MakeAssetSchema(), &CompileBlueprint, MakeCompileBlueprintOutputSchema());
 	RegisterCommand(TEXT("SaveAsset"), TEXT("Saves an asset package."), TEXT("Asset"), ECommandRisk::SavePackage, MakeAssetSchema(), &SaveAsset);
 
 	RegisterCommand(TEXT("AddWidget"), TEXT("Adds a widget to a Widget Blueprint tree."), TEXT("WidgetEditing"), ECommandRisk::ModifiesAsset, MakeAddWidgetSchema(), &AddWidget);

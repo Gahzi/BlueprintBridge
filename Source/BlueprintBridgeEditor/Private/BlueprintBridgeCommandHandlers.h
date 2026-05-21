@@ -13,6 +13,7 @@ TSharedRef<FJsonObject> GetProjectNameCommand(const FString& Id, const TSharedPt
 TSharedRef<FJsonObject> GetEngineVersionCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ListCommands(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> GenerateCommandDocs(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);

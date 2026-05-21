@@ -6,6 +6,7 @@
 
 #include "BlueprintBridgeCommandHandlers.h"
 #include "BlueprintBridgeCommandRegistry.h"
+#include "BlueprintBridgeProtocol.h"
 #include "BlueprintBridgeSettings.h"
 
 #include "AssetRegistry/AssetRegistryModule.h"
@@ -103,13 +104,7 @@ TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJs
 TSharedRef<FJsonObject> SaveAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CreateWidgetBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
-FString GetPipeNamePath();
-bool ValidateAuthToken(const TSharedPtr<FJsonObject>& Request);
-FString JsonToString(const TSharedRef<FJsonObject>& JsonObject);
-TSharedRef<FJsonObject> MakeBridgeError(const FString& Id, const FString& Code, const FString& Message);
 FString NormalizeBlueprintObjectPath(const FString& AssetPath);
-TSharedRef<FJsonObject> MakeSuccess(const FString& Id, const TSharedPtr<FJsonObject>& Result);
-TSharedRef<FJsonObject> MakeSuccessMessage(const FString& Id, const FString& Message);
 UBlueprint* LoadBlueprint(const FString& AssetPath);
 UWidgetBlueprint* LoadWidgetBlueprint(const FString& AssetPath);
 FString PinContainerTypeToString(const FEdGraphPinType& PinType);
@@ -217,11 +212,9 @@ UEdGraph* FindBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName);
 TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node);
 TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
-TSharedRef<FJsonObject> MakeCommandDescription(const ICommand& Command, const bool bIncludeSchemas);
 TSharedRef<FJsonObject> ListCommands(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
-TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& RequestText);
 TSharedRef<FJsonObject> PingCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> GetProjectNameCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> GetEngineVersionCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);

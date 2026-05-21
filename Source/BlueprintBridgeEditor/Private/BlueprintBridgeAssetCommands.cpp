@@ -2,6 +2,10 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "EdGraphToken.h"
+#include "Kismet2/CompilerResultsLog.h"
+#include "Logging/TokenizedMessage.h"
+
 namespace BlueprintBridge
 {
 TSharedRef<FJsonObject> DuplicateAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -97,6 +101,88 @@ FString GetBlueprintStatusString(const EBlueprintStatus Status)
 	}
 }
 
+static FString CompileMessageSeverityToString(const EMessageSeverity::Type Severity)
+{
+	switch (Severity)
+	{
+	case EMessageSeverity::Error:
+		return TEXT("Error");
+	case EMessageSeverity::PerformanceWarning:
+		return TEXT("PerformanceWarning");
+	case EMessageSeverity::Warning:
+		return TEXT("Warning");
+	case EMessageSeverity::Info:
+		return TEXT("Info");
+	default:
+		return TEXT("Unknown");
+	}
+}
+
+static void AddGraphTokenFields(TSharedRef<FJsonObject> MessageJson, const TSharedRef<IMessageToken>& Token)
+{
+	if (Token->GetType() != EMessageToken::EdGraph)
+	{
+		return;
+	}
+
+	const FEdGraphToken* GraphToken = static_cast<const FEdGraphToken*>(&Token.Get());
+	if (const UEdGraphPin* Pin = GraphToken->GetPin())
+	{
+		MessageJson->SetStringField(TEXT("pinId"), Pin->PinId.ToString(EGuidFormats::DigitsWithHyphens));
+		MessageJson->SetStringField(TEXT("pinName"), Pin->PinName.ToString());
+		if (const UEdGraphNode* OwningNode = Pin->GetOwningNode())
+		{
+			MessageJson->SetStringField(TEXT("nodeGuid"), OwningNode->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+			MessageJson->SetStringField(TEXT("nodeName"), OwningNode->GetName());
+			if (const UEdGraph* Graph = OwningNode->GetGraph())
+			{
+				MessageJson->SetStringField(TEXT("graph"), Graph->GetName());
+			}
+		}
+		return;
+	}
+
+	if (const UObject* GraphObject = GraphToken->GetGraphObject())
+	{
+		if (const UEdGraphNode* Node = Cast<UEdGraphNode>(GraphObject))
+		{
+			MessageJson->SetStringField(TEXT("nodeGuid"), Node->NodeGuid.ToString(EGuidFormats::DigitsWithHyphens));
+			MessageJson->SetStringField(TEXT("nodeName"), Node->GetName());
+			if (const UEdGraph* Graph = Node->GetGraph())
+			{
+				MessageJson->SetStringField(TEXT("graph"), Graph->GetName());
+			}
+		}
+		else if (const UEdGraph* Graph = Cast<UEdGraph>(GraphObject))
+		{
+			MessageJson->SetStringField(TEXT("graph"), Graph->GetName());
+		}
+	}
+}
+
+static TArray<TSharedPtr<FJsonValue>> BuildCompileMessages(const FCompilerResultsLog& ResultsLog)
+{
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	for (const TSharedRef<FTokenizedMessage>& Message : ResultsLog.Messages)
+	{
+		TSharedRef<FJsonObject> MessageJson = MakeShared<FJsonObject>();
+		MessageJson->SetStringField(TEXT("severity"), CompileMessageSeverityToString(Message->GetSeverity()));
+		MessageJson->SetStringField(TEXT("message"), Message->ToText().ToString());
+		if (!Message->GetIdentifier().IsNone())
+		{
+			MessageJson->SetStringField(TEXT("id"), Message->GetIdentifier().ToString());
+		}
+
+		for (const TSharedRef<IMessageToken>& Token : Message->GetMessageTokens())
+		{
+			AddGraphTokenFields(MessageJson, Token);
+		}
+
+		Messages.Add(MakeShared<FJsonValueObject>(MessageJson));
+	}
+	return Messages;
+}
+
 TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -111,11 +197,16 @@ TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJs
 		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
 	}
 
-	FKismetEditorUtilities::CompileBlueprint(Blueprint);
+	FCompilerResultsLog ResultsLog;
+	ResultsLog.SetSourcePath(Blueprint->GetPathName());
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &ResultsLog);
+
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("status"), GetBlueprintStatusString(Blueprint->Status));
-	Result->SetBoolField(TEXT("success"), Blueprint->Status != BS_Error);
-	Result->SetArrayField(TEXT("messages"), TArray<TSharedPtr<FJsonValue>>());
+	Result->SetBoolField(TEXT("success"), ResultsLog.NumErrors == 0 && Blueprint->Status != BS_Error);
+	Result->SetNumberField(TEXT("errorCount"), ResultsLog.NumErrors);
+	Result->SetNumberField(TEXT("warningCount"), ResultsLog.NumWarnings);
+	Result->SetArrayField(TEXT("messages"), BuildCompileMessages(ResultsLog));
 	return MakeSuccess(Id, Result);
 }
 

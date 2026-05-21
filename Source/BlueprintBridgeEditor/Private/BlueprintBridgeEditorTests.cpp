@@ -637,7 +637,43 @@ bool FBlueprintBridgeDescribeCommandTest::RunTest(const FString& Parameters)
 	}
 
 	FString SchemaType;
-	return TestTrue(TEXT("Input schema should be an object schema."), (*InputSchema)->TryGetStringField(TEXT("type"), SchemaType) && SchemaType == TEXT("object"));
+	if (!TestTrue(TEXT("Input schema should be an object schema."), (*InputSchema)->TryGetStringField(TEXT("type"), SchemaType) && SchemaType == TEXT("object")))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* OutputSchema = nullptr;
+	if (!TestTrue(TEXT("DescribeCommand should return Ping output schema."), (*Result)->TryGetObjectField(TEXT("outputSchema"), OutputSchema) && OutputSchema != nullptr && OutputSchema->IsValid()))
+	{
+		return false;
+	}
+
+	FString OutputSchemaType;
+	return TestTrue(TEXT("Ping output schema should describe a string result."), (*OutputSchema)->TryGetStringField(TEXT("type"), OutputSchemaType) && OutputSchemaType == TEXT("string"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeGenerateCommandDocsTest, "BlueprintBridge.Protocol.GenerateCommandDocs", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeGenerateCommandDocsTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("format"), TEXT("json"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GenerateCommandDocs"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+
+	FString JsonPath;
+	double CommandCount = 0.0;
+	TestTrue(TEXT("GenerateCommandDocs should return jsonPath."), (*Result)->TryGetStringField(TEXT("jsonPath"), JsonPath) && !JsonPath.IsEmpty());
+	return TestTrue(TEXT("GenerateCommandDocs should return commandCount."), (*Result)->TryGetNumberField(TEXT("commandCount"), CommandCount) && CommandCount > 0.0);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCommandSchemaTest, "BlueprintBridge.Protocol.CommandSchemas", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1445,8 +1481,16 @@ bool FBlueprintBridgeAssetLifecycleAndDefaultsTest::RunTest(const FString& Param
 		return false;
 	}
 	FString CompileStatus;
+	bool bCompileSuccess = false;
+	double CompileErrorCount = -1.0;
+	double CompileWarningCount = -1.0;
+	const TArray<TSharedPtr<FJsonValue>>* CompileMessages = nullptr;
 	TestTrue(TEXT("CompileBlueprint should include status."), (*CompileResult)->TryGetStringField(TEXT("status"), CompileStatus));
-	TestTrue(TEXT("CompileBlueprint should succeed."), CompileStatus == TEXT("UpToDate") || CompileStatus == TEXT("UpToDateWithWarnings"));
+	TestTrue(TEXT("CompileBlueprint should include success."), (*CompileResult)->TryGetBoolField(TEXT("success"), bCompileSuccess));
+	TestTrue(TEXT("CompileBlueprint should include errorCount."), (*CompileResult)->TryGetNumberField(TEXT("errorCount"), CompileErrorCount));
+	TestTrue(TEXT("CompileBlueprint should include warningCount."), (*CompileResult)->TryGetNumberField(TEXT("warningCount"), CompileWarningCount));
+	TestTrue(TEXT("CompileBlueprint should include messages."), (*CompileResult)->TryGetArrayField(TEXT("messages"), CompileMessages) && CompileMessages != nullptr);
+	TestTrue(TEXT("CompileBlueprint should succeed."), bCompileSuccess && (CompileStatus == TEXT("UpToDate") || CompileStatus == TEXT("UpToDateWithWarnings")));
 
 	TSharedRef<FJsonObject> SetDefaultParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
 	SetDefaultParams->SetStringField(TEXT("property"), TEXT("Health"));

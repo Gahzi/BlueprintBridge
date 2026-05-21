@@ -31,12 +31,14 @@ FFunctionCommand::FFunctionCommand(
 	FString InCategory,
 	const ECommandRisk InRisk,
 	TSharedPtr<FJsonObject> InInputJsonSchema,
+	TSharedPtr<FJsonObject> InOutputJsonSchema,
 	FHandler InHandler)
 	: Name(MoveTemp(InName))
 	, Description(MoveTemp(InDescription))
 	, Category(MoveTemp(InCategory))
 	, Risk(InRisk)
 	, InputJsonSchema(MoveTemp(InInputJsonSchema))
+	, OutputJsonSchema(MoveTemp(InOutputJsonSchema))
 	, Handler(MoveTemp(InHandler))
 {
 }

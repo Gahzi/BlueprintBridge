@@ -44,6 +44,7 @@ public:
 		FString InCategory,
 		ECommandRisk InRisk,
 		TSharedPtr<FJsonObject> InInputJsonSchema,
+		TSharedPtr<FJsonObject> InOutputJsonSchema,
 		FHandler InHandler);
 
 	FString GetName() const override { return Name; }
@@ -51,6 +52,7 @@ public:
 	FString GetCategory() const override { return Category; }
 	ECommandRisk GetRisk() const override { return Risk; }
 	TSharedPtr<FJsonObject> GetInputJsonSchema() const override { return InputJsonSchema; }
+	TSharedPtr<FJsonObject> GetOutputJsonSchema() const override { return OutputJsonSchema; }
 	TSharedRef<FJsonObject> Execute(const FString& Id, const TSharedPtr<FJsonObject>& Params) override;
 
 private:
@@ -59,6 +61,7 @@ private:
 	FString Category;
 	ECommandRisk Risk = ECommandRisk::ReadOnly;
 	TSharedPtr<FJsonObject> InputJsonSchema;
+	TSharedPtr<FJsonObject> OutputJsonSchema;
 	FHandler Handler;
 };
 } // namespace BlueprintBridge
