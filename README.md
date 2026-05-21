@@ -90,6 +90,15 @@ Unreal operation layer
     component/SCS operations
     widget-tree operations
     compile/save/source-control helpers
+
+Command implementation files
+    protocol
+    inspection
+    graph/node/pin editing
+    components
+    assets
+    widgets
+    variables
 ```
 
 ## Transport protocol
@@ -295,6 +304,8 @@ Returns metadata and schemas for one command.
   "command": "DescribeBlueprint"
 }
 ```
+
+Command schemas are descriptive by default. If `bValidateRequestsAgainstSchemas` is enabled, BlueprintBridge checks required fields and basic JSON types before running a command. Unknown fields are currently allowed.
 
 ### Batch execution
 
@@ -978,7 +989,7 @@ Current test areas include:
 When changing plugin C++:
 
 1. Build the editor target.
-2. Fully restart Unreal Editor before named-pipe authoring tests.
+2. Fully restart Unreal Editor before named-pipe authoring tests. A running editor keeps the old plugin DLL and old command registry.
 3. Test `Ping`.
 4. Exercise the new command with a small throwaway asset.
 5. Run the full `BlueprintBridge` automation suite before considering the milestone complete.
@@ -1009,15 +1020,16 @@ Do not paste GitHub credentials, tokens, or passwords into AI chats or logs. Use
 - Some Blueprint node families are highly context-sensitive and may still require specialized commands.
 - UMG support covers initial widget-tree/layout/runtime helpers but not the full UMG authoring surface.
 - Animation Blueprints, Materials, Niagara, Behavior Trees, and State Trees are not covered as separate graph systems yet.
-- Most command implementations are still concentrated in a large `.cpp` and should eventually be split by domain.
+- Command implementations are split into domain `.cpp` files, with shared private helpers declared in `BlueprintBridgeCommandsPrivate.h`.
+
 ## Roadmap
 
 High-value next work:
 
 - richer compile diagnostics in command responses
-- split command implementation into smaller source files
+- continue reducing shared command helper coupling if needed
 - standalone cross-shell CLI client
-- richer schema detail and generated docs
+- generated schema docs
 - remove/rename Blueprint variables
 - more delegate unbind/clear helpers
 - richer array/map/set graph operations

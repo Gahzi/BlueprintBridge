@@ -35,6 +35,52 @@ static FSchemaBuilder AddAssetGraph(FSchemaBuilder Builder)
 		.RequiredString(TEXT("graph"), TEXT("Blueprint graph name."));
 }
 
+static TSharedPtr<FJsonObject> MakeVector2Schema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredNumber(TEXT("x"), TEXT("X value."))
+		.RequiredNumber(TEXT("y"), TEXT("Y value."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeVector3Schema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredNumber(TEXT("x"), TEXT("X value."))
+		.RequiredNumber(TEXT("y"), TEXT("Y value."))
+		.RequiredNumber(TEXT("z"), TEXT("Z value."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeRotatorSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredNumber(TEXT("pitch"), TEXT("Pitch in degrees."))
+		.RequiredNumber(TEXT("yaw"), TEXT("Yaw in degrees."))
+		.RequiredNumber(TEXT("roll"), TEXT("Roll in degrees."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeAnchorsSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredNumber(TEXT("minimumX"), TEXT("Minimum X anchor."))
+		.RequiredNumber(TEXT("minimumY"), TEXT("Minimum Y anchor."))
+		.RequiredNumber(TEXT("maximumX"), TEXT("Maximum X anchor."))
+		.RequiredNumber(TEXT("maximumY"), TEXT("Maximum Y anchor."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeMarginSchema()
+{
+	return FSchemaBuilder::Object()
+		.OptionalNumber(TEXT("left"), TEXT("Left padding."))
+		.OptionalNumber(TEXT("top"), TEXT("Top padding."))
+		.OptionalNumber(TEXT("right"), TEXT("Right padding."))
+		.OptionalNumber(TEXT("bottom"), TEXT("Bottom padding."))
+		.Build();
+}
+
 static FSchemaBuilder AddGraphEditBase(FSchemaBuilder Builder)
 {
 	return AddAssetGraph(Builder)
@@ -50,7 +96,7 @@ static FSchemaBuilder AddPinTypeFields(FSchemaBuilder Builder)
 		.OptionalString(TEXT("sourceVariable"), TEXT("Optional existing variable to copy the pin type from."))
 		.OptionalString(TEXT("subCategory"), TEXT("Optional pin sub-category."))
 		.OptionalString(TEXT("subCategoryObject"), TEXT("Optional object path for object, class, enum, or struct pin types."))
-		.OptionalString(TEXT("containerType"), TEXT("Optional container type: None, Array, or Set."))
+		.OptionalStringEnum(TEXT("containerType"), TEXT("Optional container type."), { TEXT("None"), TEXT("Array"), TEXT("Set") })
 		.OptionalBoolean(TEXT("isArray"), TEXT("Legacy shortcut for containerType=Array."))
 		.OptionalBoolean(TEXT("byRef"), TEXT("Whether the pin should be passed by reference."))
 		.OptionalBoolean(TEXT("const"), TEXT("Whether the reference pin should be const."));
@@ -140,9 +186,9 @@ static TSharedPtr<FJsonObject> MakeSetComponentTransformSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
 		.RequiredString(TEXT("name"), TEXT("Scene component name."))
-		.OptionalObject(TEXT("location"), TEXT("Optional location object with x, y, and z."))
-		.OptionalObject(TEXT("rotation"), TEXT("Optional rotation object with pitch, yaw, and roll."))
-		.OptionalObject(TEXT("scale"), TEXT("Optional scale object with x, y, and z."))
+		.OptionalObject(TEXT("location"), TEXT("Optional location object with x, y, and z."), MakeVector3Schema())
+		.OptionalObject(TEXT("rotation"), TEXT("Optional rotation object with pitch, yaw, and roll."), MakeRotatorSchema())
+		.OptionalObject(TEXT("scale"), TEXT("Optional scale object with x, y, and z."), MakeVector3Schema())
 		.Build();
 }
 
@@ -175,7 +221,7 @@ static TSharedPtr<FJsonObject> MakeSetBoxExtentSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
 		.RequiredString(TEXT("name"), TEXT("Box component name."))
-		.RequiredObject(TEXT("extent"), TEXT("Extent object with x, y, and z."))
+		.RequiredObject(TEXT("extent"), TEXT("Extent object with x, y, and z."), MakeVector3Schema())
 		.Build();
 }
 
@@ -278,21 +324,21 @@ static TSharedPtr<FJsonObject> MakeAddFunctionCallNodeSchema()
 static TSharedPtr<FJsonObject> MakeAddArrayFunctionNodeSchema()
 {
 	return AddGraphEditBase(FSchemaBuilder::Object())
-		.RequiredString(TEXT("operation"), TEXT("Array operation name."))
+		.RequiredStringEnum(TEXT("operation"), TEXT("Array operation name."), { TEXT("Add"), TEXT("AddUnique"), TEXT("Remove"), TEXT("RemoveItem"), TEXT("Clear"), TEXT("Length"), TEXT("Get"), TEXT("Contains") })
 		.Build();
 }
 
 static TSharedPtr<FJsonObject> MakeAddTimerNodeSchema()
 {
 	return AddGraphEditBase(FSchemaBuilder::Object())
-		.RequiredString(TEXT("operation"), TEXT("Timer operation name."))
+		.RequiredStringEnum(TEXT("operation"), TEXT("Timer operation name."), { TEXT("SetByEvent"), TEXT("SetByFunctionName"), TEXT("ClearByHandle"), TEXT("ClearAndInvalidateByHandle") })
 		.Build();
 }
 
 static TSharedPtr<FJsonObject> MakeAddLineTraceNodeSchema()
 {
 	return AddGraphEditBase(FSchemaBuilder::Object())
-		.OptionalString(TEXT("operation"), TEXT("Trace operation: Single or Multi."))
+		.OptionalStringEnum(TEXT("operation"), TEXT("Trace operation."), { TEXT("Single"), TEXT("Multi") })
 		.Build();
 }
 
@@ -485,11 +531,11 @@ static TSharedPtr<FJsonObject> MakeSetWidgetSlotLayoutSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
 		.RequiredString(TEXT("widget"), TEXT("Widget name."))
-		.OptionalObject(TEXT("position"), TEXT("Optional canvas position object."))
-		.OptionalObject(TEXT("size"), TEXT("Optional canvas size object."))
-		.OptionalObject(TEXT("alignment"), TEXT("Optional canvas alignment object."))
-		.OptionalObject(TEXT("anchors"), TEXT("Optional canvas anchors object."))
-		.OptionalObject(TEXT("padding"), TEXT("Optional panel slot padding object."))
+		.OptionalObject(TEXT("position"), TEXT("Optional canvas position object."), MakeVector2Schema())
+		.OptionalObject(TEXT("size"), TEXT("Optional canvas size object."), MakeVector2Schema())
+		.OptionalObject(TEXT("alignment"), TEXT("Optional canvas alignment object."), MakeVector2Schema())
+		.OptionalObject(TEXT("anchors"), TEXT("Optional canvas anchors object."), MakeAnchorsSchema())
+		.OptionalObject(TEXT("padding"), TEXT("Optional panel slot padding object."), MakeMarginSchema())
 		.Build();
 }
 
@@ -521,7 +567,7 @@ static TSharedPtr<FJsonObject> MakeSetBlueprintVariableFlagsSchema()
 		.OptionalBoolean(TEXT("private"), TEXT("Whether the variable is private."))
 		.OptionalString(TEXT("categoryName"), TEXT("Variable category name."))
 		.OptionalString(TEXT("tooltip"), TEXT("Variable tooltip."))
-		.OptionalString(TEXT("replication"), TEXT("Replication mode: None, Replicated, or RepNotify."))
+		.OptionalStringEnum(TEXT("replication"), TEXT("Replication mode."), { TEXT("None"), TEXT("Replicated"), TEXT("RepNotify") })
 		.OptionalString(TEXT("repNotifyFunc"), TEXT("RepNotify function name when replication is RepNotify."))
 		.Build();
 }
@@ -533,7 +579,7 @@ static TSharedPtr<FJsonObject> MakeAddBlueprintVariableSchema()
 		.RequiredString(TEXT("category"), TEXT("Pin category."))
 		.OptionalString(TEXT("subCategory"), TEXT("Optional pin sub-category."))
 		.OptionalString(TEXT("subCategoryObject"), TEXT("Optional sub-category object path."))
-		.OptionalString(TEXT("containerType"), TEXT("Optional container type: None, Array, or Set."))
+		.OptionalStringEnum(TEXT("containerType"), TEXT("Optional container type."), { TEXT("None"), TEXT("Array"), TEXT("Set") })
 		.OptionalBoolean(TEXT("isArray"), TEXT("Legacy shortcut for containerType=Array."))
 		.OptionalString(TEXT("defaultValue"), TEXT("Optional default value as text."))
 		.Build();
