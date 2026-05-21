@@ -64,6 +64,71 @@ class BlueprintBridgeClient:
     def describe_function(self, class_path: str, function: str) -> dict[str, Any]:
         return self.result("DescribeFunction", {"class": class_path, "function": function})
 
+    def find_reflection_symbols(
+        self,
+        query: str,
+        *,
+        kinds: Sequence[str] | None = None,
+        blueprint_callable_only: bool = True,
+        include_engine: bool = False,
+        include_project: bool = True,
+        max_results: int = 50,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "query": query,
+            "blueprintCallableOnly": blueprint_callable_only,
+            "includeEngine": include_engine,
+            "includeProject": include_project,
+            "maxResults": max_results,
+        }
+        if kinds:
+            params["kinds"] = list(kinds)
+        return self.result("FindReflectionSymbols", params)
+
+    def check_delegate_compatibility(
+        self,
+        *,
+        function: str,
+        delegate_owner_class: str,
+        delegate: str,
+        asset: str | None = None,
+        function_class: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {
+            "function": function,
+            "delegateOwnerClass": delegate_owner_class,
+            "delegate": delegate,
+        }
+        if asset:
+            params["asset"] = asset
+        if function_class:
+            params["functionClass"] = function_class
+        return self.result("CheckDelegateCompatibility", params)
+
+    def apply_graph_patch(
+        self,
+        *,
+        asset: str,
+        graph: str,
+        nodes: Sequence[Mapping[str, Any]] | None = None,
+        links: Sequence[Mapping[str, Any]] | None = None,
+        defaults: Sequence[Mapping[str, Any]] | None = None,
+        rollback_on_failure: bool = True,
+        compile: bool = False,
+    ) -> dict[str, Any]:
+        return self.result(
+            "ApplyGraphPatch",
+            {
+                "asset": asset,
+                "graph": graph,
+                "nodes": list(nodes or []),
+                "links": list(links or []),
+                "defaults": list(defaults or []),
+                "rollbackOnFailure": rollback_on_failure,
+                "compile": compile,
+            },
+        )
+
     def duplicate_function_graph(
         self,
         *,

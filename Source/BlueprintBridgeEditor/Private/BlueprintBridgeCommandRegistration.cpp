@@ -299,6 +299,31 @@ static TSharedPtr<FJsonObject> MakeDescribeDelegateSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeCheckDelegateCompatibilitySchema()
+{
+	return FSchemaBuilder::Object()
+		.OptionalString(TEXT("asset"), TEXT("Blueprint asset containing the function graph to check."))
+		.OptionalString(TEXT("functionClass"), TEXT("Class path containing a reflected C++/UFunction to check."))
+		.RequiredString(TEXT("function"), TEXT("Function name to check."))
+		.RequiredString(TEXT("delegateOwnerClass"), TEXT("Class path containing the delegate property."))
+		.RequiredString(TEXT("delegate"), TEXT("Delegate property name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindReflectionSymbolsSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("query"), TEXT("Case-insensitive symbol name or display-name substring to search for."))
+		.OptionalArray(TEXT("kinds"), TEXT("Optional symbol kinds: class, function, property, delegate."))
+		.OptionalString(TEXT("class"), TEXT("Optional class path to search within instead of all loaded classes."))
+		.OptionalBoolean(TEXT("includeInherited"), TEXT("Whether class-limited member search includes inherited members. Defaults true."))
+		.OptionalBoolean(TEXT("blueprintCallableOnly"), TEXT("Whether to only include Blueprint-callable/pure functions and Blueprint-visible properties/delegates."))
+		.OptionalBoolean(TEXT("includeEngine"), TEXT("Whether to include engine/module symbols. Defaults false."))
+		.OptionalBoolean(TEXT("includeProject"), TEXT("Whether to include project/plugin symbols. Defaults true."))
+		.OptionalNumber(TEXT("maxResults"), TEXT("Maximum results to return. Defaults 50."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeDescribeSubobjectsSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
@@ -450,6 +475,17 @@ static TSharedPtr<FJsonObject> MakeAddVariableGetterFunctionSchema()
 		.RequiredString(TEXT("function"), TEXT("Function graph name to create."))
 		.RequiredString(TEXT("variable"), TEXT("Variable name to return."))
 		.OptionalString(TEXT("output"), TEXT("Optional output pin name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeApplyGraphPatchSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to remove nodes created by this patch if an operation fails. Defaults true."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile the Blueprint after applying the patch."))
+		.OptionalArray(TEXT("nodes"), TEXT("Node declarations with id, type, x/y, and type-specific fields."))
+		.OptionalArray(TEXT("links"), TEXT("Pin links with from/to refs in nodeId.pinName form."))
+		.OptionalArray(TEXT("defaults"), TEXT("Pin defaults with node, pin, and value."))
 		.Build();
 }
 
@@ -787,6 +823,8 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DescribeFunction"), TEXT("Returns reflected function flags, node purity, metadata, and params."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeFunctionSchema(), &DescribeFunction);
 	RegisterCommand(TEXT("DescribeProperty"), TEXT("Returns reflected property type, flags, metadata, and pin type."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribePropertySchema(), &DescribeProperty);
 	RegisterCommand(TEXT("DescribeDelegate"), TEXT("Returns reflected delegate property and signature metadata."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeDelegateSchema(), &DescribeDelegate);
+	RegisterCommand(TEXT("CheckDelegateCompatibility"), TEXT("Checks whether a function signature is compatible with a delegate."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeCheckDelegateCompatibilitySchema(), &CheckDelegateCompatibility);
+	RegisterCommand(TEXT("FindReflectionSymbols"), TEXT("Finds loaded reflected classes, functions, properties, and delegates by name."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeFindReflectionSymbolsSchema(), &FindReflectionSymbols);
 	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeComponents);
 	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeWidgetTree);
 	RegisterCommand(TEXT("DescribeSubobjects"), TEXT("Returns Blueprint subobject data."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubobjectsSchema(), &DescribeSubobjects);
@@ -812,6 +850,7 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("SetUserDefinedPinFlags"), TEXT("Edits byRef/isConst on a user-defined event or function pin."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeSetUserDefinedPinFlagsSchema(), &SetUserDefinedPinFlags);
 	RegisterCommand(TEXT("RenameGraph"), TEXT("Renames a Blueprint graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeRenameGraphSchema(), &RenameGraph);
 	RegisterCommand(TEXT("AddVariableGetterFunction"), TEXT("Creates a function that returns a Blueprint variable."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAddVariableGetterFunctionSchema(), &AddVariableGetterFunction);
+	RegisterCommand(TEXT("ApplyGraphPatch"), TEXT("Applies declarative node/default/link edits to a graph."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyGraphPatchSchema(), &ApplyGraphPatch);
 
 	RegisterCommand(TEXT("AddVariableGetNode"), TEXT("Adds a Blueprint variable getter node."), TEXT("NodeCreation"), ECommandRisk::ModifiesAsset, MakeVariableNodeSchema(), &AddVariableGetNode);
 	RegisterCommand(TEXT("AddVariableSetNode"), TEXT("Adds a Blueprint variable setter node."), TEXT("NodeCreation"), ECommandRisk::ModifiesAsset, MakeVariableNodeSchema(), &AddVariableSetNode);

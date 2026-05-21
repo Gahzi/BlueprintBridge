@@ -708,6 +708,8 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeFunction"), { TEXT("class"), TEXT("function") });
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeProperty"), { TEXT("class"), TEXT("property") });
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeDelegate"), { TEXT("class"), TEXT("delegate") });
+	bSuccess &= ExpectRequiredFields(TEXT("CheckDelegateCompatibility"), { TEXT("function"), TEXT("delegateOwnerClass"), TEXT("delegate") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindReflectionSymbols"), { TEXT("query") });
 	bSuccess &= ExpectRequiredFields(TEXT("ConnectPins"), { TEXT("asset"), TEXT("graph"), TEXT("fromNode"), TEXT("fromPin"), TEXT("toNode"), TEXT("toPin") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetPinDefault"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin"), TEXT("value") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetNodePosition"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("x"), TEXT("y") });
@@ -715,6 +717,7 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	bSuccess &= ExpectRequiredFields(TEXT("AddFunctionCallNode"), { TEXT("asset"), TEXT("graph"), TEXT("x"), TEXT("y"), TEXT("functionClass"), TEXT("function") });
 	bSuccess &= ExpectRequiredFields(TEXT("DuplicateFunctionGraph"), { TEXT("asset"), TEXT("sourceGraph"), TEXT("newGraph") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetUserDefinedPinFlags"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin") });
+	bSuccess &= ExpectRequiredFields(TEXT("ApplyGraphPatch"), { TEXT("asset"), TEXT("graph") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddWidget"), { TEXT("asset"), TEXT("name"), TEXT("widgetClass") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddBlueprintVariable"), { TEXT("asset"), TEXT("name"), TEXT("category") });
 
@@ -825,7 +828,40 @@ bool FBlueprintBridgeReflectionCommandTest::RunTest(const FString& Parameters)
 
 	const TSharedPtr<FJsonObject>* DelegateResult = BlueprintBridgeTests::GetResultObject(*this, DelegateResponse);
 	const TSharedPtr<FJsonObject>* Signature = nullptr;
-	return DelegateResult && TestTrue(TEXT("DescribeDelegate should include signature."), (*DelegateResult)->TryGetObjectField(TEXT("signature"), Signature) && Signature != nullptr && Signature->IsValid());
+	if (!DelegateResult || !TestTrue(TEXT("DescribeDelegate should include signature."), (*DelegateResult)->TryGetObjectField(TEXT("signature"), Signature) && Signature != nullptr && Signature->IsValid()))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CompatibilityParams = MakeShared<FJsonObject>();
+	CompatibilityParams->SetStringField(TEXT("functionClass"), TEXT("/Script/Engine.Actor"));
+	CompatibilityParams->SetStringField(TEXT("function"), TEXT("K2_DestroyActor"));
+	CompatibilityParams->SetStringField(TEXT("delegateOwnerClass"), TEXT("/Script/Engine.Actor"));
+	CompatibilityParams->SetStringField(TEXT("delegate"), TEXT("OnDestroyed"));
+	const TSharedRef<FJsonObject> CompatibilityResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CheckDelegateCompatibility"), CompatibilityParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, CompatibilityResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* CompatibilityResult = BlueprintBridgeTests::GetResultObject(*this, CompatibilityResponse);
+	bool bCompatible = true;
+	TestTrue(TEXT("CheckDelegateCompatibility should report mismatch for incompatible function."), CompatibilityResult && (*CompatibilityResult)->TryGetBoolField(TEXT("compatible"), bCompatible) && !bCompatible);
+
+	TSharedRef<FJsonObject> SymbolParams = MakeShared<FJsonObject>();
+	SymbolParams->SetStringField(TEXT("query"), TEXT("Add_DoubleDouble"));
+	SymbolParams->SetBoolField(TEXT("includeEngine"), true);
+	SymbolParams->SetBoolField(TEXT("blueprintCallableOnly"), true);
+	TArray<TSharedPtr<FJsonValue>> Kinds;
+	Kinds.Add(MakeShared<FJsonValueString>(TEXT("function")));
+	SymbolParams->SetArrayField(TEXT("kinds"), Kinds);
+	const TSharedRef<FJsonObject> SymbolResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindReflectionSymbols"), SymbolParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, SymbolResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* SymbolResult = BlueprintBridgeTests::GetResultObject(*this, SymbolResponse);
+	const TArray<TSharedPtr<FJsonValue>>* Results = nullptr;
+	return SymbolResult && TestTrue(TEXT("FindReflectionSymbols should return matching results."), (*SymbolResult)->TryGetArrayField(TEXT("results"), Results) && Results != nullptr && Results->Num() > 0);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSchemaValidationTest, "BlueprintBridge.Protocol.SchemaValidation", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -1104,6 +1140,147 @@ bool FBlueprintBridgeGraphNodeCommandTest::RunTest(const FString& Parameters)
 
 	const TSharedRef<FJsonObject> DeletedNodeResponse = BlueprintBridgeTests::DescribeNodeRequest(Asset.AssetPath, EventGraphName, CommentNodeGuid);
 	return BlueprintBridgeTests::ExpectErrorCode(*this, DeletedNodeResponse, TEXT("NodeNotFound"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeApplyGraphPatchTest, "BlueprintBridge.Blueprint.ApplyGraphPatch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeApplyGraphPatchTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("GraphPatch"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CreateFunctionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateFunctionParams->SetStringField(TEXT("function"), TEXT("PatchFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateFunctionParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> PatchParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("PatchFunction"));
+	TArray<TSharedPtr<FJsonValue>> Nodes;
+	TSharedRef<FJsonObject> BranchNode = MakeShared<FJsonObject>();
+	BranchNode->SetStringField(TEXT("id"), TEXT("branch"));
+	BranchNode->SetStringField(TEXT("type"), TEXT("Branch"));
+	BranchNode->SetNumberField(TEXT("x"), 100);
+	BranchNode->SetNumberField(TEXT("y"), 0);
+	Nodes.Add(MakeShared<FJsonValueObject>(BranchNode));
+	TSharedRef<FJsonObject> SequenceNode = MakeShared<FJsonObject>();
+	SequenceNode->SetStringField(TEXT("id"), TEXT("sequence"));
+	SequenceNode->SetStringField(TEXT("type"), TEXT("Sequence"));
+	SequenceNode->SetNumberField(TEXT("x"), 360);
+	SequenceNode->SetNumberField(TEXT("y"), 0);
+	Nodes.Add(MakeShared<FJsonValueObject>(SequenceNode));
+	PatchParams->SetArrayField(TEXT("nodes"), Nodes);
+
+	TArray<TSharedPtr<FJsonValue>> Defaults;
+	TSharedRef<FJsonObject> ConditionDefault = MakeShared<FJsonObject>();
+	ConditionDefault->SetStringField(TEXT("node"), TEXT("branch"));
+	ConditionDefault->SetStringField(TEXT("pin"), TEXT("Condition"));
+	ConditionDefault->SetStringField(TEXT("value"), TEXT("true"));
+	Defaults.Add(MakeShared<FJsonValueObject>(ConditionDefault));
+	PatchParams->SetArrayField(TEXT("defaults"), Defaults);
+
+	TArray<TSharedPtr<FJsonValue>> Links;
+	TSharedRef<FJsonObject> BranchToSequence = MakeShared<FJsonObject>();
+	BranchToSequence->SetStringField(TEXT("from"), TEXT("branch.then"));
+	BranchToSequence->SetStringField(TEXT("to"), TEXT("sequence.execute"));
+	Links.Add(MakeShared<FJsonValueObject>(BranchToSequence));
+	PatchParams->SetArrayField(TEXT("links"), Links);
+
+	const TSharedRef<FJsonObject> PatchResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyGraphPatch"), PatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PatchResponse))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* PatchResult = BlueprintBridgeTests::GetResultObject(*this, PatchResponse);
+	const TArray<TSharedPtr<FJsonValue>>* LinkResults = nullptr;
+	TestTrue(TEXT("ApplyGraphPatch should report link results."), PatchResult && (*PatchResult)->TryGetArrayField(TEXT("links"), LinkResults) && LinkResults != nullptr && LinkResults->Num() == 1);
+
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("PatchFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* GraphNodes = nullptr;
+	bool bFoundBranchDefault = false;
+	int32 BranchCount = 0;
+	if (DescribeResult && (*DescribeResult)->TryGetArrayField(TEXT("nodes"), GraphNodes) && GraphNodes != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *GraphNodes)
+		{
+			const TSharedPtr<FJsonObject>* NodeObject = nullptr;
+			if (!NodeValue.IsValid() || !NodeValue->TryGetObject(NodeObject) || NodeObject == nullptr || !NodeObject->IsValid())
+			{
+				continue;
+			}
+
+			FString ClassName;
+			(*NodeObject)->TryGetStringField(TEXT("class"), ClassName);
+			if (ClassName.Contains(TEXT("K2Node_IfThenElse")))
+			{
+				++BranchCount;
+				if (const TSharedPtr<FJsonObject> ConditionPin = BlueprintBridgeTests::FindPinObjectByName(*NodeObject, TEXT("Condition")))
+				{
+					FString DefaultValue;
+					bFoundBranchDefault |= ConditionPin->TryGetStringField(TEXT("defaultValue"), DefaultValue) && DefaultValue == TEXT("true");
+				}
+			}
+		}
+	}
+	TestTrue(TEXT("ApplyGraphPatch should set pin defaults."), bFoundBranchDefault);
+
+	TSharedRef<FJsonObject> BadPatchParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("PatchFunction"));
+	BadPatchParams->SetBoolField(TEXT("rollbackOnFailure"), true);
+	TArray<TSharedPtr<FJsonValue>> BadNodes;
+	TSharedRef<FJsonObject> BadBranchNode = MakeShared<FJsonObject>();
+	BadBranchNode->SetStringField(TEXT("id"), TEXT("bad_branch"));
+	BadBranchNode->SetStringField(TEXT("type"), TEXT("Branch"));
+	BadBranchNode->SetNumberField(TEXT("x"), 600);
+	BadBranchNode->SetNumberField(TEXT("y"), 0);
+	BadNodes.Add(MakeShared<FJsonValueObject>(BadBranchNode));
+	BadPatchParams->SetArrayField(TEXT("nodes"), BadNodes);
+	TArray<TSharedPtr<FJsonValue>> BadLinks;
+	TSharedRef<FJsonObject> BadLink = MakeShared<FJsonObject>();
+	BadLink->SetStringField(TEXT("from"), TEXT("bad_branch.not_a_pin"));
+	BadLink->SetStringField(TEXT("to"), TEXT("sequence.execute"));
+	BadLinks.Add(MakeShared<FJsonValueObject>(BadLink));
+	BadPatchParams->SetArrayField(TEXT("links"), BadLinks);
+	const TSharedRef<FJsonObject> BadPatchResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyGraphPatch"), BadPatchParams);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, BadPatchResponse, TEXT("GraphPatchFailed")))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> RollbackDescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, TEXT("PatchFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, RollbackDescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* RollbackDescribeResult = BlueprintBridgeTests::GetResultObject(*this, RollbackDescribeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* RollbackNodes = nullptr;
+	int32 RollbackBranchCount = 0;
+	if (RollbackDescribeResult && (*RollbackDescribeResult)->TryGetArrayField(TEXT("nodes"), RollbackNodes) && RollbackNodes != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *RollbackNodes)
+		{
+			const TSharedPtr<FJsonObject>* NodeObject = nullptr;
+			if (NodeValue.IsValid() && NodeValue->TryGetObject(NodeObject) && NodeObject != nullptr && NodeObject->IsValid())
+			{
+				FString ClassName;
+				(*NodeObject)->TryGetStringField(TEXT("class"), ClassName);
+				if (ClassName.Contains(TEXT("K2Node_IfThenElse")))
+				{
+					++RollbackBranchCount;
+				}
+			}
+		}
+	}
+	return TestEqual(TEXT("ApplyGraphPatch rollback should remove nodes created by failed patch."), RollbackBranchCount, BranchCount);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgePinEditingCommandTest, "BlueprintBridge.Blueprint.PinEditingCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

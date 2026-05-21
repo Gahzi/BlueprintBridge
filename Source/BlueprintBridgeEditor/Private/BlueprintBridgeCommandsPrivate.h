@@ -186,6 +186,7 @@ TSharedRef<FJsonObject> DeleteNode(const FString& Id, const TSharedPtr<FJsonObje
 bool TryGetBlueprintVariableType(UBlueprint* Blueprint, const FName VariableName, FEdGraphPinType& OutPinType);
 UK2Node_FunctionResult* FindFunctionResultNode(UEdGraph* Graph);
 TSharedRef<FJsonObject> AddVariableGetterFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ApplyGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 void ApplyPinRefAndConstFlags(const TSharedPtr<FJsonObject>& Params, FEdGraphPinType& OutPinType);
 TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
@@ -220,6 +221,8 @@ TSharedRef<FJsonObject> FindFunctions(const FString& Id, const TSharedPtr<FJsonO
 TSharedRef<FJsonObject> DescribeFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeProperty(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeDelegate(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> CheckDelegateCompatibility(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindReflectionSymbols(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ListCommands(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);

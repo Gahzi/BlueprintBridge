@@ -459,4 +459,517 @@ TSharedRef<FJsonObject> DescribeDelegate(const FString& Id, const TSharedPtr<FJs
 	Result->SetObjectField(TEXT("signature"), DescribeFunctionFull(Signature));
 	return MakeSuccess(Id, Result);
 }
+
+struct FBridgeSignatureParam
+{
+	FName Name;
+	FString Direction;
+	FEdGraphPinType PinType;
+	bool bByRef = false;
+	bool bIsConst = false;
+};
+
+static TSharedRef<FJsonObject> DescribeSignatureParam(const FBridgeSignatureParam& Param)
+{
+	TSharedRef<FJsonObject> Result = DescribePinType(Param.PinType);
+	Result->SetStringField(TEXT("name"), Param.Name.ToString());
+	Result->SetStringField(TEXT("direction"), Param.Direction);
+	Result->SetBoolField(TEXT("byRef"), Param.bByRef);
+	Result->SetBoolField(TEXT("isConst"), Param.bIsConst);
+	return Result;
+}
+
+static void BuildSignatureFromUFunction(UFunction* Function, TArray<FBridgeSignatureParam>& OutParams)
+{
+	if (!Function)
+	{
+		return;
+	}
+
+	for (TFieldIterator<FProperty> PropertyIt(Function); PropertyIt && PropertyIt->HasAnyPropertyFlags(CPF_Parm); ++PropertyIt)
+	{
+		FProperty* Property = *PropertyIt;
+		if (Property->HasAnyPropertyFlags(CPF_ReturnParm))
+		{
+			continue;
+		}
+
+		FEdGraphPinType PinType;
+		if (!GetDefault<UEdGraphSchema_K2>()->ConvertPropertyToPinType(Property, PinType))
+		{
+			continue;
+		}
+
+		FBridgeSignatureParam Param;
+		Param.Name = Property->GetFName();
+		Param.Direction = PropertyDirection(Property);
+		Param.PinType = PinType;
+		Param.bByRef = Property->HasAnyPropertyFlags(CPF_ReferenceParm);
+		Param.bIsConst = Property->HasAnyPropertyFlags(CPF_ConstParm);
+		Param.PinType.bIsReference = Param.bByRef;
+		Param.PinType.bIsConst = Param.bIsConst;
+		OutParams.Add(Param);
+	}
+}
+
+static void BuildSignatureFromBlueprintFunctionGraph(UEdGraph* Graph, TArray<FBridgeSignatureParam>& OutParams)
+{
+	if (!Graph)
+	{
+		return;
+	}
+
+	if (UK2Node_FunctionEntry* EntryNode = FindFunctionEntryNode(Graph))
+	{
+		for (UEdGraphPin* Pin : EntryNode->Pins)
+		{
+			if (!Pin || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || Pin->Direction != EGPD_Output)
+			{
+				continue;
+			}
+
+			FBridgeSignatureParam Param;
+			Param.Name = Pin->PinName;
+			Param.Direction = TEXT("Input");
+			Param.PinType = Pin->PinType;
+			Param.bByRef = Pin->PinType.bIsReference;
+			Param.bIsConst = Pin->PinType.bIsConst;
+			OutParams.Add(Param);
+		}
+	}
+
+	if (UK2Node_FunctionResult* ResultNode = FindFunctionResultNode(Graph))
+	{
+		for (UEdGraphPin* Pin : ResultNode->Pins)
+		{
+			if (!Pin || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || Pin->Direction != EGPD_Input)
+			{
+				continue;
+			}
+
+			FBridgeSignatureParam Param;
+			Param.Name = Pin->PinName;
+			Param.Direction = TEXT("Output");
+			Param.PinType = Pin->PinType;
+			Param.bByRef = Pin->PinType.bIsReference;
+			Param.bIsConst = Pin->PinType.bIsConst;
+			OutParams.Add(Param);
+		}
+	}
+}
+
+static bool PinTypesCompatible(const FEdGraphPinType& Expected, const FEdGraphPinType& Actual)
+{
+	return Expected.PinCategory == Actual.PinCategory &&
+		Expected.PinSubCategory == Actual.PinSubCategory &&
+		Expected.PinSubCategoryObject == Actual.PinSubCategoryObject &&
+		Expected.ContainerType == Actual.ContainerType;
+}
+
+static void AddSignatureMismatch(TArray<TSharedPtr<FJsonValue>>& Mismatches, const FString& Kind, const FBridgeSignatureParam* Expected, const FBridgeSignatureParam* Actual)
+{
+	TSharedRef<FJsonObject> Mismatch = MakeShared<FJsonObject>();
+	Mismatch->SetStringField(TEXT("kind"), Kind);
+	if (Expected)
+	{
+		Mismatch->SetStringField(TEXT("param"), Expected->Name.ToString());
+		Mismatch->SetObjectField(TEXT("expected"), DescribeSignatureParam(*Expected));
+	}
+	if (Actual)
+	{
+		if (!Expected)
+		{
+			Mismatch->SetStringField(TEXT("param"), Actual->Name.ToString());
+		}
+		Mismatch->SetObjectField(TEXT("actual"), DescribeSignatureParam(*Actual));
+	}
+	if (Expected && Actual && (Expected->bByRef != Actual->bByRef || Expected->bIsConst != Actual->bIsConst))
+	{
+		TSharedRef<FJsonObject> SuggestedFix = MakeShared<FJsonObject>();
+		SuggestedFix->SetStringField(TEXT("command"), TEXT("SetUserDefinedPinFlags"));
+		TSharedRef<FJsonObject> SuggestedParams = MakeShared<FJsonObject>();
+		SuggestedParams->SetStringField(TEXT("pin"), Actual->Name.ToString());
+		SuggestedParams->SetBoolField(TEXT("byRef"), Expected->bByRef);
+		SuggestedParams->SetBoolField(TEXT("isConst"), Expected->bIsConst);
+		SuggestedFix->SetObjectField(TEXT("params"), SuggestedParams);
+		Mismatch->SetObjectField(TEXT("suggestedFix"), SuggestedFix);
+	}
+	Mismatches.Add(MakeShared<FJsonValueObject>(Mismatch));
+}
+
+TSharedRef<FJsonObject> CheckDelegateCompatibility(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString FunctionName;
+	FString DelegateOwnerClassPath;
+	FString DelegateName;
+	if (!TryGetRequiredString(Params, TEXT("function"), FunctionName) ||
+		!TryGetRequiredString(Params, TEXT("delegateOwnerClass"), DelegateOwnerClassPath) ||
+		!TryGetRequiredString(Params, TEXT("delegate"), DelegateName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("CheckDelegateCompatibility requires params.function, params.delegateOwnerClass, and params.delegate."));
+	}
+
+	UClass* DelegateOwnerClass = ResolveReflectionClass(DelegateOwnerClassPath);
+	if (!DelegateOwnerClass)
+	{
+		return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not load delegate owner class '%s'."), *DelegateOwnerClassPath));
+	}
+
+	FProperty* DelegateProperty = FindPropertyByName(DelegateOwnerClass, DelegateName);
+	UFunction* DelegateSignature = GetDelegateSignature(DelegateProperty);
+	if (!DelegateSignature)
+	{
+		return MakeBridgeError(Id, TEXT("DelegateNotFound"), FString::Printf(TEXT("Could not find delegate '%s' on '%s'."), *DelegateName, *DelegateOwnerClassPath));
+	}
+
+	TArray<FBridgeSignatureParam> DelegateParams;
+	BuildSignatureFromUFunction(DelegateSignature, DelegateParams);
+
+	TArray<FBridgeSignatureParam> FunctionParams;
+	FString FunctionOwner;
+	FString AssetPath;
+	FString FunctionClassPath;
+	if (Params->TryGetStringField(TEXT("asset"), AssetPath) && !AssetPath.IsEmpty())
+	{
+		UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+		if (!Blueprint)
+		{
+			return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+		}
+
+		UEdGraph* FunctionGraph = FindBlueprintGraph(Blueprint, FunctionName);
+		if (!FunctionGraph || !Blueprint->FunctionGraphs.Contains(FunctionGraph))
+		{
+			return MakeBridgeError(Id, TEXT("FunctionNotFound"), FString::Printf(TEXT("Could not find function graph '%s' on '%s'."), *FunctionName, *AssetPath));
+		}
+		BuildSignatureFromBlueprintFunctionGraph(FunctionGraph, FunctionParams);
+		FunctionOwner = AssetPath;
+	}
+	else if (Params->TryGetStringField(TEXT("functionClass"), FunctionClassPath) && !FunctionClassPath.IsEmpty())
+	{
+		UClass* FunctionClass = ResolveReflectionClass(FunctionClassPath);
+		if (!FunctionClass)
+		{
+			return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not load function class '%s'."), *FunctionClassPath));
+		}
+
+		UFunction* Function = FindFunctionByName(FunctionClass, FunctionName);
+		if (!Function)
+		{
+			return MakeBridgeError(Id, TEXT("FunctionNotFound"), FString::Printf(TEXT("Could not find function '%s' on '%s'."), *FunctionName, *FunctionClassPath));
+		}
+		BuildSignatureFromUFunction(Function, FunctionParams);
+		FunctionOwner = FunctionClass->GetPathName();
+	}
+	else
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("CheckDelegateCompatibility requires params.asset or params.functionClass."));
+	}
+
+	TArray<TSharedPtr<FJsonValue>> Mismatches;
+	if (DelegateParams.Num() != FunctionParams.Num())
+	{
+		TSharedRef<FJsonObject> Mismatch = MakeShared<FJsonObject>();
+		Mismatch->SetStringField(TEXT("kind"), TEXT("ParamCountMismatch"));
+		Mismatch->SetNumberField(TEXT("expectedCount"), DelegateParams.Num());
+		Mismatch->SetNumberField(TEXT("actualCount"), FunctionParams.Num());
+		Mismatches.Add(MakeShared<FJsonValueObject>(Mismatch));
+	}
+
+	const int32 CompareCount = FMath::Min(DelegateParams.Num(), FunctionParams.Num());
+	for (int32 Index = 0; Index < CompareCount; ++Index)
+	{
+		const FBridgeSignatureParam& Expected = DelegateParams[Index];
+		const FBridgeSignatureParam& Actual = FunctionParams[Index];
+		if (!Expected.Name.ToString().Equals(Actual.Name.ToString(), ESearchCase::IgnoreCase))
+		{
+			AddSignatureMismatch(Mismatches, TEXT("ParamNameMismatch"), &Expected, &Actual);
+			continue;
+		}
+		if (Expected.Direction != Actual.Direction)
+		{
+			AddSignatureMismatch(Mismatches, TEXT("ParamDirectionMismatch"), &Expected, &Actual);
+			continue;
+		}
+		if (!PinTypesCompatible(Expected.PinType, Actual.PinType))
+		{
+			AddSignatureMismatch(Mismatches, TEXT("ParamTypeMismatch"), &Expected, &Actual);
+			continue;
+		}
+		if (Expected.bByRef != Actual.bByRef || Expected.bIsConst != Actual.bIsConst)
+		{
+			AddSignatureMismatch(Mismatches, TEXT("ParamFlagsMismatch"), &Expected, &Actual);
+		}
+	}
+
+	TArray<TSharedPtr<FJsonValue>> ExpectedParamsJson;
+	for (const FBridgeSignatureParam& Param : DelegateParams)
+	{
+		ExpectedParamsJson.Add(MakeShared<FJsonValueObject>(DescribeSignatureParam(Param)));
+	}
+	TArray<TSharedPtr<FJsonValue>> ActualParamsJson;
+	for (const FBridgeSignatureParam& Param : FunctionParams)
+	{
+		ActualParamsJson.Add(MakeShared<FJsonValueObject>(DescribeSignatureParam(Param)));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetBoolField(TEXT("compatible"), Mismatches.IsEmpty());
+	Result->SetArrayField(TEXT("mismatches"), Mismatches);
+	TSharedRef<FJsonObject> DelegateJson = MakeShared<FJsonObject>();
+	DelegateJson->SetStringField(TEXT("ownerClass"), DelegateOwnerClass->GetPathName());
+	DelegateJson->SetStringField(TEXT("name"), DelegateName);
+	DelegateJson->SetStringField(TEXT("signature"), DelegateSignature->GetName());
+	DelegateJson->SetArrayField(TEXT("params"), ExpectedParamsJson);
+	Result->SetObjectField(TEXT("delegate"), DelegateJson);
+	TSharedRef<FJsonObject> FunctionJson = MakeShared<FJsonObject>();
+	FunctionJson->SetStringField(TEXT("ownerClass"), FunctionOwner);
+	FunctionJson->SetStringField(TEXT("name"), FunctionName);
+	FunctionJson->SetArrayField(TEXT("params"), ActualParamsJson);
+	Result->SetObjectField(TEXT("function"), FunctionJson);
+	return MakeSuccess(Id, Result);
+}
+
+struct FReflectionSymbolResult
+{
+	int32 Score = 0;
+	FString SortKey;
+	TSharedPtr<FJsonObject> Json;
+};
+
+static bool ShouldIncludeKind(const TSet<FString>& Kinds, const FString& Kind)
+{
+	return Kinds.IsEmpty() || Kinds.Contains(Kind);
+}
+
+static TSet<FString> GetRequestedSymbolKinds(const TSharedPtr<FJsonObject>& Params)
+{
+	TSet<FString> Kinds;
+	const TArray<TSharedPtr<FJsonValue>>* KindValues = nullptr;
+	if (!Params.IsValid() || !Params->TryGetArrayField(TEXT("kinds"), KindValues) || KindValues == nullptr)
+	{
+		return Kinds;
+	}
+
+	for (const TSharedPtr<FJsonValue>& Value : *KindValues)
+	{
+		FString Kind;
+		if (Value.IsValid() && Value->TryGetString(Kind))
+		{
+			Kinds.Add(Kind.ToLower());
+		}
+	}
+	return Kinds;
+}
+
+static bool IsEngineReflectionClass(const UClass* Class)
+{
+	if (!Class)
+	{
+		return true;
+	}
+
+	const FString Path = Class->GetPathName();
+	static const TCHAR* EnginePrefixes[] = {
+		TEXT("/Script/Core"),
+		TEXT("/Script/CoreUObject"),
+		TEXT("/Script/Engine"),
+		TEXT("/Script/Slate"),
+		TEXT("/Script/SlateCore"),
+		TEXT("/Script/UMG"),
+		TEXT("/Script/UnrealEd"),
+		TEXT("/Script/BlueprintGraph"),
+		TEXT("/Script/Editor"),
+	};
+	for (const TCHAR* Prefix : EnginePrefixes)
+	{
+		if (Path.StartsWith(Prefix))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+static int32 ScoreSymbol(const FString& Name, const FString& Query, const FString& DisplayName = FString())
+{
+	if (Name.Equals(Query, ESearchCase::CaseSensitive))
+	{
+		return 100;
+	}
+	if (Name.Equals(Query, ESearchCase::IgnoreCase))
+	{
+		return 95;
+	}
+	if (Name.StartsWith(Query, ESearchCase::IgnoreCase))
+	{
+		return 85;
+	}
+	if (Name.Contains(Query, ESearchCase::IgnoreCase))
+	{
+		return 70;
+	}
+	if (!DisplayName.IsEmpty() && DisplayName.Equals(Query, ESearchCase::IgnoreCase))
+	{
+		return 90;
+	}
+	if (!DisplayName.IsEmpty() && DisplayName.Contains(Query, ESearchCase::IgnoreCase))
+	{
+		return 65;
+	}
+	return 0;
+}
+
+static void AddSymbolResult(TArray<FReflectionSymbolResult>& Results, TSharedRef<FJsonObject> Json, const int32 Score)
+{
+	if (Score <= 0)
+	{
+		return;
+	}
+
+	FString Kind;
+	FString Name;
+	FString Owner;
+	Json->TryGetStringField(TEXT("kind"), Kind);
+	Json->TryGetStringField(TEXT("name"), Name);
+	Json->TryGetStringField(TEXT("ownerClass"), Owner);
+	Json->SetNumberField(TEXT("score"), Score);
+
+	FReflectionSymbolResult Result;
+	Result.Score = Score;
+	Result.SortKey = FString::Printf(TEXT("%s:%s:%s"), *Kind, *Owner, *Name);
+	Result.Json = Json;
+	Results.Add(Result);
+}
+
+static void SearchClassSymbols(UClass* Class, const FString& Query, const TSet<FString>& Kinds, const bool bBlueprintCallableOnly, const bool bIncludeInherited, TArray<FReflectionSymbolResult>& Results)
+{
+	if (!Class)
+	{
+		return;
+	}
+
+	if (ShouldIncludeKind(Kinds, TEXT("class")))
+	{
+		TSharedRef<FJsonObject> ClassJson = MakeShared<FJsonObject>();
+		ClassJson->SetStringField(TEXT("kind"), TEXT("class"));
+		ClassJson->SetStringField(TEXT("name"), Class->GetName());
+		ClassJson->SetStringField(TEXT("path"), Class->GetPathName());
+		ClassJson->SetStringField(TEXT("ownerClass"), Class->GetPathName());
+		AddSymbolResult(Results, ClassJson, ScoreSymbol(Class->GetName(), Query));
+	}
+
+	const EFieldIteratorFlags::SuperClassFlags SuperClassFlags = bIncludeInherited ? EFieldIteratorFlags::IncludeSuper : EFieldIteratorFlags::ExcludeSuper;
+	if (ShouldIncludeKind(Kinds, TEXT("function")))
+	{
+		for (TFieldIterator<UFunction> FunctionIt(Class, SuperClassFlags); FunctionIt; ++FunctionIt)
+		{
+			UFunction* Function = *FunctionIt;
+			if (bBlueprintCallableOnly && !Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintPure))
+			{
+				continue;
+			}
+			const FString DisplayName = Function->GetMetaData(TEXT("DisplayName"));
+			const int32 Score = ScoreSymbol(Function->GetName(), Query, DisplayName) + (Function->HasAnyFunctionFlags(FUNC_BlueprintCallable | FUNC_BlueprintPure) ? 5 : 0);
+			TSharedRef<FJsonObject> FunctionJson = DescribeFunctionSummary(Function);
+			FunctionJson->SetStringField(TEXT("kind"), TEXT("function"));
+			FunctionJson->SetStringField(TEXT("path"), Function->GetPathName());
+			AddSymbolResult(Results, FunctionJson, Score);
+		}
+	}
+
+	for (TFieldIterator<FProperty> PropertyIt(Class, SuperClassFlags); PropertyIt; ++PropertyIt)
+	{
+		FProperty* Property = *PropertyIt;
+		const bool bDelegate = GetDelegateSignature(Property) != nullptr;
+		const FString Kind = bDelegate ? TEXT("delegate") : TEXT("property");
+		if (!ShouldIncludeKind(Kinds, Kind))
+		{
+			continue;
+		}
+		if (bBlueprintCallableOnly && !Property->HasAnyPropertyFlags(CPF_BlueprintVisible))
+		{
+			continue;
+		}
+
+		const FString DisplayName = Property->GetMetaData(TEXT("DisplayName"));
+		const int32 Score = ScoreSymbol(Property->GetName(), Query, DisplayName) + (Property->HasAnyPropertyFlags(CPF_BlueprintVisible) ? 5 : 0);
+		TSharedRef<FJsonObject> PropertyJson = DescribeReflectedProperty(Property);
+		PropertyJson->SetStringField(TEXT("kind"), Kind);
+		PropertyJson->SetStringField(TEXT("path"), FString::Printf(TEXT("%s:%s"), *Class->GetPathName(), *Property->GetName()));
+		AddSymbolResult(Results, PropertyJson, Score);
+	}
+}
+
+TSharedRef<FJsonObject> FindReflectionSymbols(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString Query;
+	if (!TryGetRequiredString(Params, TEXT("query"), Query) || Query.IsEmpty())
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("FindReflectionSymbols requires non-empty params.query."));
+	}
+
+	bool bBlueprintCallableOnly = false;
+	bool bIncludeEngine = false;
+	bool bIncludeProject = true;
+	bool bIncludeInherited = true;
+	Params->TryGetBoolField(TEXT("blueprintCallableOnly"), bBlueprintCallableOnly);
+	Params->TryGetBoolField(TEXT("includeEngine"), bIncludeEngine);
+	Params->TryGetBoolField(TEXT("includeProject"), bIncludeProject);
+	Params->TryGetBoolField(TEXT("includeInherited"), bIncludeInherited);
+
+	int32 MaxResults = 50;
+	Params->TryGetNumberField(TEXT("maxResults"), MaxResults);
+	MaxResults = FMath::Clamp(MaxResults, 1, 500);
+
+	const TSet<FString> Kinds = GetRequestedSymbolKinds(Params);
+	TArray<FReflectionSymbolResult> Results;
+
+	FString ClassPath;
+	if (Params->TryGetStringField(TEXT("class"), ClassPath) && !ClassPath.IsEmpty())
+	{
+		UClass* Class = ResolveReflectionClass(ClassPath);
+		if (!Class)
+		{
+			return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not load class '%s'."), *ClassPath));
+		}
+		SearchClassSymbols(Class, Query, Kinds, bBlueprintCallableOnly, bIncludeInherited, Results);
+	}
+	else
+	{
+		for (TObjectIterator<UClass> ClassIt; ClassIt; ++ClassIt)
+		{
+			UClass* Class = *ClassIt;
+			const bool bEngineClass = IsEngineReflectionClass(Class);
+			if ((bEngineClass && !bIncludeEngine) || (!bEngineClass && !bIncludeProject))
+			{
+				continue;
+			}
+			SearchClassSymbols(Class, Query, Kinds, bBlueprintCallableOnly, false, Results);
+		}
+	}
+
+	Results.Sort([](const FReflectionSymbolResult& A, const FReflectionSymbolResult& B)
+	{
+		if (A.Score != B.Score)
+		{
+			return A.Score > B.Score;
+		}
+		return A.SortKey < B.SortKey;
+	});
+
+	TArray<TSharedPtr<FJsonValue>> ResultValues;
+	for (int32 Index = 0; Index < Results.Num() && Index < MaxResults; ++Index)
+	{
+		if (Results[Index].Json.IsValid())
+		{
+			ResultValues.Add(MakeShared<FJsonValueObject>(Results[Index].Json.ToSharedRef()));
+		}
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("query"), Query);
+	Result->SetArrayField(TEXT("results"), ResultValues);
+	return MakeSuccess(Id, Result);
+}
 } // namespace BlueprintBridge

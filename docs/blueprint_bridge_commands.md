@@ -109,6 +109,35 @@ Required params:
 
 Returns delegate property metadata plus the signature params. Use this before creating/binding delegate-compatible Blueprint functions.
 
+### `CheckDelegateCompatibility`
+
+Required params:
+- `function`
+- `delegateOwnerClass`
+- `delegate`
+
+Plus one function source:
+- `asset` — Blueprint asset containing a function graph
+- `functionClass` — reflected class containing a `UFunction`
+
+Returns `compatible`, normalized expected/actual params, mismatches, and suggested `SetUserDefinedPinFlags` fixes for ref/const mismatches.
+
+### `FindReflectionSymbols`
+
+Required params:
+- `query`
+
+Optional params:
+- `kinds`: `class`, `function`, `property`, `delegate`
+- `class` — limit search to one class
+- `includeInherited` — for class-limited member search
+- `blueprintCallableOnly`
+- `includeEngine`
+- `includeProject`
+- `maxResults`
+
+Use this before guessing exact `/Script/...` class/function/property paths.
+
 ## Graph management
 
 ### `CreateFunctionGraph`
@@ -264,6 +293,43 @@ Required params:
 - `y`
 
 Important: these use `struct`, not `structType`.
+
+### `ApplyGraphPatch`
+
+Required params:
+- `asset`
+- `graph`
+
+Optional params:
+- `rollbackOnFailure` — defaults true
+- `compile`
+- `nodes`
+- `defaults`
+- `links`
+
+Supported v1 node types include `Branch`, `Sequence`, `Reroute`, `Comment`, `VariableGet`, `VariableSet`, `FunctionCall`, `Self`, `DynamicCast`, `MakeStruct`, `BreakStruct`, and `CustomEvent`.
+
+Pin links use `nodeId.pinName` refs. Function graphs expose virtual node ids `entry` and `result` when those nodes exist.
+
+```json
+{
+  "command": "ApplyGraphPatch",
+  "params": {
+    "asset": "/Game/Path/BP_Enemy",
+    "graph": "ScoreSlam",
+    "nodes": [
+      { "id": "branch", "type": "Branch", "x": 400, "y": 0 },
+      { "id": "score", "type": "FunctionCall", "functionClass": "/Script/Biscuit.ScoreLibrary", "function": "ComputeSlamScore", "x": 700, "y": 0 }
+    ],
+    "defaults": [
+      { "node": "branch", "pin": "Condition", "value": "true" }
+    ],
+    "links": [
+      { "from": "branch.then", "to": "score.execute" }
+    ]
+  }
+}
+```
 
 ### Other common node commands
 

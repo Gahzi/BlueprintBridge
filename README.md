@@ -477,6 +477,35 @@ Returns function flags, `isPureNode`, `hasExecPins`, metadata, and reflected par
 
 Returns the delegate property and signature params for binding-compatible Blueprint function creation.
 
+#### `CheckDelegateCompatibility`
+
+```json
+{
+  "asset": "/Game/Path/BP_Enemy",
+  "function": "OnTargetSelected",
+  "delegateOwnerClass": "/Script/Biscuit.TargetingComponent",
+  "delegate": "OnTargetSelected"
+}
+```
+
+Use `asset` for Blueprint function graphs or `functionClass` for reflected C++/UFunction sources. The result reports `compatible`, expected/actual params, mismatches, and suggested `SetUserDefinedPinFlags` fixes for ref/const flag mismatches.
+
+#### `FindReflectionSymbols`
+
+```json
+{
+  "query": "GetTarget",
+  "kinds": ["function", "property", "delegate", "class"],
+  "blueprintCallableOnly": true,
+  "includeInherited": true,
+  "includeEngine": false,
+  "includeProject": true,
+  "maxResults": 50
+}
+```
+
+Searches loaded reflection symbols so clients can discover exact owner classes and names before mutating graphs.
+
 ### Asset, source control, compile, save
 
 #### `CreateBlueprintAsset`
@@ -722,6 +751,7 @@ Example:
 - `SetUserDefinedPinFlags`
 - `RenameCustomEvent`
 - `AddVariableGetterFunction`
+- `ApplyGraphPatch`
 
 Function input/output pin type params use the same `category`, `subCategory`, `subCategoryObject`, and `containerType` fields as variables. Function pins also accept `byRef` and `isConst` (`const` is still accepted as a legacy alias).
 
@@ -742,6 +772,28 @@ Function input/output pin type params use the same `category`, `subCategory`, `s
 Use `pinRenames` or `variableRenames` when you only want one side of that behavior. `renames` applies to both user-defined function pins and local/self variable references. Set `strictRenames: true` to fail on unmatched rename keys, rename collisions, or missing self-variable targets; the result includes applied/unmatched/collision reports for non-strict runs.
 
 Use `SetUserDefinedPinFlags` for simple `byRef` / `isConst` changes without re-specifying the whole pin type.
+
+`ApplyGraphPatch` applies node creation, defaults, and links in one request. Nodes get temporary ids that links/defaults can reference with `nodeId.pinName`; function graphs also expose virtual `entry` and `result` ids when those nodes exist.
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "ScoreSlam",
+  "rollbackOnFailure": true,
+  "nodes": [
+    { "id": "branch", "type": "Branch", "x": 400, "y": 0 },
+    { "id": "score", "type": "FunctionCall", "functionClass": "/Script/Biscuit.ScoreLibrary", "function": "ComputeSlamScore", "x": 700, "y": 0 }
+  ],
+  "defaults": [
+    { "node": "branch", "pin": "Condition", "value": "true" }
+  ],
+  "links": [
+    { "from": "branch.then", "to": "score.execute" }
+  ]
+}
+```
+
+Supported v1 node types include `Branch`, `Sequence`, `Reroute`, `Comment`, `VariableGet`, `VariableSet`, `FunctionCall`, `Self`, `DynamicCast`, `MakeStruct`, `BreakStruct`, and `CustomEvent`.
 
 ### Node creation
 
