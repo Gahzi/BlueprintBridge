@@ -78,6 +78,7 @@
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/EngineVersion.h"
 #include "Misc/PackageName.h"
+#include "Misc/Paths.h"
 #include "ScopedTransaction.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
@@ -187,6 +188,10 @@ bool TryGetBlueprintVariableType(UBlueprint* Blueprint, const FName VariableName
 UK2Node_FunctionResult* FindFunctionResultNode(UEdGraph* Graph);
 TSharedRef<FJsonObject> AddVariableGetterFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ApplyGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ApplyFunctionPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ApplyGraphSnippet(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ExportGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ImportGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 void ApplyPinRefAndConstFlags(const TSharedPtr<FJsonObject>& Params, FEdGraphPinType& OutPinType);
 TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
@@ -216,6 +221,15 @@ TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node);
 TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> GetConnectedNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindExecutionPath(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeSubgraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindFunctionCallNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindVariableNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindDelegateNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindNodesByPin(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ExplainCompileErrors(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeClass(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindFunctions(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);

@@ -26,6 +26,7 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - event graph and function graph creation/editing
 - node creation for variables, branches, sequences, functions, events, custom events, dynamic casts, spawn actor, macros, structs, delegates, timers, traces, arrays, math helpers, UMG runtime calls, and Create Widget
 - pin linking, link movement, link breaking, pin defaults, type copying, safer pin lookup aliases, node movement, and node deletion
+- declarative graph patches (`ApplyGraphPatch`/`ApplyFunctionPatch`) and a Semantic IR (`LowerSemanticFunction`/`ApplySemanticFunction`) that lowers high-level intent (`if`, `return`, pure/impure `call`, `set`, `seq`) into patches
 - initial UMG widget-tree creation/editing and slot layout commands
 - batched request execution
 - command discovery through `ListCommands` and `DescribeCommand`
@@ -752,6 +753,9 @@ Example:
 - `RenameCustomEvent`
 - `AddVariableGetterFunction`
 - `ApplyGraphPatch`
+- `ApplyFunctionPatch`
+- `LowerSemanticFunction`
+- `ApplySemanticFunction`
 
 Function input/output pin type params use the same `category`, `subCategory`, `subCategoryObject`, and `containerType` fields as variables. Function pins also accept `byRef` and `isConst` (`const` is still accepted as a legacy alias).
 
@@ -794,6 +798,32 @@ Use `SetUserDefinedPinFlags` for simple `byRef` / `isConst` changes without re-s
 ```
 
 Supported v1 node types include `Branch`, `Sequence`, `Reroute`, `Comment`, `VariableGet`, `VariableSet`, `FunctionCall`, `Self`, `DynamicCast`, `MakeStruct`, `BreakStruct`, and `CustomEvent`.
+
+#### `LowerSemanticFunction` / `ApplySemanticFunction`
+
+A higher-level layer above `ApplyFunctionPatch`. The caller writes a function signature plus a `flow` tree of intent — `call`, `set`, `if`/`then`/`else`, `seq`, `return` — and BlueprintBridge lowers it to the same node/link JSON `ApplyGraphPatch` accepts. The lowering threads exec pins, detects pure vs impure UFunctions via reflection, and resolves bare identifiers in order (function input → member variable → literal) with the chosen resolution reported back so the caller can audit.
+
+`LowerSemanticFunction` is a pure dry-run: it returns the patch JSON plus a `resolutions` map without mutating the asset. `ApplySemanticFunction` does the same lowering and then applies it through `ApplyFunctionPatch` (including optional `createIfMissing` and `compile`). The `resolutions` map is included in the success response in both cases.
+
+```json
+{
+  "asset": "/Game/Abilities/BP_SlamAbility",
+  "function": "ScoreSlam",
+  "createIfMissing": true,
+  "compile": true,
+  "inputs":  [{"name": "Context", "category": "struct", "subCategoryObject": "/Script/Biscuit.AbilityScoreContext", "byRef": true, "isConst": true}],
+  "outputs": [{"name": "Score",   "category": "float"}],
+  "flow": [
+    {
+      "if": {"call": "/Script/Biscuit.ScoreLibrary.CanSlam", "args": {"Context": "Context"}},
+      "then": [{"return": {"Score": {"call": "/Script/Biscuit.ScoreLibrary.ComputeSlamScore", "args": {"Context": "Context", "Config": "SlamConfig"}}}}],
+      "else": [{"return": {"Score": 0.0}}]
+    }
+  ]
+}
+```
+
+v1 statement forms: `call` (impure), `set`, `if`/`then`/`else`, `seq`, `return`. v1 expression forms: `var`, `in`, `self`, `lit`, `call` (pure). Function references use the full UFunction path (`/Script/Package.Class.Function`). Calling a pure function in statement position or an impure function in expression position is a lowering error and the response carries a `pointer` field locating the offending IR node (e.g. `flow[0].if.args.Context`). Loops, `cast`, `switch`, `let` bindings, and delegate bind/broadcast are scheduled for v2.
 
 ### Node creation
 

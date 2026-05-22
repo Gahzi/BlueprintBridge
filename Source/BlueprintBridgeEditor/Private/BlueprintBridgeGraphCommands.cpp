@@ -124,6 +124,14 @@ FString NormalizePinLookupName(const FString& Name)
 	{
 		return TEXT("execute");
 	}
+	if (Result.Equals(TEXT("return"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("returnvalue");
+	}
+	if (Result.Equals(TEXT("self"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("self");
+	}
 	return Result;
 }
 

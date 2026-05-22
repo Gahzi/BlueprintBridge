@@ -703,6 +703,13 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeNode"), { TEXT("asset"), TEXT("graph"), TEXT("node") });
 	bSuccess &= ExpectRequiredFields(TEXT("FindVariableReferences"), { TEXT("asset"), TEXT("variable") });
 	bSuccess &= ExpectRequiredFields(TEXT("AnalyzeGraph"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("SummarizeBlueprintGraph"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("GetConnectedNodes"), { TEXT("asset"), TEXT("graph"), TEXT("node") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindExecutionPath"), { TEXT("asset"), TEXT("graph"), TEXT("from"), TEXT("to") });
+	bSuccess &= ExpectRequiredFields(TEXT("DescribeSubgraph"), { TEXT("asset"), TEXT("graph"), TEXT("seeds") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindFunctionCallNodes"), { TEXT("asset"), TEXT("graph"), TEXT("function") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindVariableNodes"), { TEXT("asset"), TEXT("graph"), TEXT("variable") });
+	bSuccess &= ExpectRequiredFields(TEXT("FindNodesByPin"), { TEXT("asset"), TEXT("graph"), TEXT("pin") });
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeClass"), { TEXT("class") });
 	bSuccess &= ExpectRequiredFields(TEXT("FindFunctions"), { TEXT("class") });
 	bSuccess &= ExpectRequiredFields(TEXT("DescribeFunction"), { TEXT("class"), TEXT("function") });
@@ -718,6 +725,10 @@ bool FBlueprintBridgeCommandSchemaTest::RunTest(const FString& Parameters)
 	bSuccess &= ExpectRequiredFields(TEXT("DuplicateFunctionGraph"), { TEXT("asset"), TEXT("sourceGraph"), TEXT("newGraph") });
 	bSuccess &= ExpectRequiredFields(TEXT("SetUserDefinedPinFlags"), { TEXT("asset"), TEXT("graph"), TEXT("node"), TEXT("pin") });
 	bSuccess &= ExpectRequiredFields(TEXT("ApplyGraphPatch"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("ApplyFunctionPatch"), { TEXT("asset"), TEXT("function") });
+	bSuccess &= ExpectRequiredFields(TEXT("ApplyGraphSnippet"), { TEXT("asset"), TEXT("graph"), TEXT("snippet") });
+	bSuccess &= ExpectRequiredFields(TEXT("ExportGraphPatch"), { TEXT("asset"), TEXT("graph") });
+	bSuccess &= ExpectRequiredFields(TEXT("ImportGraphPatch"), { TEXT("asset"), TEXT("graph"), TEXT("patch") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddWidget"), { TEXT("asset"), TEXT("name"), TEXT("widgetClass") });
 	bSuccess &= ExpectRequiredFields(TEXT("AddBlueprintVariable"), { TEXT("asset"), TEXT("name"), TEXT("category") });
 
@@ -1281,6 +1292,97 @@ bool FBlueprintBridgeApplyGraphPatchTest::RunTest(const FString& Parameters)
 		}
 	}
 	return TestEqual(TEXT("ApplyGraphPatch rollback should remove nodes created by failed patch."), RollbackBranchCount, BranchCount);
+}
+
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeGraphQueryCommandTest, "BlueprintBridge.Blueprint.GraphQueryCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeGraphQueryCommandTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("GraphQueries"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> FunctionParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	FunctionParams->SetStringField(TEXT("function"), TEXT("QueryFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), FunctionParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> PatchParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("QueryFunction"));
+	TArray<TSharedPtr<FJsonValue>> Nodes;
+	TSharedRef<FJsonObject> BranchNode = MakeShared<FJsonObject>();
+	BranchNode->SetStringField(TEXT("id"), TEXT("branch"));
+	BranchNode->SetStringField(TEXT("type"), TEXT("Branch"));
+	BranchNode->SetNumberField(TEXT("x"), 100);
+	BranchNode->SetNumberField(TEXT("y"), 0);
+	Nodes.Add(MakeShared<FJsonValueObject>(BranchNode));
+	TSharedRef<FJsonObject> SequenceNode = MakeShared<FJsonObject>();
+	SequenceNode->SetStringField(TEXT("id"), TEXT("sequence"));
+	SequenceNode->SetStringField(TEXT("type"), TEXT("Sequence"));
+	SequenceNode->SetNumberField(TEXT("x"), 360);
+	SequenceNode->SetNumberField(TEXT("y"), 0);
+	Nodes.Add(MakeShared<FJsonValueObject>(SequenceNode));
+	PatchParams->SetArrayField(TEXT("nodes"), Nodes);
+
+	TArray<TSharedPtr<FJsonValue>> Links;
+	TSharedRef<FJsonObject> BranchToSequence = MakeShared<FJsonObject>();
+	BranchToSequence->SetStringField(TEXT("from"), TEXT("branch.true"));
+	BranchToSequence->SetStringField(TEXT("to"), TEXT("sequence.exec"));
+	Links.Add(MakeShared<FJsonValueObject>(BranchToSequence));
+	PatchParams->SetArrayField(TEXT("links"), Links);
+
+	const TSharedRef<FJsonObject> PatchResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyGraphPatch"), PatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PatchResponse))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> SummaryParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("QueryFunction"));
+	const TSharedRef<FJsonObject> SummaryResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprintGraph"), SummaryParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, SummaryResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* SummaryResult = BlueprintBridgeTests::GetResultObject(*this, SummaryResponse);
+	const TArray<TSharedPtr<FJsonValue>>* Branches = nullptr;
+	TestTrue(TEXT("Summary should include branch descriptions."), SummaryResult && (*SummaryResult)->TryGetArrayField(TEXT("branches"), Branches) && Branches != nullptr && Branches->Num() > 0);
+
+	TSharedRef<FJsonObject> ConnectedParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("QueryFunction"));
+	ConnectedParams->SetStringField(TEXT("node"), TEXT("branch"));
+	ConnectedParams->SetStringField(TEXT("direction"), TEXT("Downstream"));
+	ConnectedParams->SetNumberField(TEXT("depth"), 1);
+	const TSharedRef<FJsonObject> ConnectedResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GetConnectedNodes"), ConnectedParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, ConnectedResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* ConnectedResult = BlueprintBridgeTests::GetResultObject(*this, ConnectedResponse);
+	const TArray<TSharedPtr<FJsonValue>>* ConnectedNodes = nullptr;
+	TestTrue(TEXT("Connected query should find downstream nodes."), ConnectedResult && (*ConnectedResult)->TryGetArrayField(TEXT("nodes"), ConnectedNodes) && ConnectedNodes != nullptr && ConnectedNodes->Num() > 0);
+
+	TSharedRef<FJsonObject> PathParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("QueryFunction"));
+	PathParams->SetStringField(TEXT("from"), TEXT("branch"));
+	PathParams->SetStringField(TEXT("to"), TEXT("sequence"));
+	const TSharedRef<FJsonObject> PathResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindExecutionPath"), PathParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, PathResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* PathResult = BlueprintBridgeTests::GetResultObject(*this, PathResponse);
+	bool bFoundPath = false;
+	TestTrue(TEXT("Execution path should be found."), PathResult && (*PathResult)->TryGetBoolField(TEXT("found"), bFoundPath) && bFoundPath);
+
+	TSharedRef<FJsonObject> SubgraphParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("QueryFunction"));
+	TArray<TSharedPtr<FJsonValue>> Seeds;
+	Seeds.Add(MakeShared<FJsonValueString>(TEXT("branch")));
+	SubgraphParams->SetArrayField(TEXT("seeds"), Seeds);
+	SubgraphParams->SetNumberField(TEXT("depth"), 1);
+	return BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeSubgraph"), SubgraphParams));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgePinEditingCommandTest, "BlueprintBridge.Blueprint.PinEditingCommands", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -2525,6 +2627,308 @@ bool FBlueprintBridgeAssetCommandErrorsTest::RunTest(const FString& Parameters)
 	TSharedRef<FJsonObject> MissingAssetParams = BlueprintBridgeTests::MakeAssetParams(TEXT("/Game/BlueprintBridgeTests/BP_DoesNotExist"));
 	const TSharedRef<FJsonObject> CheckoutResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CheckoutAsset"), MissingAssetParams);
 	return BlueprintBridgeTests::ExpectErrorCode(*this, CheckoutResponse, TEXT("AssetNotFound"));
+}
+
+namespace BlueprintBridgeTests
+{
+static TSharedRef<FJsonObject> MakePinSpec(const FString& Name, const FString& Category)
+{
+	TSharedRef<FJsonObject> Pin = MakeShared<FJsonObject>();
+	Pin->SetStringField(TEXT("name"), Name);
+	Pin->SetStringField(TEXT("category"), Category);
+	return Pin;
+}
+
+static TSharedRef<FJsonObject> MakeStatement(const FString& Key, const TSharedPtr<FJsonValue>& Value)
+{
+	TSharedRef<FJsonObject> Stmt = MakeShared<FJsonObject>();
+	Stmt->SetField(Key, Value);
+	return Stmt;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLowerLiteralReturnTest, "BlueprintBridge.Blueprint.SemanticIR.LowerLiteralReturn", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLowerLiteralReturnTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLitReturn"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("ScoreFn"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Score"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	TSharedRef<FJsonObject> ReturnExpr = MakeShared<FJsonObject>();
+	ReturnExpr->SetNumberField(TEXT("Score"), 42);
+	Flow.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeStatement(TEXT("return"), MakeShared<FJsonValueObject>(ReturnExpr))));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Patch = nullptr;
+	TestTrue(TEXT("Result should contain patch."), Result && (*Result)->TryGetObjectField(TEXT("patch"), Patch) && Patch && Patch->IsValid());
+	if (!Patch || !Patch->IsValid())
+	{
+		return false;
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	(*Patch)->TryGetArrayField(TEXT("nodes"), Nodes);
+	TestTrue(TEXT("Literal return should emit no body nodes."), Nodes != nullptr && Nodes->Num() == 0);
+
+	const TArray<TSharedPtr<FJsonValue>>* Defaults = nullptr;
+	bool bFoundScoreDefault = false;
+	if ((*Patch)->TryGetArrayField(TEXT("defaults"), Defaults) && Defaults != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& Value : *Defaults)
+		{
+			const TSharedPtr<FJsonObject>* DefObj = nullptr;
+			if (Value->TryGetObject(DefObj) && DefObj && DefObj->IsValid())
+			{
+				FString Node, Pin, Lit;
+				(*DefObj)->TryGetStringField(TEXT("node"), Node);
+				(*DefObj)->TryGetStringField(TEXT("pin"), Pin);
+				(*DefObj)->TryGetStringField(TEXT("value"), Lit);
+				if (Node == TEXT("result") && Pin == TEXT("Score") && Lit == TEXT("42"))
+				{
+					bFoundScoreDefault = true;
+				}
+			}
+		}
+	}
+	TestTrue(TEXT("Result.Score default should be the integer 42, not 42.0."), bFoundScoreDefault);
+
+	const TArray<TSharedPtr<FJsonValue>>* Links = nullptr;
+	bool bFoundExecLink = false;
+	if ((*Patch)->TryGetArrayField(TEXT("links"), Links) && Links != nullptr)
+	{
+		for (const TSharedPtr<FJsonValue>& Value : *Links)
+		{
+			const TSharedPtr<FJsonObject>* LinkObj = nullptr;
+			if (Value->TryGetObject(LinkObj) && LinkObj && LinkObj->IsValid())
+			{
+				FString From, To;
+				(*LinkObj)->TryGetStringField(TEXT("from"), From);
+				(*LinkObj)->TryGetStringField(TEXT("to"), To);
+				if (From == TEXT("entry.then") && To == TEXT("result.execute"))
+				{
+					bFoundExecLink = true;
+				}
+			}
+		}
+	}
+	return TestTrue(TEXT("Lowering should link entry.then to result.execute on return."), bFoundExecLink);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRImplicitResolutionTest, "BlueprintBridge.Blueprint.SemanticIR.ImplicitResolution", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRImplicitResolutionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemResolve"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("ResolveFn"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Offset"), TEXT("int"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetStringField(TEXT("Out"), TEXT("Health"));
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	TestTrue(TEXT("Result should contain resolutions."), Result && (*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) && Resolutions && Resolutions->IsValid());
+	if (!Resolutions || !Resolutions->IsValid())
+	{
+		return false;
+	}
+	FString Resolved;
+	TestTrue(TEXT("'Health' should resolve to member variable."), (*Resolutions)->TryGetStringField(TEXT("flow[0].return.Out"), Resolved) && Resolved == TEXT("var:Health"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRImpureInExpressionTest, "BlueprintBridge.Blueprint.SemanticIR.ImpureInExpression", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRImpureInExpressionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemImpureExpr"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BadFn"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	// Impure call (PrintString) used as a return-value expression — should error.
+	TSharedRef<FJsonObject> CallExpr = MakeShared<FJsonObject>();
+	CallExpr->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.PrintString"));
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetObjectField(TEXT("Out"), CallExpr);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("SemanticLoweringFailed")))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Error = nullptr;
+	Response->TryGetObjectField(TEXT("error"), Error);
+	FString Pointer;
+	TestTrue(TEXT("Error should carry a pointer to the offending IR location."), Error && (*Error)->TryGetStringField(TEXT("pointer"), Pointer) && Pointer.Contains(TEXT("flow[0].return.Out")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRPureCallAsStatementTest, "BlueprintBridge.Blueprint.SemanticIR.PureCallAsStatement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRPureCallAsStatementTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemPureStmt"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BadFn"));
+	TSharedRef<FJsonObject> CallStmt = MakeShared<FJsonObject>();
+	CallStmt->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetMathLibrary.EqualEqual_IntInt"));
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("SemanticLoweringFailed")))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Error = nullptr;
+	Response->TryGetObjectField(TEXT("error"), Error);
+	FString Message;
+	Error && (*Error)->TryGetStringField(TEXT("message"), Message);
+	TestTrue(TEXT("Error should mention dead-code purity."), Message.Contains(TEXT("dead code")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRApplyAndCompileTest, "BlueprintBridge.Blueprint.SemanticIR.ApplyAndCompile", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRApplyAndCompileTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemApply"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("CompareFn"));
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+	Params->SetBoolField(TEXT("compile"), true);
+
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Input"), TEXT("int"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	// flow: if EqualEqual_IntInt(Input, 0) then return Out=1 else return Out=0
+	TSharedRef<FJsonObject> CondCall = MakeShared<FJsonObject>();
+	CondCall->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetMathLibrary.EqualEqual_IntInt"));
+	TSharedRef<FJsonObject> CondArgs = MakeShared<FJsonObject>();
+	CondArgs->SetStringField(TEXT("A"), TEXT("Input"));
+	CondArgs->SetNumberField(TEXT("B"), 0);
+	CondCall->SetObjectField(TEXT("args"), CondArgs);
+
+	TSharedRef<FJsonObject> ThenReturn = MakeShared<FJsonObject>();
+	{
+		TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+		Fields->SetNumberField(TEXT("Out"), 1);
+		ThenReturn->SetObjectField(TEXT("return"), Fields);
+	}
+	TSharedRef<FJsonObject> ElseReturn = MakeShared<FJsonObject>();
+	{
+		TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+		Fields->SetNumberField(TEXT("Out"), 0);
+		ElseReturn->SetObjectField(TEXT("return"), Fields);
+	}
+
+	TSharedRef<FJsonObject> IfStmt = MakeShared<FJsonObject>();
+	IfStmt->SetObjectField(TEXT("if"), CondCall);
+	TArray<TSharedPtr<FJsonValue>> ThenBlock;
+	ThenBlock.Add(MakeShared<FJsonValueObject>(ThenReturn));
+	IfStmt->SetArrayField(TEXT("then"), ThenBlock);
+	TArray<TSharedPtr<FJsonValue>> ElseBlock;
+	ElseBlock.Add(MakeShared<FJsonValueObject>(ElseReturn));
+	IfStmt->SetArrayField(TEXT("else"), ElseBlock);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(IfStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplySemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		AddError(FString::Printf(TEXT("ApplySemanticFunction failed: %s"), *BlueprintBridgeTests::GetErrorMessage(Response)));
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString CompileStatus;
+	TestTrue(TEXT("Apply response should include compile status."), Result && (*Result)->TryGetStringField(TEXT("compileStatus"), CompileStatus));
+	TestEqual(TEXT("Compiled function should be UpToDate."), CompileStatus, FString(TEXT("UpToDate")));
+
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	TestTrue(TEXT("Apply response should include resolutions map."), Result && (*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) && Resolutions && Resolutions->IsValid());
+	if (Resolutions && Resolutions->IsValid())
+	{
+		FString InputRes;
+		TestTrue(TEXT("'Input' in args should resolve to param."), (*Resolutions)->TryGetStringField(TEXT("flow[0].if.args.A"), InputRes) && InputRes == TEXT("param:Input"));
+	}
+	return true;
 }
 
 #endif

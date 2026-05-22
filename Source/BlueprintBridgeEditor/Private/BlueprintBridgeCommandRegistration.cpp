@@ -255,6 +255,79 @@ static TSharedPtr<FJsonObject> MakeAnalyzeGraphSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeSummarizeBlueprintGraphSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("includeDefaults"), TEXT("Whether to include pin defaults where useful."))
+		.OptionalBoolean(TEXT("includePins"), TEXT("Whether to include compact pin descriptions."))
+		.OptionalBoolean(TEXT("includeWarnings"), TEXT("Whether to include graph warnings."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeGetConnectedNodesSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("node"), TEXT("Node GUID or symbolic id from SummarizeBlueprintGraph."))
+		.OptionalStringEnum(TEXT("direction"), TEXT("Traversal direction."), { TEXT("Upstream"), TEXT("Downstream"), TEXT("Both") })
+		.OptionalNumber(TEXT("depth"), TEXT("Traversal depth."))
+		.OptionalBoolean(TEXT("includeExecLinks"), TEXT("Whether to follow exec links."))
+		.OptionalBoolean(TEXT("includeDataLinks"), TEXT("Whether to follow data links."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindExecutionPathSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("from"), TEXT("Start node GUID or symbolic id."))
+		.RequiredString(TEXT("to"), TEXT("Target node GUID or symbolic id."))
+		.OptionalBoolean(TEXT("includeBranches"), TEXT("Whether to include branch pin choices."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeSubgraphSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredArray(TEXT("seeds"), TEXT("Seed node GUIDs or symbolic ids."))
+		.OptionalNumber(TEXT("depth"), TEXT("Traversal depth."))
+		.OptionalBoolean(TEXT("includeUpstream"), TEXT("Whether to include upstream nodes."))
+		.OptionalBoolean(TEXT("includeDownstream"), TEXT("Whether to include downstream nodes."))
+		.OptionalBoolean(TEXT("includeDataLinks"), TEXT("Whether to include data links."))
+		.OptionalBoolean(TEXT("includeExecLinks"), TEXT("Whether to include exec links."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindFunctionCallNodesSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalString(TEXT("functionClass"), TEXT("Optional function owner class path."))
+		.RequiredString(TEXT("function"), TEXT("Function name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindVariableNodesSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("variable"), TEXT("Variable name."))
+		.OptionalStringEnum(TEXT("access"), TEXT("Optional access filter."), { TEXT("Get"), TEXT("Set"), TEXT("Other") })
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindDelegateNodesSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalString(TEXT("delegate"), TEXT("Optional delegate name/title filter."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindNodesByPinSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("pin"), TEXT("Pin name."))
+		.OptionalStringEnum(TEXT("direction"), TEXT("Optional direction filter."), { TEXT("Input"), TEXT("Output") })
+		.OptionalString(TEXT("category"), TEXT("Optional pin category filter."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeDescribeClassSchema()
 {
 	return FSchemaBuilder::Object()
@@ -482,10 +555,77 @@ static TSharedPtr<FJsonObject> MakeApplyGraphPatchSchema()
 {
 	return AddAssetGraph(FSchemaBuilder::Object())
 		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to remove nodes created by this patch if an operation fails. Defaults true."))
+		.OptionalBoolean(TEXT("validateOnly"), TEXT("Whether to validate and roll back without mutating the graph."))
 		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile the Blueprint after applying the patch."))
-		.OptionalArray(TEXT("nodes"), TEXT("Node declarations with id, type, x/y, and type-specific fields."))
+		.OptionalObject(TEXT("existingNodes"), TEXT("Optional map of symbolic ids to existing node GUIDs."))
+		.OptionalArray(TEXT("nodes"), TEXT("Node declarations with id, type, x/y, existingGuid, and type-specific fields."))
 		.OptionalArray(TEXT("links"), TEXT("Pin links with from/to refs in nodeId.pinName form."))
 		.OptionalArray(TEXT("defaults"), TEXT("Pin defaults with node, pin, and value."))
+		.OptionalArray(TEXT("deleteNodes"), TEXT("Nodes to delete."))
+		.OptionalArray(TEXT("moveNodes"), TEXT("Nodes to move."))
+		.OptionalArray(TEXT("breakLinks"), TEXT("Pins whose links should be broken."))
+		.OptionalArray(TEXT("renamePins"), TEXT("User-defined pins to rename."))
+		.OptionalArray(TEXT("setPinFlags"), TEXT("User-defined pin flags to edit."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeApplyFunctionPatchSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("function"), TEXT("Function graph name."))
+		.OptionalBoolean(TEXT("createIfMissing"), TEXT("Whether to create the function when missing."))
+		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
+		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
+		.OptionalObject(TEXT("body"), TEXT("ApplyGraphPatch body."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after applying."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeLowerSemanticFunctionSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("function"), TEXT("Function graph name."))
+		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
+		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeApplySemanticFunctionSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("function"), TEXT("Function graph name."))
+		.OptionalBoolean(TEXT("createIfMissing"), TEXT("Whether to create the function when missing."))
+		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
+		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after applying."))
+		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to roll back created nodes on failure. Defaults true."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeApplyGraphSnippetSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("snippet"), TEXT("Snippet name."))
+		.OptionalString(TEXT("snippetPath"), TEXT("Explicit snippet JSON path."))
+		.OptionalObject(TEXT("bindings"), TEXT("Binding substitutions."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeExportGraphPatchSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.OptionalString(TEXT("selection"), TEXT("Selection to export. Currently All."))
+		.OptionalBoolean(TEXT("normalizeIds"), TEXT("Whether to export stable node_N ids."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeImportGraphPatchSchema()
+{
+	return AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredObject(TEXT("patch"), TEXT("Patch JSON to import."))
+		.OptionalObject(TEXT("bindings"), TEXT("Binding substitutions."))
 		.Build();
 }
 
@@ -818,6 +958,15 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("FindNodes"), TEXT("Finds Blueprint graph nodes matching optional filters."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesSchema(), &FindNodes, MakeFindNodesOutputSchema());
 	RegisterCommand(TEXT("FindVariableReferences"), TEXT("Finds get/set nodes referencing a Blueprint variable."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindVariableReferencesSchema(), &FindVariableReferences);
 	RegisterCommand(TEXT("AnalyzeGraph"), TEXT("Reports simple exec reachability and disconnected/orphaned graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAnalyzeGraphSchema(), &AnalyzeGraph);
+	RegisterCommand(TEXT("SummarizeBlueprintGraph"), TEXT("Returns a compact semantic summary of a Blueprint graph."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeSummarizeBlueprintGraphSchema(), &SummarizeBlueprintGraph);
+	RegisterCommand(TEXT("GetConnectedNodes"), TEXT("Returns nearby graph topology around a node."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeGetConnectedNodesSchema(), &GetConnectedNodes);
+	RegisterCommand(TEXT("FindExecutionPath"), TEXT("Finds executable paths between graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindExecutionPathSchema(), &FindExecutionPath);
+	RegisterCommand(TEXT("DescribeSubgraph"), TEXT("Returns a graph slice around seed nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubgraphSchema(), &DescribeSubgraph, MakeDescribeGraphOutputSchema());
+	RegisterCommand(TEXT("FindFunctionCallNodes"), TEXT("Finds function call nodes by reflected function identity."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindFunctionCallNodesSchema(), &FindFunctionCallNodes, MakeFindNodesOutputSchema());
+	RegisterCommand(TEXT("FindVariableNodes"), TEXT("Finds variable get/set nodes by variable identity."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindVariableNodesSchema(), &FindVariableNodes, MakeFindNodesOutputSchema());
+	RegisterCommand(TEXT("FindDelegateNodes"), TEXT("Finds delegate-related graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindDelegateNodesSchema(), &FindDelegateNodes, MakeFindNodesOutputSchema());
+	RegisterCommand(TEXT("FindNodesByPin"), TEXT("Finds graph nodes by pin semantics."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesByPinSchema(), &FindNodesByPin, MakeFindNodesOutputSchema());
+	RegisterCommand(TEXT("ExplainCompileErrors"), TEXT("Compiles a Blueprint and summarizes actionable error context."), TEXT("BlueprintInspection"), ECommandRisk::ModifiesAsset, MakeAssetSchema(), &ExplainCompileErrors);
 	RegisterCommand(TEXT("DescribeClass"), TEXT("Returns reflected class metadata and optional function/property/delegate summaries."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeClassSchema(), &DescribeClass);
 	RegisterCommand(TEXT("FindFunctions"), TEXT("Finds reflected functions on a class."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeFindFunctionsSchema(), &FindFunctions);
 	RegisterCommand(TEXT("DescribeFunction"), TEXT("Returns reflected function flags, node purity, metadata, and params."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeFunctionSchema(), &DescribeFunction);
@@ -851,6 +1000,12 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("RenameGraph"), TEXT("Renames a Blueprint graph."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeRenameGraphSchema(), &RenameGraph);
 	RegisterCommand(TEXT("AddVariableGetterFunction"), TEXT("Creates a function that returns a Blueprint variable."), TEXT("GraphManagement"), ECommandRisk::ModifiesAsset, MakeAddVariableGetterFunctionSchema(), &AddVariableGetterFunction);
 	RegisterCommand(TEXT("ApplyGraphPatch"), TEXT("Applies declarative node/default/link edits to a graph."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyGraphPatchSchema(), &ApplyGraphPatch);
+	RegisterCommand(TEXT("ApplyFunctionPatch"), TEXT("Creates or updates a function signature and graph body."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyFunctionPatchSchema(), &ApplyFunctionPatch);
+	RegisterCommand(TEXT("LowerSemanticFunction"), TEXT("Lowers Semantic IR to an ApplyFunctionPatch body without mutating the asset."), TEXT("GraphEditing"), ECommandRisk::ReadOnly, MakeLowerSemanticFunctionSchema(), &LowerSemanticFunction);
+	RegisterCommand(TEXT("ApplySemanticFunction"), TEXT("Lowers Semantic IR and applies it as a function signature + body."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplySemanticFunctionSchema(), &ApplySemanticFunction);
+	RegisterCommand(TEXT("ApplyGraphSnippet"), TEXT("Applies a reusable graph snippet with optional bindings."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyGraphSnippetSchema(), &ApplyGraphSnippet);
+	RegisterCommand(TEXT("ExportGraphPatch"), TEXT("Exports a graph into reusable patch JSON."), TEXT("GraphEditing"), ECommandRisk::ReadOnly, MakeExportGraphPatchSchema(), &ExportGraphPatch);
+	RegisterCommand(TEXT("ImportGraphPatch"), TEXT("Imports reusable patch JSON with optional bindings."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeImportGraphPatchSchema(), &ImportGraphPatch);
 
 	RegisterCommand(TEXT("AddVariableGetNode"), TEXT("Adds a Blueprint variable getter node."), TEXT("NodeCreation"), ECommandRisk::ModifiesAsset, MakeVariableNodeSchema(), &AddVariableGetNode);
 	RegisterCommand(TEXT("AddVariableSetNode"), TEXT("Adds a Blueprint variable setter node."), TEXT("NodeCreation"), ECommandRisk::ModifiesAsset, MakeVariableNodeSchema(), &AddVariableSetNode);
