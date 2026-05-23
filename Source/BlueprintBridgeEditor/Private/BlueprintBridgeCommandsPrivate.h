@@ -216,12 +216,28 @@ USCS_Node* FindSCSParentNode(USimpleConstructionScript* SCS, USCS_Node* ChildNod
 TSharedRef<FJsonObject> DescribeWidget(UWidget* Widget);
 void AddWidgetTreeDescription(TSharedRef<FJsonObject> Result, UWidgetBlueprint* WidgetBlueprint);
 TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> BuildBlueprintDescription(UBlueprint* Blueprint);
+TSharedRef<FJsonObject> BuildComponentsDescription(UBlueprint* Blueprint);
+TArray<TSharedPtr<FJsonValue>> CollectClassDelegates(UClass* Class);
+struct FGraphSummaryOptions
+{
+	bool bIncludeDefaults = true;
+	bool bIncludePins = false;
+	bool bIncludeWarnings = true;
+};
+TSharedRef<FJsonObject> BuildGraphSummary(UEdGraph* Graph, const FGraphSummaryOptions& Options);
 UEdGraph* FindBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName);
 TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node);
 TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeGraphFull(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> SummarizeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+UBlueprint* CreateBlueprintAssetWorker(const FString& AssetPath, const FString& ParentClassPath, FString& OutErrorCode, FString& OutErrorMessage);
+bool AddBlueprintVariableWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage);
+USCS_Node* AddComponentWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage);
+TSharedRef<FJsonObject> CreateBlueprintFromSpec(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> GetConnectedNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindExecutionPath(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeSubgraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);

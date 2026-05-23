@@ -2,6 +2,8 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "BlueprintBridgeFieldSelection.h"
+
 namespace BlueprintBridge
 {
 TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -21,7 +23,7 @@ TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<F
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetStringField(TEXT("asset"), AssetPath);
 	AddWidgetTreeDescription(Result, Blueprint);
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> AddWidget(const FString& Id, const TSharedPtr<FJsonObject>& Params)

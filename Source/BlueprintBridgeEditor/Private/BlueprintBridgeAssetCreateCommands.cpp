@@ -4,38 +4,38 @@
 
 namespace BlueprintBridge
 {
-TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+UBlueprint* CreateBlueprintAssetWorker(const FString& AssetPath, const FString& ParentClassPath, FString& OutErrorCode, FString& OutErrorMessage)
 {
-	FString AssetPath;
-	FString ParentClassPath;
-	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("parentClass"), ParentClassPath))
-	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("CreateBlueprintAsset requires params.asset and params.parentClass."));
-	}
-
 	FString PackagePath;
 	FString AssetName;
 	if (!SplitAssetPath(AssetPath, PackagePath, AssetName))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidAssetPath"), FString::Printf(TEXT("'%s' is not a valid asset path."), *AssetPath));
+		OutErrorCode = TEXT("InvalidAssetPath");
+		OutErrorMessage = FString::Printf(TEXT("'%s' is not a valid asset path."), *AssetPath);
+		return nullptr;
 	}
 
 	if (DoesAssetExistQuiet(AssetPath))
 	{
-		return MakeBridgeError(Id, TEXT("AssetAlreadyExists"), FString::Printf(TEXT("Asset '%s' already exists."), *AssetPath));
+		OutErrorCode = TEXT("AssetAlreadyExists");
+		OutErrorMessage = FString::Printf(TEXT("Asset '%s' already exists."), *AssetPath);
+		return nullptr;
 	}
 
 	UClass* ParentClass = LoadClassByPath(ParentClassPath);
 	if (!ParentClass)
 	{
-		return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not load parent class '%s'."), *ParentClassPath));
+		OutErrorCode = TEXT("ClassNotFound");
+		OutErrorMessage = FString::Printf(TEXT("Could not load parent class '%s'."), *ParentClassPath);
+		return nullptr;
 	}
 
-	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "CreateBlueprintAsset", "Blueprint Bridge: Create Blueprint Asset"));
 	UPackage* Package = CreatePackage(*FString::Printf(TEXT("%s/%s"), *PackagePath, *AssetName));
 	if (!Package)
 	{
-		return MakeBridgeError(Id, TEXT("CreatePackageFailed"), FString::Printf(TEXT("Could not create package for '%s'."), *AssetPath));
+		OutErrorCode = TEXT("CreatePackageFailed");
+		OutErrorMessage = FString::Printf(TEXT("Could not create package for '%s'."), *AssetPath);
+		return nullptr;
 	}
 
 	UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
@@ -49,10 +49,33 @@ TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr
 
 	if (!Blueprint)
 	{
-		return MakeBridgeError(Id, TEXT("CreateBlueprintFailed"), FString::Printf(TEXT("Could not create Blueprint '%s'."), *AssetPath));
+		OutErrorCode = TEXT("CreateBlueprintFailed");
+		OutErrorMessage = FString::Printf(TEXT("Could not create Blueprint '%s'."), *AssetPath);
+		return nullptr;
 	}
 
 	FAssetRegistryModule::AssetCreated(Blueprint);
+	return Blueprint;
+}
+
+TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString ParentClassPath;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("parentClass"), ParentClassPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("CreateBlueprintAsset requires params.asset and params.parentClass."));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "CreateBlueprintAsset", "Blueprint Bridge: Create Blueprint Asset"));
+	FString ErrorCode;
+	FString ErrorMessage;
+	UBlueprint* Blueprint = CreateBlueprintAssetWorker(AssetPath, ParentClassPath, ErrorCode, ErrorMessage);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, ErrorCode, ErrorMessage);
+	}
+
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 	Blueprint->GetOutermost()->MarkPackageDirty();
 

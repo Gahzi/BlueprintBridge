@@ -2,8 +2,14 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "BlueprintBridgeFieldSelection.h"
+
 namespace BlueprintBridge
 {
+// Forward decl: defined as a static helper later in this file (see LoadGraphForRead). The new
+// DescribeGraph handler below calls it before the definition site, so it needs to be visible here.
+static bool LoadGraphForRead(const FString& Id, const TSharedPtr<FJsonObject>& Params, UBlueprint*& OutBlueprint, UEdGraph*& OutGraph, TSharedRef<FJsonObject>& OutError);
+
 TSharedRef<FJsonObject> DescribeWidget(UWidget* Widget)
 {
 	TSharedRef<FJsonObject> WidgetJson = MakeShared<FJsonObject>();
@@ -57,22 +63,13 @@ void AddWidgetTreeDescription(TSharedRef<FJsonObject> Result, UWidgetBlueprint* 
 	Result->SetObjectField(TEXT("widgetTree"), TreeJson);
 }
 
-TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> BuildBlueprintDescription(UBlueprint* Blueprint)
 {
-	if (!Params.IsValid() || !Params->HasTypedField<EJson::String>(TEXT("asset")))
-	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeBlueprint requires params.asset."));
-	}
-
-	const FString AssetPath = Params->GetStringField(TEXT("asset"));
-	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	if (!Blueprint)
 	{
-		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+		return Result;
 	}
-
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset"), AssetPath);
 	Result->SetStringField(TEXT("name"), Blueprint->GetName());
 	Result->SetStringField(TEXT("parentClass"), Blueprint->ParentClass ? Blueprint->ParentClass->GetPathName() : TEXT(""));
 
@@ -116,7 +113,26 @@ TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJ
 		AddWidgetTreeDescription(Result, WidgetBlueprint);
 	}
 
-	return MakeSuccess(Id, Result);
+	return Result;
+}
+
+TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	if (!Params.IsValid() || !Params->HasTypedField<EJson::String>(TEXT("asset")))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeBlueprint requires params.asset."));
+	}
+
+	const FString AssetPath = Params->GetStringField(TEXT("asset"));
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	TSharedRef<FJsonObject> Result = BuildBlueprintDescription(Blueprint);
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 UEdGraph* FindBlueprintGraph(UBlueprint* Blueprint, const FString& GraphName)
@@ -207,13 +223,13 @@ TSharedRef<FJsonObject> DescribeNode(UEdGraphNode* Node)
 	return NodeJson;
 }
 
-TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> DescribeGraphFull(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
 	FString GraphName;
 	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("graph"), GraphName))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeGraph requires params.asset and params.graph."));
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("DescribeGraphFull requires params.asset and params.graph."));
 	}
 
 	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
@@ -241,7 +257,29 @@ TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonO
 		}
 	}
 	Result->SetArrayField(TEXT("nodes"), Nodes);
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
+}
+
+TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	// Default to the compact summary shape. Callers who need the per-node/per-pin dump should use
+	// DescribeGraphFull. Mirrors SummarizeBlueprintGraph's handler.
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	TSharedRef<FJsonObject> Error = MakeShared<FJsonObject>();
+	if (!LoadGraphForRead(Id, Params, Blueprint, Graph, Error))
+	{
+		return Error;
+	}
+
+	FGraphSummaryOptions Options;
+	Params->TryGetBoolField(TEXT("includeDefaults"), Options.bIncludeDefaults);
+	Params->TryGetBoolField(TEXT("includePins"), Options.bIncludePins);
+	Params->TryGetBoolField(TEXT("includeWarnings"), Options.bIncludeWarnings);
+
+	TSharedRef<FJsonObject> Result = BuildGraphSummary(Graph, Options);
+	Result->SetStringField(TEXT("asset"), Params->GetStringField(TEXT("asset")));
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -664,22 +702,25 @@ static bool LoadGraphForRead(const FString& Id, const TSharedPtr<FJsonObject>& P
 	return true;
 }
 
-TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+TSharedRef<FJsonObject> BuildGraphSummary(UEdGraph* Graph, const FGraphSummaryOptions& Options)
 {
-	UBlueprint* Blueprint = nullptr;
-	UEdGraph* Graph = nullptr;
-	TSharedRef<FJsonObject> Error = MakeShared<FJsonObject>();
-	if (!LoadGraphForRead(Id, Params, Blueprint, Graph, Error))
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	if (!Graph)
 	{
-		return Error;
+		Result->SetArrayField(TEXT("entryNodes"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetArrayField(TEXT("resultNodes"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetArrayField(TEXT("executionChains"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetArrayField(TEXT("functionCalls"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetObjectField(TEXT("variables"), MakeShared<FJsonObject>());
+		Result->SetArrayField(TEXT("branches"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetArrayField(TEXT("disconnectedNodes"), TArray<TSharedPtr<FJsonValue>>());
+		Result->SetArrayField(TEXT("warnings"), TArray<TSharedPtr<FJsonValue>>());
+		return Result;
 	}
 
-	bool bIncludeDefaults = true;
-	bool bIncludePins = false;
-	bool bIncludeWarnings = true;
-	Params->TryGetBoolField(TEXT("includeDefaults"), bIncludeDefaults);
-	Params->TryGetBoolField(TEXT("includePins"), bIncludePins);
-	Params->TryGetBoolField(TEXT("includeWarnings"), bIncludeWarnings);
+	const bool bIncludeDefaults = Options.bIncludeDefaults;
+	const bool bIncludePins = Options.bIncludePins;
+	const bool bIncludeWarnings = Options.bIncludeWarnings;
 
 	TMap<UEdGraphNode*, FString> NodeToId;
 	TMap<FString, UEdGraphNode*> IdToNode;
@@ -823,8 +864,6 @@ TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TShared
 		}
 	}
 
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetStringField(TEXT("asset"), Params->GetStringField(TEXT("asset")));
 	Result->SetStringField(TEXT("graph"), Graph->GetName());
 	Result->SetStringField(TEXT("graphType"), Graph->GetFName() == UEdGraphSchema_K2::GN_EventGraph ? TEXT("EventGraph") : Entries.Num() > 0 && Results.Num() > 0 ? TEXT("Function") : TEXT("Graph"));
 	Result->SetArrayField(TEXT("entryNodes"), Entries);
@@ -835,7 +874,27 @@ TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TShared
 	Result->SetArrayField(TEXT("branches"), Branches);
 	Result->SetArrayField(TEXT("disconnectedNodes"), Disconnected);
 	Result->SetArrayField(TEXT("warnings"), Warnings);
-	return MakeSuccess(Id, Result);
+	return Result;
+}
+
+TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	UBlueprint* Blueprint = nullptr;
+	UEdGraph* Graph = nullptr;
+	TSharedRef<FJsonObject> Error = MakeShared<FJsonObject>();
+	if (!LoadGraphForRead(Id, Params, Blueprint, Graph, Error))
+	{
+		return Error;
+	}
+
+	FGraphSummaryOptions Options;
+	Params->TryGetBoolField(TEXT("includeDefaults"), Options.bIncludeDefaults);
+	Params->TryGetBoolField(TEXT("includePins"), Options.bIncludePins);
+	Params->TryGetBoolField(TEXT("includeWarnings"), Options.bIncludeWarnings);
+
+	TSharedRef<FJsonObject> Result = BuildGraphSummary(Graph, Options);
+	Result->SetStringField(TEXT("asset"), Params->GetStringField(TEXT("asset")));
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> GetConnectedNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -1248,6 +1307,202 @@ TSharedRef<FJsonObject> ExplainCompileErrors(const FString& Id, const TSharedPtr
 	Result->SetBoolField(TEXT("success"), bSuccess);
 	Result->SetArrayField(TEXT("errors"), Errors);
 	return MakeSuccess(Id, Result);
+}
+
+static TSharedRef<FJsonObject> SerializePinTypeFields(const FEdGraphPinType& PinType)
+{
+	TSharedRef<FJsonObject> Obj = MakeShared<FJsonObject>();
+	Obj->SetStringField(TEXT("category"), PinType.PinCategory.ToString());
+	Obj->SetStringField(TEXT("subCategory"), PinType.PinSubCategory.ToString());
+	Obj->SetStringField(TEXT("subCategoryObject"), PinType.PinSubCategoryObject.IsValid() ? PinType.PinSubCategoryObject->GetPathName() : TEXT(""));
+	Obj->SetStringField(TEXT("containerType"), PinContainerTypeToString(PinType));
+	Obj->SetBoolField(TEXT("byRef"), PinType.bIsReference);
+	Obj->SetBoolField(TEXT("isConst"), PinType.bIsConst);
+	return Obj;
+}
+
+static TSharedRef<FJsonObject> BuildFunctionSignature(UEdGraph* FunctionGraph)
+{
+	TSharedRef<FJsonObject> Sig = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	if (UK2Node_FunctionEntry* Entry = FindFunctionEntryNode(FunctionGraph))
+	{
+		for (UEdGraphPin* Pin : Entry->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output || IsExecPin(Pin))
+			{
+				continue;
+			}
+			TSharedRef<FJsonObject> P = SerializePinTypeFields(Pin->PinType);
+			P->SetStringField(TEXT("name"), Pin->PinName.ToString());
+			Inputs.Add(MakeShared<FJsonValueObject>(P));
+		}
+	}
+	if (UK2Node_FunctionResult* ResultNode = FindFunctionResultNode(FunctionGraph))
+	{
+		for (UEdGraphPin* Pin : ResultNode->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Input || IsExecPin(Pin))
+			{
+				continue;
+			}
+			TSharedRef<FJsonObject> P = SerializePinTypeFields(Pin->PinType);
+			P->SetStringField(TEXT("name"), Pin->PinName.ToString());
+			Outputs.Add(MakeShared<FJsonValueObject>(P));
+		}
+	}
+	Sig->SetArrayField(TEXT("inputs"), Inputs);
+	Sig->SetArrayField(TEXT("outputs"), Outputs);
+	return Sig;
+}
+
+static void AddGraphEntryToArray(UEdGraph* Graph, bool bIncludeBody, bool bIncludeSignature, TArray<TSharedPtr<FJsonValue>>& OutArray)
+{
+	if (!Graph)
+	{
+		return;
+	}
+	TSharedRef<FJsonObject> Entry = MakeShared<FJsonObject>();
+	Entry->SetStringField(TEXT("name"), Graph->GetName());
+	if (bIncludeSignature)
+	{
+		Entry->SetObjectField(TEXT("signature"), BuildFunctionSignature(Graph));
+	}
+	if (bIncludeBody)
+	{
+		FGraphSummaryOptions Options;
+		Entry->SetObjectField(TEXT("summary"), BuildGraphSummary(Graph, Options));
+	}
+	OutArray.Add(MakeShared<FJsonValueObject>(Entry));
+}
+
+TSharedRef<FJsonObject> SummarizeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("SummarizeBlueprint requires params.asset."));
+	}
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	bool bIncludeFunctionBodies = true;
+	bool bIncludeEventGraph = true;
+	bool bIncludeMacros = true;
+	bool bIncludeDelegates = true;
+	bool bIncludeWidgetTree = true;
+	bool bIncludeReflection = false;
+	bool bIncludeSubobjectProperties = false;
+	bool bIncludeParent = false;
+	Params->TryGetBoolField(TEXT("includeFunctionBodies"), bIncludeFunctionBodies);
+	Params->TryGetBoolField(TEXT("includeEventGraph"), bIncludeEventGraph);
+	Params->TryGetBoolField(TEXT("includeMacros"), bIncludeMacros);
+	Params->TryGetBoolField(TEXT("includeDelegates"), bIncludeDelegates);
+	Params->TryGetBoolField(TEXT("includeWidgetTree"), bIncludeWidgetTree);
+	Params->TryGetBoolField(TEXT("includeReflection"), bIncludeReflection);
+	Params->TryGetBoolField(TEXT("includeSubobjectProperties"), bIncludeSubobjectProperties);
+	Params->TryGetBoolField(TEXT("includeParent"), bIncludeParent);
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	Result->SetStringField(TEXT("name"), Blueprint->GetName());
+	Result->SetStringField(TEXT("kind"), Blueprint->GetClass()->GetName());
+	Result->SetStringField(TEXT("parentClass"), Blueprint->ParentClass ? Blueprint->ParentClass->GetPathName() : TEXT(""));
+
+	FString ParentBlueprintPath;
+	if (Blueprint->ParentClass)
+	{
+		if (UBlueprint* ParentBP = Cast<UBlueprint>(Blueprint->ParentClass->ClassGeneratedBy))
+		{
+			ParentBlueprintPath = ParentBP->GetPathName();
+		}
+	}
+	Result->SetStringField(TEXT("parentBlueprint"), ParentBlueprintPath);
+
+	TArray<TSharedPtr<FJsonValue>> Interfaces;
+	for (const FBPInterfaceDescription& InterfaceDesc : Blueprint->ImplementedInterfaces)
+	{
+		if (InterfaceDesc.Interface)
+		{
+			Interfaces.Add(MakeShared<FJsonValueString>(InterfaceDesc.Interface->GetPathName()));
+		}
+	}
+	Result->SetArrayField(TEXT("interfaces"), Interfaces);
+
+	// Variables: copy from BuildBlueprintDescription (it produces the variables shape we want).
+	TSharedRef<FJsonObject> BPDesc = BuildBlueprintDescription(Blueprint);
+	const TArray<TSharedPtr<FJsonValue>>* Vars = nullptr;
+	if (BPDesc->TryGetArrayField(TEXT("variables"), Vars) && Vars != nullptr)
+	{
+		Result->SetArrayField(TEXT("variables"), *Vars);
+	}
+
+	// Components
+	TSharedRef<FJsonObject> ComponentsDesc = BuildComponentsDescription(Blueprint);
+	const TArray<TSharedPtr<FJsonValue>>* Components = nullptr;
+	if (ComponentsDesc->TryGetArrayField(TEXT("components"), Components) && Components != nullptr)
+	{
+		Result->SetArrayField(TEXT("components"), *Components);
+	}
+
+	// Delegates
+	if (bIncludeDelegates)
+	{
+		Result->SetArrayField(TEXT("delegates"), CollectClassDelegates(Blueprint->GeneratedClass));
+	}
+
+	// Graphs: event, functions, macros
+	TSharedRef<FJsonObject> GraphsJson = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> EventGraphs;
+	if (bIncludeEventGraph)
+	{
+		for (UEdGraph* Graph : Blueprint->UbergraphPages)
+		{
+			AddGraphEntryToArray(Graph, bIncludeFunctionBodies, false, EventGraphs);
+		}
+	}
+	GraphsJson->SetArrayField(TEXT("event"), EventGraphs);
+
+	TArray<TSharedPtr<FJsonValue>> Functions;
+	for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+	{
+		AddGraphEntryToArray(Graph, bIncludeFunctionBodies, true, Functions);
+	}
+	GraphsJson->SetArrayField(TEXT("functions"), Functions);
+
+	TArray<TSharedPtr<FJsonValue>> Macros;
+	if (bIncludeMacros)
+	{
+		for (UEdGraph* Graph : Blueprint->MacroGraphs)
+		{
+			AddGraphEntryToArray(Graph, bIncludeFunctionBodies, true, Macros);
+		}
+	}
+	GraphsJson->SetArrayField(TEXT("macros"), Macros);
+
+	Result->SetObjectField(TEXT("graphs"), GraphsJson);
+
+	// Widget tree (UMG)
+	if (bIncludeWidgetTree)
+	{
+		if (UWidgetBlueprint* WidgetBlueprint = Cast<UWidgetBlueprint>(Blueprint))
+		{
+			AddWidgetTreeDescription(Result, WidgetBlueprint);
+		}
+	}
+
+	// Optional opt-in sections (v1 placeholders — not yet wired to specific data).
+	// includeReflection / includeSubobjectProperties / includeParent are accepted for forward-compat
+	// but currently only the parent name is emitted; deeper recursion is reserved for v2.
+	(void)bIncludeReflection;
+	(void)bIncludeSubobjectProperties;
+	(void)bIncludeParent;
+
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 } // namespace BlueprintBridge

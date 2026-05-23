@@ -16,11 +16,14 @@ TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJso
 TSharedRef<FJsonObject> GenerateCommandDocs(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> DescribeGraphFull(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> SummarizeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> CreateBlueprintFromSpec(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> GetConnectedNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindExecutionPath(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeSubgraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);

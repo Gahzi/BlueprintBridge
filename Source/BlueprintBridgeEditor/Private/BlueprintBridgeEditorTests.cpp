@@ -475,9 +475,12 @@ static TSharedRef<FJsonObject> MakeGraphParams(const FString& AssetPath, const F
 	return Params;
 }
 
+// Pre-PR3 tests asserted against the per-node/per-pin verbose shape. Route this helper to
+// DescribeGraphFull so those assertions keep working; tests that want the new summary-shaped
+// DescribeGraph should call ExecuteJsonRequest(TEXT("DescribeGraph"), ...) directly.
 static TSharedRef<FJsonObject> DescribeGraphRequest(const FString& AssetPath, const FString& GraphName)
 {
-	return ExecuteJsonRequest(TEXT("DescribeGraph"), MakeGraphParams(AssetPath, GraphName));
+	return ExecuteJsonRequest(TEXT("DescribeGraphFull"), MakeGraphParams(AssetPath, GraphName));
 }
 
 static TSharedRef<FJsonObject> DescribeNodeRequest(const FString& AssetPath, const FString& GraphName, const FString& NodeGuid)
@@ -2620,6 +2623,185 @@ bool FBlueprintBridgeExtendedGraphHelpersTest::RunTest(const FString& Parameters
 	return true;
 }
 
+namespace BlueprintBridgeTests
+{
+static FString MakeUniqueSpecAssetPath(const TCHAR* Suffix)
+{
+	const FString AssetName = FString::Printf(TEXT("BP_BridgeTest_Spec%s_%s"), Suffix, *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	return FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *AssetName);
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCreateFromSpecMinimalTest, "BlueprintBridge.Blueprint.CreateFromSpec.Minimal", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCreateFromSpecMinimalTest::RunTest(const FString& Parameters)
+{
+	const FString AssetPath = BlueprintBridgeTests::MakeUniqueSpecAssetPath(TEXT("Min"));
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	Params->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintFromSpec"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	// Verify asset exists by round-tripping through the bridge.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	return BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCreateFromSpecVariablesAndComponentsTest, "BlueprintBridge.Blueprint.CreateFromSpec.VariablesAndComponents", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCreateFromSpecVariablesAndComponentsTest::RunTest(const FString& Parameters)
+{
+	const FString AssetPath = BlueprintBridgeTests::MakeUniqueSpecAssetPath(TEXT("VarComp"));
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	Params->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+
+	TArray<TSharedPtr<FJsonValue>> Variables;
+	TSharedRef<FJsonObject> Var = MakeShared<FJsonObject>();
+	Var->SetStringField(TEXT("name"), TEXT("Health"));
+	Var->SetStringField(TEXT("category"), TEXT("int"));
+	Var->SetStringField(TEXT("defaultValue"), TEXT("100"));
+	Variables.Add(MakeShared<FJsonValueObject>(Var));
+	Params->SetArrayField(TEXT("variables"), Variables);
+
+	TArray<TSharedPtr<FJsonValue>> Components;
+	TSharedRef<FJsonObject> Comp = MakeShared<FJsonObject>();
+	Comp->SetStringField(TEXT("name"), TEXT("Hitbox"));
+	Comp->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.BoxComponent"));
+	Components.Add(MakeShared<FJsonValueObject>(Comp));
+	Params->SetArrayField(TEXT("components"), Components);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintFromSpec"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	// Verify variable + component via the bridge so the test doesn't depend on internal helpers.
+	const TSharedRef<FJsonObject> SummaryResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, SummaryResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, SummaryResponse);
+	if (!Result)
+	{
+		return false;
+	}
+
+	bool bFoundVar = false;
+	const TArray<TSharedPtr<FJsonValue>>* Vars = nullptr;
+	if ((*Result)->TryGetArrayField(TEXT("variables"), Vars) && Vars)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *Vars)
+		{
+			const TSharedPtr<FJsonObject>* VObj = nullptr;
+			FString Name;
+			if (V->TryGetObject(VObj) && VObj && (*VObj)->TryGetStringField(TEXT("name"), Name) && Name == TEXT("Health"))
+			{
+				bFoundVar = true;
+			}
+		}
+	}
+	TestTrue(TEXT("'Health' variable should be present."), bFoundVar);
+
+	bool bFoundComp = false;
+	const TArray<TSharedPtr<FJsonValue>>* ResultComponents = nullptr;
+	if ((*Result)->TryGetArrayField(TEXT("components"), ResultComponents) && ResultComponents)
+	{
+		for (const TSharedPtr<FJsonValue>& C : *ResultComponents)
+		{
+			const TSharedPtr<FJsonObject>* CObj = nullptr;
+			FString Name;
+			if (C->TryGetObject(CObj) && CObj && (*CObj)->TryGetStringField(TEXT("name"), Name) && Name == TEXT("Hitbox"))
+			{
+				bFoundComp = true;
+			}
+		}
+	}
+	TestTrue(TEXT("'Hitbox' component should be present."), bFoundComp);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCreateFromSpecFunctionTest, "BlueprintBridge.Blueprint.CreateFromSpec.Function", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCreateFromSpecFunctionTest::RunTest(const FString& Parameters)
+{
+	const FString AssetPath = BlueprintBridgeTests::MakeUniqueSpecAssetPath(TEXT("Fn"));
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	Params->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+	Params->SetBoolField(TEXT("compile"), true);
+
+	// Function: return Out = 42
+	TSharedRef<FJsonObject> Fn = MakeShared<FJsonObject>();
+	Fn->SetStringField(TEXT("name"), TEXT("Constant"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("name"), TEXT("Out"));
+	Out->SetStringField(TEXT("category"), TEXT("int"));
+	Outputs.Add(MakeShared<FJsonValueObject>(Out));
+	Fn->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 42);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Fn->SetArrayField(TEXT("flow"), Flow);
+
+	TArray<TSharedPtr<FJsonValue>> Functions;
+	Functions.Add(MakeShared<FJsonValueObject>(Fn));
+	Params->SetArrayField(TEXT("functions"), Functions);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintFromSpec"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		AddError(FString::Printf(TEXT("CreateBlueprintFromSpec failed: %s"), *BlueprintBridgeTests::GetErrorMessage(Response)));
+		return false;
+	}
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString CompileStatus;
+	TestTrue(TEXT("Response should include compile status."), Result && (*Result)->TryGetStringField(TEXT("compileStatus"), CompileStatus));
+	TestEqual(TEXT("Compiled function should be UpToDate."), CompileStatus, FString(TEXT("UpToDate")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCreateFromSpecRollbackTest, "BlueprintBridge.Blueprint.CreateFromSpec.Rollback", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeCreateFromSpecRollbackTest::RunTest(const FString& Parameters)
+{
+	const FString AssetPath = BlueprintBridgeTests::MakeUniqueSpecAssetPath(TEXT("Rollback"));
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(AssetPath);
+	Params->SetStringField(TEXT("parentClass"), TEXT("/Script/Engine.Actor"));
+
+	// Function references a non-existent UFunction → lowering fails → rollback.
+	TSharedRef<FJsonObject> Fn = MakeShared<FJsonObject>();
+	Fn->SetStringField(TEXT("name"), TEXT("BadFn"));
+	TSharedRef<FJsonObject> CallStmt = MakeShared<FJsonObject>();
+	CallStmt->SetStringField(TEXT("call"), TEXT("/Script/Engine.NonExistentClass.NoSuchFunction"));
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
+	Fn->SetArrayField(TEXT("flow"), Flow);
+
+	TArray<TSharedPtr<FJsonValue>> Functions;
+	Functions.Add(MakeShared<FJsonValueObject>(Fn));
+	Params->SetArrayField(TEXT("functions"), Functions);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintFromSpec"), Params);
+	bool bOk = true;
+	Response->TryGetBoolField(TEXT("ok"), bOk);
+	TestFalse(TEXT("Bad function spec should fail the whole creation."), bOk);
+
+	// The asset should not have survived the rollback. Round-trip through the bridge so the test
+	// doesn't depend on internal helpers; AssetNotFound is the expected error from DescribeBlueprint.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	return BlueprintBridgeTests::ExpectErrorCode(*this, DescribeResponse, TEXT("AssetNotFound"));
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetCommandErrorsTest, "BlueprintBridge.Blueprint.AssetCommandErrors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FBlueprintBridgeAssetCommandErrorsTest::RunTest(const FString& Parameters)
@@ -2850,6 +3032,536 @@ bool FBlueprintBridgeSemanticIRPureCallAsStatementTest::RunTest(const FString& P
 	FString Message;
 	Error && (*Error)->TryGetStringField(TEXT("message"), Message);
 	TestTrue(TEXT("Error should mention dead-code purity."), Message.Contains(TEXT("dead code")));
+	return true;
+}
+
+namespace BlueprintBridgeTests
+{
+// Helper: create a populated function graph for field-selection tests — Branch wired to Sequence.
+static FString CreateFieldSelectionTestGraph(FAutomationTestBase& Test, const FTestBlueprintAsset& Asset)
+{
+	const FString GraphName(TEXT("FieldFn"));
+	TSharedRef<FJsonObject> CreateParams = MakeAssetParams(Asset.AssetPath);
+	CreateParams->SetStringField(TEXT("function"), GraphName);
+	if (!ExpectSuccess(Test, ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateParams)))
+	{
+		return FString();
+	}
+	TSharedRef<FJsonObject> Patch = MakeGraphParams(Asset.AssetPath, GraphName);
+	TArray<TSharedPtr<FJsonValue>> Nodes;
+	TSharedRef<FJsonObject> BranchNode = MakeShared<FJsonObject>();
+	BranchNode->SetStringField(TEXT("id"), TEXT("branch"));
+	BranchNode->SetStringField(TEXT("type"), TEXT("Branch"));
+	BranchNode->SetNumberField(TEXT("x"), 100);
+	BranchNode->SetNumberField(TEXT("y"), 0);
+	Nodes.Add(MakeShared<FJsonValueObject>(BranchNode));
+	Patch->SetArrayField(TEXT("nodes"), Nodes);
+	if (!ExpectSuccess(Test, ExecuteJsonRequest(TEXT("ApplyGraphPatch"), Patch)))
+	{
+		return FString();
+	}
+	return GraphName;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFieldSelectionWholeObjectTest, "BlueprintBridge.Blueprint.FieldSelection.WholeObject", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFieldSelectionWholeObjectTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FieldWhole"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName);
+	TArray<TSharedPtr<FJsonValue>> Fields;
+	Fields.Add(MakeShared<FJsonValueString>(TEXT("nodes.title")));
+	Params->SetArrayField(TEXT("fields"), Fields);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result || !Result->IsValid())
+	{
+		return false;
+	}
+	TestFalse(TEXT("'asset' should be filtered out."), (*Result)->HasField(TEXT("asset")));
+	TestFalse(TEXT("'graph' should be filtered out."), (*Result)->HasField(TEXT("graph")));
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	TestTrue(TEXT("'nodes' should be kept."), (*Result)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes != nullptr && Nodes->Num() > 0);
+	if (!Nodes || Nodes->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FirstNode = nullptr;
+	(*Nodes)[0]->TryGetObject(FirstNode);
+	TestTrue(TEXT("Node should keep 'title'."), FirstNode && (*FirstNode)->HasField(TEXT("title")));
+	TestFalse(TEXT("Node should drop 'guid'."), FirstNode && (*FirstNode)->HasField(TEXT("guid")));
+	TestFalse(TEXT("Node should drop 'class'."), FirstNode && (*FirstNode)->HasField(TEXT("class")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFieldSelectionArrayElementTest, "BlueprintBridge.Blueprint.FieldSelection.ArrayElement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFieldSelectionArrayElementTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FieldPin"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName);
+	TArray<TSharedPtr<FJsonValue>> Fields;
+	Fields.Add(MakeShared<FJsonValueString>(TEXT("nodes.pins.name")));
+	Params->SetArrayField(TEXT("fields"), Fields);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	if (!Result || !(*Result)->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes || Nodes->Num() == 0)
+	{
+		return false;
+	}
+	bool bAnyPinSeen = false;
+	for (const TSharedPtr<FJsonValue>& NodeValue : *Nodes)
+	{
+		const TSharedPtr<FJsonObject>* NodeObj = nullptr;
+		if (!NodeValue->TryGetObject(NodeObj) || !NodeObj || !NodeObj->IsValid())
+		{
+			continue;
+		}
+		const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+		if (!(*NodeObj)->TryGetArrayField(TEXT("pins"), Pins) || !Pins)
+		{
+			continue;
+		}
+		for (const TSharedPtr<FJsonValue>& PinValue : *Pins)
+		{
+			const TSharedPtr<FJsonObject>* PinObj = nullptr;
+			if (PinValue->TryGetObject(PinObj) && PinObj && PinObj->IsValid())
+			{
+				TestTrue(TEXT("Pin should keep 'name'."), (*PinObj)->HasField(TEXT("name")));
+				TestFalse(TEXT("Pin should drop 'direction'."), (*PinObj)->HasField(TEXT("direction")));
+				TestFalse(TEXT("Pin should drop 'category'."), (*PinObj)->HasField(TEXT("category")));
+				bAnyPinSeen = true;
+			}
+		}
+	}
+	return TestTrue(TEXT("At least one pin should be observed for the assertion to be meaningful."), bAnyPinSeen);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFieldSelectionMultiplePathsTest, "BlueprintBridge.Blueprint.FieldSelection.MultiplePaths", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFieldSelectionMultiplePathsTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FieldMulti"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName);
+	TArray<TSharedPtr<FJsonValue>> Fields;
+	Fields.Add(MakeShared<FJsonValueString>(TEXT("nodes.guid")));
+	Fields.Add(MakeShared<FJsonValueString>(TEXT("nodes.title")));
+	Params->SetArrayField(TEXT("fields"), Fields);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	if (!Result || !(*Result)->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes || Nodes->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FirstNode = nullptr;
+	(*Nodes)[0]->TryGetObject(FirstNode);
+	TestTrue(TEXT("Node should keep 'guid'."), FirstNode && (*FirstNode)->HasField(TEXT("guid")));
+	TestTrue(TEXT("Node should keep 'title'."), FirstNode && (*FirstNode)->HasField(TEXT("title")));
+	TestFalse(TEXT("Node should drop 'class'."), FirstNode && (*FirstNode)->HasField(TEXT("class")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFieldSelectionUnknownPathTest, "BlueprintBridge.Blueprint.FieldSelection.UnknownPath", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFieldSelectionUnknownPathTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FieldUnknown"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName);
+	TArray<TSharedPtr<FJsonValue>> Fields;
+	Fields.Add(MakeShared<FJsonValueString>(TEXT("nodes.banana")));
+	Params->SetArrayField(TEXT("fields"), Fields);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	TestTrue(TEXT("'nodes' should still be kept (prefix match)."), Result && (*Result)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes != nullptr);
+	if (!Nodes || Nodes->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FirstNode = nullptr;
+	(*Nodes)[0]->TryGetObject(FirstNode);
+	TestTrue(TEXT("Unknown sub-field yields an empty node object, not an error."), FirstNode && (*FirstNode)->Values.Num() == 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFieldSelectionPassthroughTest, "BlueprintBridge.Blueprint.FieldSelection.Passthrough", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFieldSelectionPassthroughTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FieldPass"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	// No `fields` param → full response shape, asserted via DescribeGraphFull's documented top-level keys.
+	// (Routes to DescribeGraphFull after the PR3 default flip — DescribeGraph now returns the summary shape.)
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	TestTrue(TEXT("Passthrough should keep 'asset'."), (*Result)->HasField(TEXT("asset")));
+	TestTrue(TEXT("Passthrough should keep 'graph'."), (*Result)->HasField(TEXT("graph")));
+	TestTrue(TEXT("Passthrough should keep 'nodes'."), (*Result)->HasField(TEXT("nodes")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeDescribeGraphReturnsSummaryTest, "BlueprintBridge.Blueprint.DescribeGraph.ReturnsSummary", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeDescribeGraphReturnsSummaryTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("DescGraphSum"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraph"), BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	// Summary-shape: top-level keys mirror SummarizeBlueprintGraph, NOT a per-node 'nodes' array.
+	TestTrue(TEXT("DescribeGraph should expose summary 'entryNodes' key."), (*Result)->HasField(TEXT("entryNodes")));
+	TestTrue(TEXT("DescribeGraph should expose summary 'executionChains' key."), (*Result)->HasField(TEXT("executionChains")));
+	TestTrue(TEXT("DescribeGraph should expose summary 'functionCalls' key."), (*Result)->HasField(TEXT("functionCalls")));
+	TestFalse(TEXT("DescribeGraph should NOT expose the verbose 'nodes' array (that is DescribeGraphFull)."), (*Result)->HasField(TEXT("nodes")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeDescribeGraphFullReturnsVerboseTest, "BlueprintBridge.Blueprint.DescribeGraph.FullReturnsVerbose", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeDescribeGraphFullReturnsVerboseTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("DescGraphFull"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString GraphName = BlueprintBridgeTests::CreateFieldSelectionTestGraph(*this, Asset);
+	if (GraphName.IsEmpty())
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, GraphName));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	TestTrue(TEXT("DescribeGraphFull should expose the per-node 'nodes' array."), (*Result)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes != nullptr && Nodes->Num() > 0);
+	if (!Nodes || Nodes->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FirstNode = nullptr;
+	(*Nodes)[0]->TryGetObject(FirstNode);
+	TestTrue(TEXT("Verbose nodes should expose per-pin detail."), FirstNode && (*FirstNode)->HasField(TEXT("pins")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSummarizeBlueprintMinimalTest, "BlueprintBridge.Blueprint.SummarizeBlueprint.Minimal", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSummarizeBlueprintMinimalTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SumMin"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	TestTrue(TEXT("Should include parentClass."), (*Result)->HasField(TEXT("parentClass")));
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	TestTrue(TEXT("Should include variables array (empty)."), (*Result)->TryGetArrayField(TEXT("variables"), Variables) && Variables != nullptr && Variables->Num() == 0);
+	const TSharedPtr<FJsonObject>* Graphs = nullptr;
+	TestTrue(TEXT("Should include graphs object."), (*Result)->TryGetObjectField(TEXT("graphs"), Graphs) && Graphs && Graphs->IsValid());
+	const TArray<TSharedPtr<FJsonValue>>* EventGraphs = nullptr;
+	TestTrue(TEXT("Graphs should include an 'event' array with at least one entry."), Graphs && (*Graphs)->TryGetArrayField(TEXT("event"), EventGraphs) && EventGraphs != nullptr && EventGraphs->Num() > 0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSummarizeBlueprintPopulatedTest, "BlueprintBridge.Blueprint.SummarizeBlueprint.Populated", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSummarizeBlueprintPopulatedTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SumPop"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddCompParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddCompParams->SetStringField(TEXT("name"), TEXT("Hitbox"));
+	AddCompParams->SetStringField(TEXT("componentClass"), TEXT("/Script/Engine.BoxComponent"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddComponent"), AddCompParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> CreateFnParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateFnParams->SetStringField(TEXT("function"), TEXT("GetHealth"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateFnParams)))
+	{
+		return false;
+	}
+	TSharedRef<FJsonObject> AddOutParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddOutParams->SetStringField(TEXT("graph"), TEXT("GetHealth"));
+	AddOutParams->SetStringField(TEXT("name"), TEXT("OutValue"));
+	AddOutParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddFunctionOutput"), AddOutParams)))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	// Variable present
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	bool bFoundHealth = false;
+	if ((*Result)->TryGetArrayField(TEXT("variables"), Variables) && Variables)
+	{
+		for (const TSharedPtr<FJsonValue>& V : *Variables)
+		{
+			const TSharedPtr<FJsonObject>* Obj = nullptr;
+			FString Name;
+			if (V->TryGetObject(Obj) && Obj && (*Obj)->TryGetStringField(TEXT("name"), Name) && Name == TEXT("Health"))
+			{
+				bFoundHealth = true;
+			}
+		}
+	}
+	TestTrue(TEXT("'Health' variable should appear."), bFoundHealth);
+
+	// Component present
+	const TArray<TSharedPtr<FJsonValue>>* Components = nullptr;
+	bool bFoundHitbox = false;
+	if ((*Result)->TryGetArrayField(TEXT("components"), Components) && Components)
+	{
+		for (const TSharedPtr<FJsonValue>& C : *Components)
+		{
+			const TSharedPtr<FJsonObject>* Obj = nullptr;
+			FString Name;
+			if (C->TryGetObject(Obj) && Obj && (*Obj)->TryGetStringField(TEXT("name"), Name) && Name == TEXT("Hitbox"))
+			{
+				bFoundHitbox = true;
+			}
+		}
+	}
+	TestTrue(TEXT("'Hitbox' component should appear."), bFoundHitbox);
+
+	// Function with signature.outputs containing OutValue
+	const TSharedPtr<FJsonObject>* Graphs = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* Functions = nullptr;
+	bool bFoundFn = false;
+	bool bFoundOutValue = false;
+	if ((*Result)->TryGetObjectField(TEXT("graphs"), Graphs) && Graphs && (*Graphs)->TryGetArrayField(TEXT("functions"), Functions) && Functions)
+	{
+		for (const TSharedPtr<FJsonValue>& F : *Functions)
+		{
+			const TSharedPtr<FJsonObject>* FnObj = nullptr;
+			FString FnName;
+			if (F->TryGetObject(FnObj) && FnObj && (*FnObj)->TryGetStringField(TEXT("name"), FnName) && FnName == TEXT("GetHealth"))
+			{
+				bFoundFn = true;
+				const TSharedPtr<FJsonObject>* Sig = nullptr;
+				const TArray<TSharedPtr<FJsonValue>>* Outputs = nullptr;
+				if ((*FnObj)->TryGetObjectField(TEXT("signature"), Sig) && Sig && (*Sig)->TryGetArrayField(TEXT("outputs"), Outputs) && Outputs)
+				{
+					for (const TSharedPtr<FJsonValue>& O : *Outputs)
+					{
+						const TSharedPtr<FJsonObject>* OObj = nullptr;
+						FString OName;
+						if (O->TryGetObject(OObj) && OObj && (*OObj)->TryGetStringField(TEXT("name"), OName) && OName == TEXT("OutValue"))
+						{
+							bFoundOutValue = true;
+						}
+					}
+				}
+			}
+		}
+	}
+	TestTrue(TEXT("'GetHealth' function should appear in graphs.functions."), bFoundFn);
+	TestTrue(TEXT("Function signature.outputs should include 'OutValue'."), bFoundOutValue);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSummarizeBlueprintFlagGatingTest, "BlueprintBridge.Blueprint.SummarizeBlueprint.FlagGating", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSummarizeBlueprintFlagGatingTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SumGate"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	TSharedRef<FJsonObject> CreateFnParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateFnParams->SetStringField(TEXT("function"), TEXT("Gated"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateFnParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetBoolField(TEXT("includeFunctionBodies"), false);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Graphs = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* Functions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("graphs"), Graphs) || !Graphs || !(*Graphs)->TryGetArrayField(TEXT("functions"), Functions) || !Functions || Functions->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FnObj = nullptr;
+	(*Functions)[0]->TryGetObject(FnObj);
+	TestTrue(TEXT("Function entry should keep 'signature' when bodies are off."), FnObj && (*FnObj)->HasField(TEXT("signature")));
+	TestFalse(TEXT("Function entry should drop 'summary' when bodies are off."), FnObj && (*FnObj)->HasField(TEXT("summary")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSummarizeBlueprintWidgetTest, "BlueprintBridge.Blueprint.SummarizeBlueprint.Widget", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSummarizeBlueprintWidgetTest::RunTest(const FString& Parameters)
+{
+	const FString AssetName = FString::Printf(TEXT("WBP_BridgeTest_SumWidget_%s"), *FGuid::NewGuid().ToString(EGuidFormats::Digits));
+	const FString AssetPath = FString::Printf(TEXT("/Game/BlueprintBridgeTests/%s"), *AssetName);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateWidgetBlueprintAsset"), BlueprintBridgeTests::MakeAssetParams(AssetPath))))
+	{
+		return false;
+	}
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	FString Kind;
+	TestTrue(TEXT("Kind should be WidgetBlueprint."), (*Result)->TryGetStringField(TEXT("kind"), Kind) && Kind == TEXT("WidgetBlueprint"));
+	TestTrue(TEXT("widgetTree should be present for UMG."), (*Result)->HasField(TEXT("widgetTree")));
 	return true;
 }
 

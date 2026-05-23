@@ -2,6 +2,8 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "BlueprintBridgeFieldSelection.h"
+
 namespace BlueprintBridge
 {
 void MoveLinks(UEdGraphPin* FromPin, UEdGraphPin* ToPin)
@@ -1669,7 +1671,7 @@ TSharedRef<FJsonObject> DescribeNodeCommand(const FString& Id, const TSharedPtr<
 
 	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
 	Result->SetObjectField(TEXT("node"), DescribeNode(Node));
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> FindNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params)

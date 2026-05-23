@@ -2,6 +2,8 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "BlueprintBridgeFieldSelection.h"
+
 namespace BlueprintBridge
 {
 static UClass* ResolveReflectionClass(const FString& ClassPath)
@@ -263,6 +265,24 @@ static UFunction* GetDelegateSignature(FProperty* Property)
 	return nullptr;
 }
 
+TArray<TSharedPtr<FJsonValue>> CollectClassDelegates(UClass* Class)
+{
+	TArray<TSharedPtr<FJsonValue>> Delegates;
+	if (!Class)
+	{
+		return Delegates;
+	}
+	for (TFieldIterator<FProperty> PropertyIt(Class, EFieldIteratorFlags::IncludeSuper); PropertyIt; ++PropertyIt)
+	{
+		FProperty* Property = *PropertyIt;
+		if (GetDelegateSignature(Property))
+		{
+			Delegates.Add(MakeShared<FJsonValueObject>(DescribeReflectedProperty(Property)));
+		}
+	}
+	return Delegates;
+}
+
 TSharedRef<FJsonObject> DescribeClass(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString ClassPath;
@@ -333,7 +353,7 @@ TSharedRef<FJsonObject> DescribeClass(const FString& Id, const TSharedPtr<FJsonO
 		}
 	}
 
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> FindFunctions(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -400,7 +420,7 @@ TSharedRef<FJsonObject> DescribeFunction(const FString& Id, const TSharedPtr<FJs
 		return MakeBridgeError(Id, TEXT("FunctionNotFound"), FString::Printf(TEXT("Could not find function '%s' on '%s'."), *FunctionName, *ClassPath));
 	}
 
-	return MakeSuccess(Id, DescribeFunctionFull(Function));
+	return MakeSuccess(Id, ApplyFieldSelection(Params, DescribeFunctionFull(Function)));
 }
 
 TSharedRef<FJsonObject> DescribeProperty(const FString& Id, const TSharedPtr<FJsonObject>& Params)

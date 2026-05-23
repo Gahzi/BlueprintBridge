@@ -224,11 +224,35 @@ static TSharedPtr<FJsonObject> MakeAssetGraphSchema()
 	return AddAssetGraph(FSchemaBuilder::Object()).Build();
 }
 
+static FSchemaBuilder AddFieldSelection(FSchemaBuilder Builder)
+{
+	return Builder.OptionalArray(TEXT("fields"), TEXT("Optional dot-path field selector (e.g. [\"nodes.title\", \"nodes.links\"]). When present and non-empty, the response is trimmed to keep only matching keys. Unknown paths are silently dropped."));
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeBlueprintSchema()
+{
+	return AddFieldSelection(AddAsset(FSchemaBuilder::Object())).Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeGraphSchema()
+{
+	return AddFieldSelection(AddAssetGraph(FSchemaBuilder::Object())).Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeComponentsSchema()
+{
+	return AddFieldSelection(AddAsset(FSchemaBuilder::Object())).Build();
+}
+
+static TSharedPtr<FJsonObject> MakeDescribeWidgetTreeSchema()
+{
+	return AddFieldSelection(AddAsset(FSchemaBuilder::Object())).Build();
+}
+
 static TSharedPtr<FJsonObject> MakeDescribeNodeSchema()
 {
-	return AddAssetGraph(FSchemaBuilder::Object())
-		.RequiredString(TEXT("node"), TEXT("Node GUID to describe."))
-		.Build();
+	return AddFieldSelection(AddAssetGraph(FSchemaBuilder::Object())
+		.RequiredString(TEXT("node"), TEXT("Node GUID to describe."))).Build();
 }
 
 static TSharedPtr<FJsonObject> MakeFindNodesSchema()
@@ -257,11 +281,23 @@ static TSharedPtr<FJsonObject> MakeAnalyzeGraphSchema()
 
 static TSharedPtr<FJsonObject> MakeSummarizeBlueprintGraphSchema()
 {
-	return AddAssetGraph(FSchemaBuilder::Object())
+	return AddFieldSelection(AddAssetGraph(FSchemaBuilder::Object())
 		.OptionalBoolean(TEXT("includeDefaults"), TEXT("Whether to include pin defaults where useful."))
 		.OptionalBoolean(TEXT("includePins"), TEXT("Whether to include compact pin descriptions."))
-		.OptionalBoolean(TEXT("includeWarnings"), TEXT("Whether to include graph warnings."))
-		.Build();
+		.OptionalBoolean(TEXT("includeWarnings"), TEXT("Whether to include graph warnings."))).Build();
+}
+
+static TSharedPtr<FJsonObject> MakeSummarizeBlueprintSchema()
+{
+	return AddFieldSelection(AddAsset(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("includeFunctionBodies"), TEXT("Whether to include per-function graph summaries (default true)."))
+		.OptionalBoolean(TEXT("includeEventGraph"), TEXT("Whether to include event graph summaries (default true)."))
+		.OptionalBoolean(TEXT("includeMacros"), TEXT("Whether to include macro graph summaries (default true)."))
+		.OptionalBoolean(TEXT("includeDelegates"), TEXT("Whether to include declared delegates from the generated class (default true)."))
+		.OptionalBoolean(TEXT("includeWidgetTree"), TEXT("Whether to include widget tree for Widget Blueprints (default true)."))
+		.OptionalBoolean(TEXT("includeReflection"), TEXT("Reserved for v2: reflected functions/properties from the generated class."))
+		.OptionalBoolean(TEXT("includeSubobjectProperties"), TEXT("Reserved for v2: subobject property values."))
+		.OptionalBoolean(TEXT("includeParent"), TEXT("Reserved for v2: one-level parent Blueprint recursion."))).Build();
 }
 
 static TSharedPtr<FJsonObject> MakeGetConnectedNodesSchema()
@@ -330,12 +366,11 @@ static TSharedPtr<FJsonObject> MakeFindNodesByPinSchema()
 
 static TSharedPtr<FJsonObject> MakeDescribeClassSchema()
 {
-	return FSchemaBuilder::Object()
+	return AddFieldSelection(FSchemaBuilder::Object()
 		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
 		.OptionalBoolean(TEXT("includeFunctions"), TEXT("Whether to include reflected function summaries."))
 		.OptionalBoolean(TEXT("includeProperties"), TEXT("Whether to include reflected property summaries."))
-		.OptionalBoolean(TEXT("includeDelegates"), TEXT("Whether to include reflected delegate summaries."))
-		.Build();
+		.OptionalBoolean(TEXT("includeDelegates"), TEXT("Whether to include reflected delegate summaries."))).Build();
 }
 
 static TSharedPtr<FJsonObject> MakeFindFunctionsSchema()
@@ -350,10 +385,9 @@ static TSharedPtr<FJsonObject> MakeFindFunctionsSchema()
 
 static TSharedPtr<FJsonObject> MakeDescribeFunctionSchema()
 {
-	return FSchemaBuilder::Object()
+	return AddFieldSelection(FSchemaBuilder::Object()
 		.RequiredString(TEXT("class"), TEXT("Class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
-		.RequiredString(TEXT("function"), TEXT("Function name."))
-		.Build();
+		.RequiredString(TEXT("function"), TEXT("Function name."))).Build();
 }
 
 static TSharedPtr<FJsonObject> MakeDescribePropertySchema()
@@ -548,6 +582,18 @@ static TSharedPtr<FJsonObject> MakeAddVariableGetterFunctionSchema()
 		.RequiredString(TEXT("function"), TEXT("Function graph name to create."))
 		.RequiredString(TEXT("variable"), TEXT("Variable name to return."))
 		.OptionalString(TEXT("output"), TEXT("Optional output pin name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeCreateBlueprintFromSpecSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("parentClass"), TEXT("Parent class path, e.g. /Script/Engine.Actor."))
+		.OptionalArray(TEXT("variables"), TEXT("Variable specs (same shape as AddBlueprintVariable params minus 'asset')."))
+		.OptionalArray(TEXT("components"), TEXT("Component specs (same shape as AddComponent params minus 'asset'). Use 'root: true' to set a scene component as root."))
+		.OptionalArray(TEXT("functions"), TEXT("Function specs (same shape as ApplySemanticFunction params minus 'asset' and 'function' — name comes from the entry)."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Compile the resulting Blueprint at the end."))
+		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Roll back the whole creation if any step fails. Defaults true."))
 		.Build();
 }
 
@@ -952,13 +998,15 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DescribeCommand"), TEXT("Returns metadata and schemas for a registered command."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeDescribeCommandSchema(), &DescribeCommand, MakeDescribeCommandOutputSchema());
 	RegisterCommand(TEXT("GenerateCommandDocs"), TEXT("Generates JSON and/or Markdown command schema documentation."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeGenerateCommandDocsSchema(), &GenerateCommandDocs, MakeGenerateCommandDocsOutputSchema());
 
-	RegisterCommand(TEXT("DescribeBlueprint"), TEXT("Returns parent class, variables, and graph names for a Blueprint."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeBlueprint, MakeDescribeBlueprintOutputSchema());
-	RegisterCommand(TEXT("DescribeGraph"), TEXT("Returns nodes, pins, defaults, links, and positions for a Blueprint graph."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAssetGraphSchema(), &DescribeGraph, MakeDescribeGraphOutputSchema());
+	RegisterCommand(TEXT("DescribeBlueprint"), TEXT("Returns parent class, variables, and graph names for a Blueprint."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeBlueprintSchema(), &DescribeBlueprint, MakeDescribeBlueprintOutputSchema());
+	RegisterCommand(TEXT("DescribeGraph"), TEXT("Returns a compact semantic summary of a Blueprint graph (entry/result nodes, execution chains, function calls, branches, variable reads/writes, warnings). For the per-node/per-pin dump, use DescribeGraphFull."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeGraphSchema(), &DescribeGraph);
+	RegisterCommand(TEXT("DescribeGraphFull"), TEXT("Returns nodes, pins, defaults, links, and positions for a Blueprint graph (the previous DescribeGraph shape)."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeGraphSchema(), &DescribeGraphFull, MakeDescribeGraphOutputSchema());
 	RegisterCommand(TEXT("DescribeNode"), TEXT("Returns a single Blueprint graph node description."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeNodeSchema(), &DescribeNodeCommand, MakeDescribeNodeOutputSchema());
 	RegisterCommand(TEXT("FindNodes"), TEXT("Finds Blueprint graph nodes matching optional filters."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindNodesSchema(), &FindNodes, MakeFindNodesOutputSchema());
 	RegisterCommand(TEXT("FindVariableReferences"), TEXT("Finds get/set nodes referencing a Blueprint variable."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindVariableReferencesSchema(), &FindVariableReferences);
 	RegisterCommand(TEXT("AnalyzeGraph"), TEXT("Reports simple exec reachability and disconnected/orphaned graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeAnalyzeGraphSchema(), &AnalyzeGraph);
 	RegisterCommand(TEXT("SummarizeBlueprintGraph"), TEXT("Returns a compact semantic summary of a Blueprint graph."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeSummarizeBlueprintGraphSchema(), &SummarizeBlueprintGraph);
+	RegisterCommand(TEXT("SummarizeBlueprint"), TEXT("Returns a one-shot summary of a Blueprint: parent class, interfaces, variables, components, delegates, and per-graph summaries."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeSummarizeBlueprintSchema(), &SummarizeBlueprint);
 	RegisterCommand(TEXT("GetConnectedNodes"), TEXT("Returns nearby graph topology around a node."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeGetConnectedNodesSchema(), &GetConnectedNodes);
 	RegisterCommand(TEXT("FindExecutionPath"), TEXT("Finds executable paths between graph nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeFindExecutionPathSchema(), &FindExecutionPath);
 	RegisterCommand(TEXT("DescribeSubgraph"), TEXT("Returns a graph slice around seed nodes."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubgraphSchema(), &DescribeSubgraph, MakeDescribeGraphOutputSchema());
@@ -974,8 +1022,8 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DescribeDelegate"), TEXT("Returns reflected delegate property and signature metadata."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeDelegateSchema(), &DescribeDelegate);
 	RegisterCommand(TEXT("CheckDelegateCompatibility"), TEXT("Checks whether a function signature is compatible with a delegate."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeCheckDelegateCompatibilitySchema(), &CheckDelegateCompatibility);
 	RegisterCommand(TEXT("FindReflectionSymbols"), TEXT("Finds loaded reflected classes, functions, properties, and delegates by name."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeFindReflectionSymbolsSchema(), &FindReflectionSymbols);
-	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeComponents);
-	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeAssetSchema(), &DescribeWidgetTree);
+	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeDescribeComponentsSchema(), &DescribeComponents);
+	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeDescribeWidgetTreeSchema(), &DescribeWidgetTree);
 	RegisterCommand(TEXT("DescribeSubobjects"), TEXT("Returns Blueprint subobject data."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubobjectsSchema(), &DescribeSubobjects);
 
 	RegisterCommand(TEXT("AddComponent"), TEXT("Adds a component to a Blueprint SCS tree."), TEXT("ComponentEditing"), ECommandRisk::ModifiesAsset, MakeAddComponentSchema(), &AddComponent);
@@ -1048,6 +1096,7 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DeleteNode"), TEXT("Deletes a graph node."), TEXT("NodeEditing"), ECommandRisk::ModifiesAsset, MakeDeleteNodeSchema(), &DeleteNode);
 
 	RegisterCommand(TEXT("CreateBlueprintAsset"), TEXT("Creates a Blueprint asset."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeCreateBlueprintAssetSchema(), &CreateBlueprintAsset);
+	RegisterCommand(TEXT("CreateBlueprintFromSpec"), TEXT("Creates a Blueprint and populates variables, components, and Semantic IR functions in one transaction. Optionally compiles."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeCreateBlueprintFromSpecSchema(), &CreateBlueprintFromSpec);
 	RegisterCommand(TEXT("CreateWidgetBlueprintAsset"), TEXT("Creates a Widget Blueprint asset."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeCreateWidgetBlueprintAssetSchema(), &CreateWidgetBlueprintAsset);
 	RegisterCommand(TEXT("DuplicateAsset"), TEXT("Duplicates an editor asset."), TEXT("Asset"), ECommandRisk::CreatesAsset, MakeDuplicateAssetSchema(), &DuplicateAsset);
 	RegisterCommand(TEXT("CheckoutAsset"), TEXT("Checks out an asset through source control."), TEXT("SourceControl"), ECommandRisk::SourceControl, MakeAssetSchema(), &CheckoutAsset);

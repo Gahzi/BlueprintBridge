@@ -27,6 +27,10 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - node creation for variables, branches, sequences, functions, events, custom events, dynamic casts, spawn actor, macros, structs, delegates, timers, traces, arrays, math helpers, UMG runtime calls, and Create Widget
 - pin linking, link movement, link breaking, pin defaults, type copying, safer pin lookup aliases, node movement, and node deletion
 - declarative graph patches (`ApplyGraphPatch`/`ApplyFunctionPatch`) and a Semantic IR (`LowerSemanticFunction`/`ApplySemanticFunction`) that lowers high-level intent (`if`, `return`, pure/impure `call`, `set`, `seq`) into patches
+- optional `fields` selector on every inspection command for trimmed responses (`["nodes.title"]`, `["variables.name"]`, etc.)
+- `DescribeGraph` defaults to the compact summary shape (entry/result nodes, execution chains, function calls, branches, variable reads/writes); the previous per-node/per-pin dump is available as `DescribeGraphFull`
+- one-shot asset description via `SummarizeBlueprint` — parent class, interfaces, variables, components, delegates, and per-graph summaries in a single response
+- one-shot asset scaffolding via `CreateBlueprintFromSpec` — create a Blueprint and populate variables, components, and Semantic IR functions in one transaction with rollback on failure
 - initial UMG widget-tree creation/editing and slot layout commands
 - batched request execution
 - command discovery through `ListCommands` and `DescribeCommand`
@@ -358,6 +362,20 @@ Executes a list of normal requests and returns per-request responses.
 
 ### Blueprint and graph inspection
 
+> **Breaking change (PR3):** `DescribeGraph` now returns the compact summary shape (`entryNodes`, `executionChains`, `functionCalls`, `branches`, `variables.reads/writes`, `warnings`, etc. — same shape as `SummarizeBlueprintGraph`). The previous per-node/per-pin dump is now available as **`DescribeGraphFull`**. Migration is a one-line rename for callers that need the verbose shape. `SummarizeBlueprintGraph` continues to work as an alias for the summary shape.
+
+All inspection commands listed in this section (`DescribeBlueprint`, `DescribeGraph`, `DescribeGraphFull`, `DescribeNode`, `DescribeClass`, `DescribeFunction`, `DescribeComponents`, `DescribeWidgetTree`) accept an optional `fields` array that trims the response to just the keys you ask for. Field paths are dot-separated and walk arrays element-wise:
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph",
+  "fields": ["nodes.guid", "nodes.title", "nodes.links"]
+}
+```
+
+Rules: missing or empty `fields` returns the full response (no behavior change for existing callers). Unknown paths are silently dropped — `"nodes.banana"` keeps the `nodes` array with empty objects inside, not an error. `"nodes"` by itself keeps the whole nodes subtree.
+
 #### `DescribeBlueprint`
 
 ```json
@@ -377,7 +395,18 @@ Returns parent class, variables, variable flags/replication metadata, variable c
 }
 ```
 
-Returns graph nodes, pin names, pin directions, pin types, pin container types, defaults, links, node GUIDs, positions, and variable node metadata.
+Returns the compact semantic summary: entry/result nodes, execution chains, function calls, branches, variable reads/writes, disconnected nodes, and warnings. Same payload shape as `SummarizeBlueprintGraph` (which remains available as an alias).
+
+#### `DescribeGraphFull`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "graph": "EventGraph"
+}
+```
+
+Returns the verbose dump: every node with every pin, pin types, container types, defaults, links, GUIDs, and positions. Use when you need per-node or per-pin detail (e.g. confirming a patch landed, walking node topology by hand). This is the shape `DescribeGraph` returned before PR3.
 
 #### `DescribeNode`
 
@@ -420,6 +449,20 @@ Returns graph nodes, pin names, pin directions, pin types, pin container types, 
 ```
 
 Reports simple exec reachability plus disconnected/orphaned node classifications.
+
+#### `SummarizeBlueprint`
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset"
+}
+```
+
+Returns a one-shot description of an entire Blueprint asset: `kind`, `parentClass`, `parentBlueprint`, `interfaces`, `variables` (with flags), `components` (SCS tree), `delegates` (from the generated class), `graphs.event[]` / `graphs.functions[]` / `graphs.macros[]` (each entry has `name`, optional `signature` for functions/macros, and a `SummarizeBlueprintGraph`-shaped `summary`), plus `widgetTree` for Widget Blueprints.
+
+Opt-out flags (all default `true`): `includeFunctionBodies`, `includeEventGraph`, `includeMacros`, `includeDelegates`, `includeWidgetTree`. Use these on large assets to trim the response further than the default summary already does.
+
+Reserved for v2 (accepted but no-op today): `includeReflection`, `includeSubobjectProperties`, `includeParent`.
 
 ### Reflection
 
@@ -517,6 +560,33 @@ Searches loaded reflection symbols so clients can discover exact owner classes a
   "parentClass": "/Script/Engine.Actor"
 }
 ```
+
+#### `CreateBlueprintFromSpec`
+
+Creates a Blueprint and populates variables, components, and Semantic IR functions in one transactional call. Each `variables[]`/`components[]`/`functions[]` entry reuses the same shape as its single-step counterpart (`AddBlueprintVariable`, `AddComponent`, `ApplySemanticFunction`) minus the redundant `asset`/`function`-name fields.
+
+```json
+{
+  "asset": "/Game/Abilities/BP_NewAbility",
+  "parentClass": "/Script/Engine.Actor",
+  "variables": [
+    { "name": "Health", "category": "int", "defaultValue": "100" }
+  ],
+  "components": [
+    { "name": "Hitbox", "componentClass": "/Script/Engine.BoxComponent", "root": true }
+  ],
+  "functions": [
+    {
+      "name": "Constant",
+      "outputs": [{ "name": "Out", "category": "int" }],
+      "flow": [ { "return": { "Out": 42 } } ]
+    }
+  ],
+  "compile": true
+}
+```
+
+`rollbackOnFailure` defaults true — if any step fails (bad variable type, missing component class, lowering error, etc.) the whole creation is canceled and the asset never materializes. Errors carry a `phase` field (`asset`, `variables[N]`, `components[N]`, `functions[N]`) plus a `rolledBack` boolean so callers can pinpoint where the spec broke down.
 
 #### `CreateWidgetBlueprintAsset`
 

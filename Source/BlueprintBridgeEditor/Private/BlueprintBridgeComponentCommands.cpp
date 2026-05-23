@@ -2,6 +2,8 @@
 
 #include "BlueprintBridgeCommandsPrivate.h"
 
+#include "BlueprintBridgeFieldSelection.h"
+
 namespace BlueprintBridge
 {
 TSharedRef<FJsonObject> DescribeComponentNode(USCS_Node* Node)
@@ -34,6 +36,24 @@ TSharedRef<FJsonObject> DescribeComponentNode(USCS_Node* Node)
 	return Result;
 }
 
+TSharedRef<FJsonObject> BuildComponentsDescription(UBlueprint* Blueprint)
+{
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> Components;
+	if (Blueprint && Blueprint->SimpleConstructionScript)
+	{
+		for (USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
+		{
+			if (Node)
+			{
+				Components.Add(MakeShared<FJsonValueObject>(DescribeComponentNode(Node)));
+			}
+		}
+	}
+	Result->SetArrayField(TEXT("components"), Components);
+	return Result;
+}
+
 TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	FString AssetPath;
@@ -48,47 +68,40 @@ TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<F
 		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
 	}
 
-	TArray<TSharedPtr<FJsonValue>> Components;
-	for (USCS_Node* Node : Blueprint->SimpleConstructionScript->GetAllNodes())
-	{
-		if (Node)
-		{
-			Components.Add(MakeShared<FJsonValueObject>(DescribeComponentNode(Node)));
-		}
-	}
-
-	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-	Result->SetArrayField(TEXT("components"), Components);
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, BuildComponentsDescription(Blueprint)));
 }
 
-TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+USCS_Node* AddComponentWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage)
 {
-	FString AssetPath;
 	FString ComponentName;
 	FString ComponentClassPath;
-	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
-		!TryGetRequiredString(Params, TEXT("name"), ComponentName) ||
-		!TryGetRequiredString(Params, TEXT("componentClass"), ComponentClassPath))
+	if (!TryGetRequiredString(Params, TEXT("name"), ComponentName) || !TryGetRequiredString(Params, TEXT("componentClass"), ComponentClassPath))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddComponent requires params.asset, params.name, and params.componentClass."));
+		OutErrorCode = TEXT("InvalidParams");
+		OutErrorMessage = TEXT("component spec requires 'name' and 'componentClass'.");
+		return nullptr;
 	}
 
-	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
 	if (!Blueprint || !Blueprint->SimpleConstructionScript)
 	{
-		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+		OutErrorCode = TEXT("InvalidBlueprint");
+		OutErrorMessage = TEXT("Blueprint has no SimpleConstructionScript.");
+		return nullptr;
 	}
 
 	UClass* ComponentClass = LoadClassByPath(ComponentClassPath);
 	if (!ComponentClass || !ComponentClass->IsChildOf(UActorComponent::StaticClass()))
 	{
-		return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not load component class '%s'."), *ComponentClassPath));
+		OutErrorCode = TEXT("ClassNotFound");
+		OutErrorMessage = FString::Printf(TEXT("Could not load component class '%s'."), *ComponentClassPath);
+		return nullptr;
 	}
 
 	if (FindSCSNodeByName(Blueprint->SimpleConstructionScript, ComponentName))
 	{
-		return MakeBridgeError(Id, TEXT("ComponentAlreadyExists"), FString::Printf(TEXT("Component '%s' already exists on '%s'."), *ComponentName, *AssetPath));
+		OutErrorCode = TEXT("ComponentAlreadyExists");
+		OutErrorMessage = FString::Printf(TEXT("Component '%s' already exists."), *ComponentName);
+		return nullptr;
 	}
 
 	FString ParentName;
@@ -96,17 +109,20 @@ TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonOb
 	USCS_Node* ParentNode = ParentName.IsEmpty() ? nullptr : FindSCSNodeByName(Blueprint->SimpleConstructionScript, ParentName);
 	if (!ParentName.IsEmpty() && !ParentNode)
 	{
-		return MakeBridgeError(Id, TEXT("ComponentNotFound"), FString::Printf(TEXT("Could not find parent component '%s'."), *ParentName));
+		OutErrorCode = TEXT("ComponentNotFound");
+		OutErrorMessage = FString::Printf(TEXT("Could not find parent component '%s'."), *ParentName);
+		return nullptr;
 	}
 
-	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddComponent", "Blueprint Bridge: Add Component"));
 	Blueprint->Modify();
 	Blueprint->SimpleConstructionScript->Modify();
 
 	USCS_Node* Node = Blueprint->SimpleConstructionScript->CreateNode(ComponentClass, FName(*ComponentName));
 	if (!Node)
 	{
-		return MakeBridgeError(Id, TEXT("AddComponentFailed"), FString::Printf(TEXT("Could not add component '%s'."), *ComponentName));
+		OutErrorCode = TEXT("AddComponentFailed");
+		OutErrorMessage = FString::Printf(TEXT("Could not add component '%s'."), *ComponentName);
+		return nullptr;
 	}
 
 	if (ParentNode)
@@ -117,6 +133,32 @@ TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonOb
 	else
 	{
 		Blueprint->SimpleConstructionScript->AddNode(Node);
+	}
+
+	return Node;
+}
+
+TSharedRef<FJsonObject> AddComponent(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddComponent requires params.asset, params.name, and params.componentClass."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint || !Blueprint->SimpleConstructionScript)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddComponent", "Blueprint Bridge: Add Component"));
+	FString ErrorCode;
+	FString ErrorMessage;
+	USCS_Node* Node = AddComponentWorker(Blueprint, Params, ErrorCode, ErrorMessage);
+	if (!Node)
+	{
+		return MakeBridgeError(Id, ErrorCode, ErrorMessage);
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);

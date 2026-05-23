@@ -454,22 +454,15 @@ TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TShar
 	return MakeSuccess(Id, Result);
 }
 
-TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+bool AddBlueprintVariableWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage)
 {
-	FString AssetPath;
 	FString Name;
 	FString Category;
-	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
-		!TryGetRequiredString(Params, TEXT("name"), Name) ||
-		!TryGetRequiredString(Params, TEXT("category"), Category))
+	if (!TryGetRequiredString(Params, TEXT("name"), Name) || !TryGetRequiredString(Params, TEXT("category"), Category))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddBlueprintVariable requires params.asset, params.name, and params.category."));
-	}
-
-	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
-	if (!Blueprint)
-	{
-		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+		OutErrorCode = TEXT("InvalidParams");
+		OutErrorMessage = TEXT("variable spec requires 'name' and 'category'.");
+		return false;
 	}
 
 	FEdGraphPinType PinType;
@@ -490,7 +483,9 @@ TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr
 		UObject* SubCategoryObject = StaticLoadObject(UObject::StaticClass(), nullptr, *SubCategoryObjectPath);
 		if (!SubCategoryObject)
 		{
-			return MakeBridgeError(Id, TEXT("TypeNotFound"), FString::Printf(TEXT("Could not load type object '%s'."), *SubCategoryObjectPath));
+			OutErrorCode = TEXT("TypeNotFound");
+			OutErrorMessage = FString::Printf(TEXT("Could not load type object '%s'."), *SubCategoryObjectPath);
+			return false;
 		}
 		PinType.PinSubCategoryObject = SubCategoryObject;
 	}
@@ -498,26 +493,64 @@ TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr
 	FString PinTypeError;
 	if (!ApplyPinContainerType(Params, PinType, PinTypeError))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidPinType"), PinTypeError);
+		OutErrorCode = TEXT("InvalidPinType");
+		OutErrorMessage = PinTypeError;
+		return false;
 	}
 
 	FString DefaultValue;
 	Params->TryGetStringField(TEXT("defaultValue"), DefaultValue);
 
-	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddBlueprintVariable", "Blueprint Bridge: Add Blueprint Variable"));
 	Blueprint->Modify();
 	if (!FBlueprintEditorUtils::AddMemberVariable(Blueprint, *Name, PinType, DefaultValue))
 	{
-		return MakeBridgeError(Id, TEXT("AddVariableFailed"), FString::Printf(TEXT("Could not add variable '%s'."), *Name));
+		OutErrorCode = TEXT("AddVariableFailed");
+		OutErrorMessage = FString::Printf(TEXT("Could not add variable '%s'."), *Name);
+		return false;
 	}
 
 	const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *Name);
 	if (VarIndex != INDEX_NONE)
 	{
-		if (const TSharedPtr<FJsonObject> Error = ApplyBlueprintVariableFlagsFromParams(Id, Blueprint, Blueprint->NewVariables[VarIndex], Name, Params))
+		// ApplyBlueprintVariableFlagsFromParams returns a fully-formed error response if a flag fails.
+		// For worker callers we just need to detect failure and extract the code/message.
+		if (const TSharedPtr<FJsonObject> Error = ApplyBlueprintVariableFlagsFromParams(FString(), Blueprint, Blueprint->NewVariables[VarIndex], Name, Params))
 		{
-			return Error.ToSharedRef();
+			const TSharedPtr<FJsonObject>* ErrObj = nullptr;
+			OutErrorCode = TEXT("VariableFlagFailed");
+			OutErrorMessage = FString::Printf(TEXT("Failed to apply flags to variable '%s'."), *Name);
+			if (Error->TryGetObjectField(TEXT("error"), ErrObj) && ErrObj && (*ErrObj).IsValid())
+			{
+				(*ErrObj)->TryGetStringField(TEXT("code"), OutErrorCode);
+				(*ErrObj)->TryGetStringField(TEXT("message"), OutErrorMessage);
+			}
+			return false;
 		}
+	}
+
+	return true;
+}
+
+TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddBlueprintVariable requires params.asset, params.name, and params.category."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddBlueprintVariable", "Blueprint Bridge: Add Blueprint Variable"));
+	FString ErrorCode;
+	FString ErrorMessage;
+	if (!AddBlueprintVariableWorker(Blueprint, Params, ErrorCode, ErrorMessage))
+	{
+		return MakeBridgeError(Id, ErrorCode, ErrorMessage);
 	}
 
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
