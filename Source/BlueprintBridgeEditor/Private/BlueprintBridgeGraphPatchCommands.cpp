@@ -1608,6 +1608,11 @@ TSharedRef<FJsonObject> ApplyAndFix(const FString& Id, const TSharedPtr<FJsonObj
 	Params->TryGetBoolField(TEXT("rollbackOnCompileError"), bRollbackOnCompileError);
 	Params->TryGetBoolField(TEXT("createIfMissing"), bCreateIfMissing);
 
+	// Track whether the function graph existed before this call. Graph creation isn't transactional —
+	// FScopedTransaction::Cancel() won't undo CreateNewGraph + AddFunctionGraph — so a rollback
+	// from a freshly-created function needs an explicit RemoveGraph step.
+	const bool bFunctionPreExisted = (FindBlueprintGraph(Blueprint, FunctionName) != nullptr);
+
 	FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "ApplyAndFix", "Blueprint Bridge: Apply And Fix"));
 
 	FSemanticLowerResult LowerResult;
@@ -1655,6 +1660,15 @@ TSharedRef<FJsonObject> ApplyAndFix(const FString& Id, const TSharedPtr<FJsonObj
 		if (bRollbackOnCompileError)
 		{
 			Transaction.Cancel();
+			// Transaction rollback doesn't undo graph creation. If this call created the function,
+			// explicitly remove it so the rollback is honest.
+			if (!bFunctionPreExisted)
+			{
+				if (UEdGraph* CreatedGraph = FindBlueprintGraph(Blueprint, FunctionName))
+				{
+					FBlueprintEditorUtils::RemoveGraph(Blueprint, CreatedGraph, EGraphRemoveFlags::None);
+				}
+			}
 		}
 		TSharedRef<FJsonObject> Response = MakeBridgeError(Id, TEXT("CompileFailed"), FString::Printf(TEXT("Blueprint compiled with %d error(s)."), ResultsLog.NumErrors));
 		const TSharedPtr<FJsonObject>* ErrObj = nullptr;

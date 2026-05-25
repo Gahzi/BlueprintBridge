@@ -3305,6 +3305,10 @@ bool FBlueprintBridgeApplyAndFixRollbackTest::RunTest(const FString& Parameters)
 	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
 	Params->SetArrayField(TEXT("flow"), Flow);
 
+	AddExpectedError(TEXT("contains a latent call, which cannot exist outside of the event graph"),
+	EAutomationExpectedErrorFlags::Contains,
+	1);
+
 	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyAndFix"), Params);
 	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("CompileFailed")))
 	{
