@@ -31,6 +31,9 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - `DescribeGraph` defaults to the compact summary shape (entry/result nodes, execution chains, function calls, branches, variable reads/writes); the previous per-node/per-pin dump is available as `DescribeGraphFull`
 - one-shot asset description via `SummarizeBlueprint` — parent class, interfaces, variables, components, delegates, and per-graph summaries in a single response
 - one-shot asset scaffolding via `CreateBlueprintFromSpec` — create a Blueprint and populate variables, components, and Semantic IR functions in one transaction with rollback on failure
+- `ApplyAndFix` — apply Semantic IR, compile, and return compile diagnostics inline so the next turn has everything it needs to produce a fix
+- `ResolveSymbol` — for any reflected C++ symbol, returns the module name, relative + absolute header path, doxygen comment, and a C++-style signature; falls back to `kind=blueprint` for BP-defined symbols
+- `ReplaceSemanticFunction` — wipe an existing function's body and re-lower a new Semantic IR over it in one transaction, with rollback on lowering failure
 - initial UMG widget-tree creation/editing and slot layout commands
 - batched request execution
 - command discovery through `ListCommands` and `DescribeCommand`
@@ -550,6 +553,49 @@ Use `asset` for Blueprint function graphs or `functionClass` for reflected C++/U
 
 Searches loaded reflection symbols so clients can discover exact owner classes and names before mutating graphs.
 
+#### `ResolveSymbol`
+
+Resolves a reflected C++ symbol to its source location and metadata. Useful for hybrid C++/BP investigations where the LLM needs to read the actual C++ behind a `UFUNCTION`/`UCLASS`/`UPROPERTY`/`UDELEGATE` without falling back to grep.
+
+```json
+{
+  "kind": "function",
+  "class": "/Script/Biscuit.TargetingComponent",
+  "member": "OnTargetSelected"
+}
+```
+
+`kind` is one of `class`, `function`, `property`, `delegate`. `member` is required for everything except `class`.
+
+Response (C++-defined symbol):
+
+```json
+{
+  "kind": "function",
+  "owner": "/Script/Biscuit.TargetingComponent",
+  "name": "OnTargetSelected",
+  "module": "Biscuit",
+  "headerPath": "Public/Targeting/TargetingComponent.h",
+  "absoluteHeaderPath": "D:/Odyssey/UGSBiscuit/Source/Biscuit/Public/Targeting/TargetingComponent.h",
+  "signature": "void OnTargetSelected(AActor* Target)",
+  "comment": "/** Broadcast when a new target is selected. */",
+  "metadata": { "..." : "..." }
+}
+```
+
+Response (Blueprint-defined symbol — no C++ source):
+
+```json
+{
+  "kind": "blueprint",
+  "owner": "/Game/Path/BP_Asset",
+  "name": "SomeBPFunction",
+  "metadata": { "..." : "..." }
+}
+```
+
+`absoluteHeaderPath` is best-effort: it's resolved for plugin and game-module sources but skipped for engine modules (their layout varies enough that resolving them reliably isn't worth the surface area). When omitted, the relative `headerPath` is still useful for grep-based follow-ups.
+
 ### Asset, source control, compile, save
 
 #### `CreateBlueprintAsset`
@@ -894,6 +940,43 @@ A higher-level layer above `ApplyFunctionPatch`. The caller writes a function si
 ```
 
 v1 statement forms: `call` (impure), `set`, `if`/`then`/`else`, `seq`, `return`. v1 expression forms: `var`, `in`, `self`, `lit`, `call` (pure). Function references use the full UFunction path (`/Script/Package.Class.Function`). Calling a pure function in statement position or an impure function in expression position is a lowering error and the response carries a `pointer` field locating the offending IR node (e.g. `flow[0].if.args.Context`). Loops, `cast`, `switch`, `let` bindings, and delegate bind/broadcast are scheduled for v2.
+
+#### `ReplaceSemanticFunction`
+
+Rewrites an existing function body from a new Semantic IR in one transaction. Wipes every non-entry/non-result node in the function graph, then re-lowers the new IR over the preserved entry/result nodes. For whole-function rewrites — use `ApplyGraphPatch` with `existingGuid` refs for surgical edits to a subset of nodes.
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "function": "ScoreSlam",
+  "flow": [ /* new IR — replaces the entire current body */ ],
+  "compile": true
+}
+```
+
+`inputs` and `outputs` are optional. If omitted, the existing function signature is preserved and only the body is replaced. If provided, they merge with the existing signature via `ApplyFunctionPatch`'s pin-merge.
+
+The function must already exist — use `ApplySemanticFunction` with `createIfMissing: true` if you need creation. On lowering failure (bad function path, unresolved variable, etc.) the transaction cancels and the original body is restored.
+
+#### `ApplyAndFix`
+
+`ApplyAndFix` collapses the apply→compile→inspect-errors round-trip loop. It accepts the same params as `ApplySemanticFunction`, applies the IR, compiles the Blueprint, and returns the compile diagnostics in the same response — so when a turn produces a broken IR, the next turn already has everything it needs to write a correction.
+
+```json
+{
+  "asset": "/Game/Path/BP_Asset",
+  "function": "ScoreSlam",
+  "createIfMissing": true,
+  "inputs":  [...],
+  "outputs": [...],
+  "flow":    [...],
+  "rollbackOnCompileError": false
+}
+```
+
+On clean compile: success response with `compileStatus: "UpToDate"`, the `resolutions` map, and warning count. On compile errors: `ok: false`, `error.code: "CompileFailed"`, plus `error.messages` (the structured diagnostics — same shape as `CompileBlueprint` produces), `error.appliedPatch` (the lowered patch JSON so the caller can correlate diagnostics back to IR locations), `error.resolutions`, `error.compileStatus`, and `error.rolledBack` (`true` only when `rollbackOnCompileError: true`).
+
+Default `rollbackOnCompileError: false` — leaving the broken state in place is usually more useful than reverting, since the caller can inspect the actual node graph to understand what failed.
 
 ### Node creation
 
@@ -1342,17 +1425,50 @@ Do not paste GitHub credentials, tokens, or passwords into AI chats or logs. Use
 
 ## Roadmap
 
-High-value next work:
+The bridge's authoring surface is wide enough for most workflows now. Future work prioritizes **making what's already here cheaper and faster** over adding new commands. Items are ordered by expected leverage.
 
-- richer compile diagnostics in command responses
-- continue reducing shared command helper coupling if needed
-- standalone cross-shell CLI client
-- generated schema docs
-- remove/rename Blueprint variables
-- more delegate unbind/clear helpers
-- richer array/map/set graph operations
-- more trace/collision and math node helpers
-- complete runtime UMG construction/property/brush helpers
-- Behavior Tree / StateTree / Animation Blueprint asset operations
-- transaction grouping with optional rollback semantics
-- optional file-queue or socket transport
+### Token efficiency & speed (priority)
+
+1. **Semantic IR v2** — Add `let` bindings, `forEach`/`for`, `switch`, `cast`, `bind`/`broadcast`, and auto-hoist of impure expressions to the IR. Each construct shipping in IR collapses multi-call `ApplyGraphPatch` fallback patterns into a single `ApplySemanticFunction` request. This is the highest-leverage future change because every gap in the IR forces the LLM into the lower-level patch surface.
+
+2. **Diff-based editing (`PatchSemanticFunction`)** — `insertBefore` / `replace` / `delete` operations on existing graph nodes. `ReplaceSemanticFunction` already handles whole-function rewrites; diffs would let small edits scale with the size of the change instead of the size of the function. Design is gated on dogfooding evidence about which edit patterns dominate.
+
+3. **Asset versioning + conditional reads** — Bridge increments a monotonic version counter on every mutation; clients can pass `ifAssetVersionDiffersFrom: <version>` to inspection commands and get a `unchanged: true` short-circuit response. Eliminates redundant describe calls when the LLM already has a fresh snapshot.
+
+4. **Multi-asset describe** — `SummarizeAssets([paths])` returns N asset summaries in one call. For "what does this folder of related Blueprints do?" investigations, cuts N envelope overheads and the inter-turn reasoning cost of dispatching N separate `SummarizeBlueprint` calls.
+
+5. **Response budget + truncation flag** — `maxResponseBytes` cap on inspection commands. When exceeded, responses carry `truncated: true` and a hint to use the `fields` selector. Protects against unexpected payload size on assets the LLM hasn't seen before.
+
+6. **Better error messages with "did you mean"** — Typo correction on command names, UFunction paths, variable names, field names. Each successful correction saves a full retry round-trip.
+
+7. **Compact response format** — Opt-in `format: "compact"` returns short field names (`n` instead of `name`, `t` instead of `type`) and omits boolean defaults. ~20–30% wire-byte reduction on the heavy inspection commands. Off by default to keep responses human-readable.
+
+8. **Incremental compile** — `CompileBlueprint` currently does a full compile pass. UE's KismetCompiler supports incremental compilation; exposing it would cut multi-second waits on big Blueprints during apply→compile→fix loops.
+
+9. **Reference queries** — `FindAllReferences(variable)`, `WhereIsUsed(function)`, `FindAllImplementations(interface)`. Reflection iterators have this information cheaply; surfacing it eliminates grep round-trips for "what calls this?" / "what implements this?" workflows. Borderline between capability and efficiency, but it replaces work the LLM does today via the file-search tool.
+
+10. **Snippet/template library expansion** — Pre-built `ApplyGraphSnippet` templates for common patterns (event bind, scoring function, save handler, etc.) with binding substitution. Each snippet replaces a full IR construction.
+
+11. **`Batch` read parallelization** — `Batch` currently serializes requests. Read-only requests in a batch could run concurrently on the editor thread (asset loads are cached after the first).
+
+12. **Streaming responses** — Length-prefixed JSON framing supports streaming naturally. For huge `DescribeGraphFull` / `SummarizeBlueprint` responses, streaming would let the LLM start reasoning before the full payload arrives. Transport-level work; biggest single latency win on large assets but also the largest implementation effort. Worth considering only after #1–#11 are exhausted or proven insufficient.
+
+### Capability expansion (lower priority)
+
+Surface-area additions, deferred until dogfooding shows they unblock real workflows that can't be solved with the current commands:
+
+- Animation Blueprint authoring (state machines, transition rules, anim nodes)
+- Behavior Tree / StateTree asset operations
+- Material graph authoring (currently completely out of scope)
+- Niagara emitter/module operations
+- Remove/rename Blueprint variables (currently can only add)
+- More delegate unbind/clear helpers
+- Richer array/map/set graph operations
+- More trace/collision and math node helpers
+- Complete runtime UMG construction/property/brush helpers
+
+### Infrastructure (background)
+
+- Standalone cross-shell CLI client (alternative to PowerShell helper)
+- Optional file-queue or WebSocket transport (alternative to named pipes for non-Windows or multi-client scenarios)
+- Continue reducing shared command helper coupling as patterns stabilize

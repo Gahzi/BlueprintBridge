@@ -160,7 +160,7 @@ static void AddGraphTokenFields(TSharedRef<FJsonObject> MessageJson, const TShar
 	}
 }
 
-static TArray<TSharedPtr<FJsonValue>> BuildCompileMessages(const FCompilerResultsLog& ResultsLog)
+TArray<TSharedPtr<FJsonValue>> BuildCompileMessages(const FCompilerResultsLog& ResultsLog)
 {
 	TArray<TSharedPtr<FJsonValue>> Messages;
 	for (const TSharedRef<FTokenizedMessage>& Message : ResultsLog.Messages)

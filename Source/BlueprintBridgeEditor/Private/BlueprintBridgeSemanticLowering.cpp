@@ -121,10 +121,10 @@ static void LinkFrontier(FLowerCtx& Ctx, const FString& ToRef)
 	Ctx.ExecFrontier.Reset();
 }
 
-static void LinkFrontierAndAdvance(FLowerCtx& Ctx, const FString& NodeId)
+static void LinkFrontierAndAdvance(FLowerCtx& Ctx, const FString& NodeId, const TCHAR* OutExecPin = TEXT("then"))
 {
 	LinkFrontier(Ctx, NodeId + TEXT(".execute"));
-	Ctx.ExecFrontier.Add(NodeId + TEXT(".then"));
+	Ctx.ExecFrontier.Add(FString::Printf(TEXT("%s.%s"), *NodeId, OutExecPin));
 }
 
 static void WireExprToPin(FLowerCtx& Ctx, const FExprResult& Expr, const FString& NodeId, const FString& PinName)

@@ -2790,6 +2790,18 @@ bool FBlueprintBridgeCreateFromSpecRollbackTest::RunTest(const FString& Paramete
 	TArray<TSharedPtr<FJsonValue>> Functions;
 	Functions.Add(MakeShared<FJsonValueObject>(Fn));
 	Params->SetArrayField(TEXT("functions"), Functions);
+	
+	AddExpectedError(
+	TEXT("The package to load does not exist on disk or in the loader"),
+	EAutomationExpectedErrorFlags::Contains,
+	1
+	);
+
+	AddExpectedError(
+		TEXT("Failed to find object 'Blueprint"),
+		EAutomationExpectedErrorFlags::Contains,
+		1
+	);
 
 	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateBlueprintFromSpec"), Params);
 	bool bOk = true;
@@ -2800,6 +2812,577 @@ bool FBlueprintBridgeCreateFromSpecRollbackTest::RunTest(const FString& Paramete
 	// doesn't depend on internal helpers; AssetNotFound is the expected error from DescribeBlueprint.
 	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(AssetPath));
 	return BlueprintBridgeTests::ExpectErrorCode(*this, DescribeResponse, TEXT("AssetNotFound"));
+}
+
+namespace BlueprintBridgeTests
+{
+// Create a function via ApplySemanticFunction returning a literal Out=int. Returns true on success.
+static bool CreateInitialFunction(FAutomationTestBase& Test, const FTestBlueprintAsset& Asset, const FString& FunctionName, int32 InitialValue)
+{
+	TSharedRef<FJsonObject> Params = MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), FunctionName);
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("name"), TEXT("Out"));
+	Out->SetStringField(TEXT("category"), TEXT("int"));
+	Outputs.Add(MakeShared<FJsonValueObject>(Out));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), InitialValue);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+	return ExpectSuccess(Test, ExecuteJsonRequest(TEXT("ApplySemanticFunction"), Params));
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeReplaceFunctionBodyTest, "BlueprintBridge.Blueprint.ReplaceSemanticFunction.Body", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeReplaceFunctionBodyTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ReplBody"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	if (!BlueprintBridgeTests::CreateInitialFunction(*this, Asset, TEXT("Body"), 1))
+	{
+		return false;
+	}
+
+	// Count nodes via SummarizeBlueprintGraph before/after — body change should preserve the count of result nodes
+	// while function-call nodes for the new IR aren't present (return-with-literal lowers to defaults + exec links only).
+	// Easiest verification: replace with a different literal, then read the result default via DescribeGraphFull.
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("Body"));
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 99);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ReplaceSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+
+	// Verify the new default landed: DescribeGraphFull on the function, look for result-node Out pin default "99".
+	const TSharedRef<FJsonObject> Describe = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("Body")));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Describe))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Describe);
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	bool bFoundNewDefault = false;
+	if (Result && (*Result)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes)
+	{
+		for (const TSharedPtr<FJsonValue>& N : *Nodes)
+		{
+			const TSharedPtr<FJsonObject>* NObj = nullptr;
+			FString ClassName;
+			if (!N->TryGetObject(NObj) || !NObj) continue;
+			(*NObj)->TryGetStringField(TEXT("class"), ClassName);
+			if (!ClassName.Contains(TEXT("K2Node_FunctionResult"))) continue;
+			const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+			if (!(*NObj)->TryGetArrayField(TEXT("pins"), Pins) || !Pins) continue;
+			for (const TSharedPtr<FJsonValue>& P : *Pins)
+			{
+				const TSharedPtr<FJsonObject>* PObj = nullptr;
+				if (!P->TryGetObject(PObj) || !PObj) continue;
+				FString PinName, DefaultValue;
+				(*PObj)->TryGetStringField(TEXT("name"), PinName);
+				(*PObj)->TryGetStringField(TEXT("defaultValue"), DefaultValue);
+				if (PinName == TEXT("Out") && DefaultValue == TEXT("99"))
+				{
+					bFoundNewDefault = true;
+				}
+			}
+		}
+	}
+	return TestTrue(TEXT("Out default should reflect the replaced body (99)."), bFoundNewDefault);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeReplaceFunctionPreservesSignatureTest, "BlueprintBridge.Blueprint.ReplaceSemanticFunction.PreservesSignature", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeReplaceFunctionPreservesSignatureTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ReplSigKeep"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	if (!BlueprintBridgeTests::CreateInitialFunction(*this, Asset, TEXT("Keep"), 1))
+	{
+		return false;
+	}
+
+	// Replace WITHOUT providing inputs/outputs. Signature (Out: int) should survive.
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("Keep"));
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 7);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ReplaceSemanticFunction"), Params)))
+	{
+		return false;
+	}
+
+	// Verify the Out output pin is still present.
+	const TSharedRef<FJsonObject> Summary = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SummarizeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Summary))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Summary);
+	const TSharedPtr<FJsonObject>* Graphs = nullptr;
+	const TArray<TSharedPtr<FJsonValue>>* Functions = nullptr;
+	bool bSignatureKept = false;
+	if (Result && (*Result)->TryGetObjectField(TEXT("graphs"), Graphs) && Graphs && (*Graphs)->TryGetArrayField(TEXT("functions"), Functions) && Functions)
+	{
+		for (const TSharedPtr<FJsonValue>& F : *Functions)
+		{
+			const TSharedPtr<FJsonObject>* FObj = nullptr;
+			FString FName;
+			if (!F->TryGetObject(FObj) || !FObj) continue;
+			(*FObj)->TryGetStringField(TEXT("name"), FName);
+			if (FName != TEXT("Keep")) continue;
+			const TSharedPtr<FJsonObject>* Sig = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* Outputs = nullptr;
+			if (!(*FObj)->TryGetObjectField(TEXT("signature"), Sig) || !Sig) continue;
+			if (!(*Sig)->TryGetArrayField(TEXT("outputs"), Outputs) || !Outputs) continue;
+			for (const TSharedPtr<FJsonValue>& O : *Outputs)
+			{
+				const TSharedPtr<FJsonObject>* OObj = nullptr;
+				FString OName;
+				if (O->TryGetObject(OObj) && OObj && (*OObj)->TryGetStringField(TEXT("name"), OName) && OName == TEXT("Out"))
+				{
+					bSignatureKept = true;
+				}
+			}
+		}
+	}
+	return TestTrue(TEXT("Original 'Out' output pin should survive when inputs/outputs are omitted."), bSignatureKept);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeReplaceFunctionRollbackTest, "BlueprintBridge.Blueprint.ReplaceSemanticFunction.Rollback", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeReplaceFunctionRollbackTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ReplRollback"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	if (!BlueprintBridgeTests::CreateInitialFunction(*this, Asset, TEXT("Rb"), 5))
+	{
+		return false;
+	}
+
+	// Replace with IR that fails lowering (non-existent function) — transaction should roll back the wipe.
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("Rb"));
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> BadCall = MakeShared<FJsonObject>();
+	BadCall->SetStringField(TEXT("call"), TEXT("/Script/Engine.NonExistentClass.NoSuchPureFn"));
+	ReturnFields->SetObjectField(TEXT("Out"), BadCall);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ReplaceSemanticFunction"), Params);
+	bool bOk = true;
+	Response->TryGetBoolField(TEXT("ok"), bOk);
+	TestFalse(TEXT("Bad lowering should fail."), bOk);
+
+	// Verify rollback: original default value (5) should still be wired on the result node.
+	const TSharedRef<FJsonObject> Describe = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGraphFull"), BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, TEXT("Rb")));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Describe))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Describe);
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	bool bOriginalDefaultIntact = false;
+	if (Result && (*Result)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes)
+	{
+		for (const TSharedPtr<FJsonValue>& N : *Nodes)
+		{
+			const TSharedPtr<FJsonObject>* NObj = nullptr;
+			FString ClassName;
+			if (!N->TryGetObject(NObj) || !NObj) continue;
+			(*NObj)->TryGetStringField(TEXT("class"), ClassName);
+			if (!ClassName.Contains(TEXT("K2Node_FunctionResult"))) continue;
+			const TArray<TSharedPtr<FJsonValue>>* Pins = nullptr;
+			if (!(*NObj)->TryGetArrayField(TEXT("pins"), Pins) || !Pins) continue;
+			for (const TSharedPtr<FJsonValue>& P : *Pins)
+			{
+				const TSharedPtr<FJsonObject>* PObj = nullptr;
+				if (!P->TryGetObject(PObj) || !PObj) continue;
+				FString PinName, DefaultValue;
+				(*PObj)->TryGetStringField(TEXT("name"), PinName);
+				(*PObj)->TryGetStringField(TEXT("defaultValue"), DefaultValue);
+				if (PinName == TEXT("Out") && DefaultValue == TEXT("5"))
+				{
+					bOriginalDefaultIntact = true;
+				}
+			}
+		}
+	}
+	return TestTrue(TEXT("Original default (5) should be intact after rollback."), bOriginalDefaultIntact);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeReplaceFunctionCompileTest, "BlueprintBridge.Blueprint.ReplaceSemanticFunction.Compile", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeReplaceFunctionCompileTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ReplCompile"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	if (!BlueprintBridgeTests::CreateInitialFunction(*this, Asset, TEXT("C"), 0))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("C"));
+	Params->SetBoolField(TEXT("compile"), true);
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 42);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ReplaceSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString CompileStatus;
+	TestTrue(TEXT("Compile status should be present."), Result && (*Result)->TryGetStringField(TEXT("compileStatus"), CompileStatus));
+	return TestEqual(TEXT("Compiled function should be UpToDate."), CompileStatus, FString(TEXT("UpToDate")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeResolveSymbolEngineFunctionTest, "BlueprintBridge.Reflection.ResolveSymbol.EngineFunction", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeResolveSymbolEngineFunctionTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("kind"), TEXT("function"));
+	Params->SetStringField(TEXT("class"), TEXT("/Script/Engine.Actor"));
+	Params->SetStringField(TEXT("member"), TEXT("K2_GetActorLocation"));
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ResolveSymbol"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result)
+	{
+		return false;
+	}
+	FString Kind;
+	(*Result)->TryGetStringField(TEXT("kind"), Kind);
+	TestEqual(TEXT("Engine UFUNCTION should resolve as kind=function (has ModuleRelativePath)."), Kind, FString(TEXT("function")));
+	FString HeaderPath;
+	TestTrue(TEXT("Engine UFUNCTION should expose headerPath."), (*Result)->TryGetStringField(TEXT("headerPath"), HeaderPath) && HeaderPath.EndsWith(TEXT(".h")));
+	FString Signature;
+	TestTrue(TEXT("Should expose C++-style signature."), (*Result)->TryGetStringField(TEXT("signature"), Signature) && Signature.Contains(TEXT("K2_GetActorLocation")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeResolveSymbolProjectClassTest, "BlueprintBridge.Reflection.ResolveSymbol.ProjectClass", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeResolveSymbolProjectClassTest::RunTest(const FString& Parameters)
+{
+	// Use UObject as a stand-in for "any C++ class with ModuleRelativePath" — guaranteed present on every UE install,
+	// and avoids hard-coding a Biscuit-specific class that may rename. The point of the test is the resolution path,
+	// not which project the class lives in.
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("kind"), TEXT("class"));
+	Params->SetStringField(TEXT("class"), TEXT("/Script/CoreUObject.Object"));
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ResolveSymbol"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString Module;
+	TestTrue(TEXT("Should expose module name."), Result && (*Result)->TryGetStringField(TEXT("module"), Module) && !Module.IsEmpty());
+	FString HeaderPath;
+	TestTrue(TEXT("Should expose headerPath."), Result && (*Result)->TryGetStringField(TEXT("headerPath"), HeaderPath) && HeaderPath.EndsWith(TEXT(".h")));
+	// absoluteHeaderPath only resolves for game-module/plugin sources; engine modules are intentionally skipped.
+	// So we don't assert its presence here — only that when present, it points to an existing file.
+	FString Absolute;
+	if (Result && (*Result)->TryGetStringField(TEXT("absoluteHeaderPath"), Absolute))
+	{
+		TestTrue(TEXT("absoluteHeaderPath when reported should exist on disk."), FPaths::FileExists(Absolute));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeResolveSymbolBlueprintFunctionTest, "BlueprintBridge.Reflection.ResolveSymbol.BlueprintFunction", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeResolveSymbolBlueprintFunctionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ResolveBP"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	TSharedRef<FJsonObject> CreateFnParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	CreateFnParams->SetStringField(TEXT("function"), TEXT("BPOnlyFunction"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("CreateFunctionGraph"), CreateFnParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("kind"), TEXT("function"));
+	Params->SetStringField(TEXT("class"), Asset.AssetPath);
+	Params->SetStringField(TEXT("member"), TEXT("BPOnlyFunction"));
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ResolveSymbol"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString Kind;
+	TestTrue(TEXT("BP-defined function should resolve as kind=blueprint (no C++ source)."), Result && (*Result)->TryGetStringField(TEXT("kind"), Kind) && Kind == TEXT("blueprint"));
+	TestFalse(TEXT("BP-defined function should not expose headerPath."), Result && (*Result)->HasField(TEXT("headerPath")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeResolveSymbolUnknownTest, "BlueprintBridge.Reflection.ResolveSymbol.Unknown", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeResolveSymbolUnknownTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("kind"), TEXT("function"));
+	Params->SetStringField(TEXT("class"), TEXT("/Script/Engine.Actor"));
+	Params->SetStringField(TEXT("member"), TEXT("NoSuchFunctionExistsHere"));
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ResolveSymbol"), Params);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("FunctionNotFound"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeApplyAndFixSuccessTest, "BlueprintBridge.Blueprint.ApplyAndFix.Success", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeApplyAndFixSuccessTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FixOk"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("Constant"));
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	TSharedRef<FJsonObject> Out = MakeShared<FJsonObject>();
+	Out->SetStringField(TEXT("name"), TEXT("Out"));
+	Out->SetStringField(TEXT("category"), TEXT("int"));
+	Outputs.Add(MakeShared<FJsonValueObject>(Out));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 42);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyAndFix"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
+	{
+		AddError(FString::Printf(TEXT("ApplyAndFix failed: %s"), *BlueprintBridgeTests::GetErrorMessage(Response)));
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	FString CompileStatus;
+	TestTrue(TEXT("Success response should carry compileStatus."), Result && (*Result)->TryGetStringField(TEXT("compileStatus"), CompileStatus));
+	TestEqual(TEXT("compileStatus should be UpToDate."), CompileStatus, FString(TEXT("UpToDate")));
+	TestTrue(TEXT("Success response should include resolutions map."), Result && (*Result)->HasField(TEXT("resolutions")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeApplyAndFixCompileErrorTest, "BlueprintBridge.Blueprint.ApplyAndFix.CompileError", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeApplyAndFixCompileErrorTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FixErr"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	// Latent function (KismetSystemLibrary.Delay) in a function graph — Blueprint compiler errors
+	// with "Latent functions can only be called in event graphs". A reliable, narrow compile error.
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BadFn"));
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+
+	TSharedRef<FJsonObject> CallStmt = MakeShared<FJsonObject>();
+	CallStmt->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.Delay"));
+	TSharedRef<FJsonObject> CallArgs = MakeShared<FJsonObject>();
+	CallArgs->SetNumberField(TEXT("Duration"), 1.0);
+	CallStmt->SetObjectField(TEXT("args"), CallArgs);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+	
+	AddExpectedError(TEXT("contains a latent call, which cannot exist outside of the event graph"),
+	EAutomationExpectedErrorFlags::Contains,
+	1);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyAndFix"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("CompileFailed")))
+	{
+		AddError(FString::Printf(TEXT("Underlying error message: %s"), *BlueprintBridgeTests::GetErrorMessage(Response)));
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* ErrorObj = nullptr;
+	Response->TryGetObjectField(TEXT("error"), ErrorObj);
+	if (!ErrorObj)
+	{
+		return false;
+	}
+	TestTrue(TEXT("CompileFailed should include compileStatus."), (*ErrorObj)->HasField(TEXT("compileStatus")));
+	const TArray<TSharedPtr<FJsonValue>>* Messages = nullptr;
+	TestTrue(TEXT("CompileFailed should include non-empty messages array."), (*ErrorObj)->TryGetArrayField(TEXT("messages"), Messages) && Messages != nullptr && Messages->Num() > 0);
+	TestTrue(TEXT("CompileFailed should echo appliedPatch for IR↔node correlation."), (*ErrorObj)->HasField(TEXT("appliedPatch")));
+	TestTrue(TEXT("CompileFailed should echo resolutions."), (*ErrorObj)->HasField(TEXT("resolutions")));
+	bool bRolledBack = true;
+	TestTrue(TEXT("rolledBack should be reported."), (*ErrorObj)->TryGetBoolField(TEXT("rolledBack"), bRolledBack));
+	TestFalse(TEXT("Default is no rollback — the function should still be in the BP after a compile error."), bRolledBack);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeApplyAndFixRollbackTest, "BlueprintBridge.Blueprint.ApplyAndFix.Rollback", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeApplyAndFixRollbackTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FixRollback"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BadFn"));
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+	Params->SetBoolField(TEXT("rollbackOnCompileError"), true);
+
+	TSharedRef<FJsonObject> CallStmt = MakeShared<FJsonObject>();
+	CallStmt->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.Delay"));
+	TSharedRef<FJsonObject> CallArgs = MakeShared<FJsonObject>();
+	CallArgs->SetNumberField(TEXT("Duration"), 1.0);
+	CallStmt->SetObjectField(TEXT("args"), CallArgs);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyAndFix"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("CompileFailed")))
+	{
+		AddError(FString::Printf(TEXT("Underlying error message: %s"), *BlueprintBridgeTests::GetErrorMessage(Response)));
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* ErrorObj = nullptr;
+	Response->TryGetObjectField(TEXT("error"), ErrorObj);
+	bool bRolledBack = false;
+	TestTrue(TEXT("rolledBack should be true when rollbackOnCompileError is set."), ErrorObj && (*ErrorObj)->TryGetBoolField(TEXT("rolledBack"), bRolledBack) && bRolledBack);
+
+	// Verify rollback: BadFn function should NOT exist on the Blueprint.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	const TArray<TSharedPtr<FJsonValue>>* Graphs = nullptr;
+	bool bFoundBadFn = false;
+	if (DescribeResult && (*DescribeResult)->TryGetArrayField(TEXT("graphs"), Graphs) && Graphs)
+	{
+		for (const TSharedPtr<FJsonValue>& G : *Graphs)
+		{
+			FString Name;
+			if (G->TryGetString(Name) && Name == TEXT("BadFn"))
+			{
+				bFoundBadFn = true;
+			}
+		}
+	}
+	TestFalse(TEXT("Rolled-back function should not appear in DescribeBlueprint graphs list."), bFoundBadFn);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeApplyAndFixMessagesShapeTest, "BlueprintBridge.Blueprint.ApplyAndFix.MessagesShape", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeApplyAndFixMessagesShapeTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("FixMsg"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BadFn"));
+	Params->SetBoolField(TEXT("createIfMissing"), true);
+	TSharedRef<FJsonObject> CallStmt = MakeShared<FJsonObject>();
+	CallStmt->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.Delay"));
+	TSharedRef<FJsonObject> CallArgs = MakeShared<FJsonObject>();
+	CallArgs->SetNumberField(TEXT("Duration"), 1.0);
+	CallStmt->SetObjectField(TEXT("args"), CallArgs);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CallStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+	
+	AddExpectedError(TEXT("contains a latent call, which cannot exist outside of the event graph"),
+	EAutomationExpectedErrorFlags::Contains,
+	1);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ApplyAndFix"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("CompileFailed")))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* ErrorObj = nullptr;
+	Response->TryGetObjectField(TEXT("error"), ErrorObj);
+	const TArray<TSharedPtr<FJsonValue>>* Messages = nullptr;
+	if (!ErrorObj || !(*ErrorObj)->TryGetArrayField(TEXT("messages"), Messages) || !Messages || Messages->Num() == 0)
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* FirstMsg = nullptr;
+	(*Messages)[0]->TryGetObject(FirstMsg);
+	TestTrue(TEXT("Message should carry severity."), FirstMsg && (*FirstMsg)->HasField(TEXT("severity")));
+	TestTrue(TEXT("Message should carry message text."), FirstMsg && (*FirstMsg)->HasField(TEXT("message")));
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetCommandErrorsTest, "BlueprintBridge.Blueprint.AssetCommandErrors", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

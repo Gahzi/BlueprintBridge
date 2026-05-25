@@ -39,6 +39,7 @@ TSharedRef<FJsonObject> DescribeProperty(const FString& Id, const TSharedPtr<FJs
 TSharedRef<FJsonObject> DescribeDelegate(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CheckDelegateCompatibility(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindReflectionSymbols(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ResolveSymbol(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeComponents(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeWidgetTree(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeSubobjects(const FString& Id, const TSharedPtr<FJsonObject>& Params);
@@ -66,6 +67,8 @@ TSharedRef<FJsonObject> ApplyGraphPatch(const FString& Id, const TSharedPtr<FJso
 TSharedRef<FJsonObject> ApplyFunctionPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> LowerSemanticFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ApplySemanticFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ApplyAndFix(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ReplaceSemanticFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ApplyGraphSnippet(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ExportGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ImportGraphPatch(const FString& Id, const TSharedPtr<FJsonObject>& Params);

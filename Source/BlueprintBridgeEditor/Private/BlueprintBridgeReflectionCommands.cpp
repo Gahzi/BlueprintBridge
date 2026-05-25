@@ -992,4 +992,259 @@ TSharedRef<FJsonObject> FindReflectionSymbols(const FString& Id, const TSharedPt
 	Result->SetArrayField(TEXT("results"), ResultValues);
 	return MakeSuccess(Id, Result);
 }
+
+static FString ExtractModuleNameFromClass(UClass* Class)
+{
+	if (!Class)
+	{
+		return FString();
+	}
+	const UPackage* Package = Class->GetPackage();
+	if (!Package)
+	{
+		return FString();
+	}
+	const FString PackageName = Package->GetName();
+	if (PackageName.StartsWith(TEXT("/Script/")))
+	{
+		return PackageName.RightChop(8);
+	}
+	return FString();
+}
+
+static FString ResolveModuleSourceRoot(const FString& ModuleName)
+{
+	if (ModuleName.IsEmpty())
+	{
+		return FString();
+	}
+	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(ModuleName))
+	{
+		const FString PluginSource = Plugin->GetBaseDir() / TEXT("Source") / ModuleName;
+		if (FPaths::DirectoryExists(PluginSource))
+		{
+			return PluginSource;
+		}
+	}
+	const FString GameModuleSource = FPaths::ConvertRelativePathToFull(FPaths::GameSourceDir() / ModuleName);
+	if (FPaths::DirectoryExists(GameModuleSource))
+	{
+		return GameModuleSource;
+	}
+	// Engine modules have varying layouts (Runtime/Editor/Developer/...) and aren't worth resolving here.
+	return FString();
+}
+
+static FString BuildFunctionSignatureString(UFunction* Function)
+{
+	if (!Function)
+	{
+		return FString();
+	}
+	FProperty* ReturnProperty = nullptr;
+	TArray<FString> ParamStrings;
+	for (TFieldIterator<FProperty> It(Function); It && It->HasAnyPropertyFlags(CPF_Parm); ++It)
+	{
+		FProperty* Property = *It;
+		if (Property->HasAnyPropertyFlags(CPF_ReturnParm))
+		{
+			ReturnProperty = Property;
+			continue;
+		}
+		FString ParamStr;
+		if (Property->HasAnyPropertyFlags(CPF_ConstParm))
+		{
+			ParamStr += TEXT("const ");
+		}
+		ParamStr += Property->GetCPPType();
+		if (Property->HasAnyPropertyFlags(CPF_ReferenceParm))
+		{
+			ParamStr += TEXT("&");
+		}
+		ParamStr += TEXT(" ");
+		ParamStr += Property->GetName();
+		ParamStrings.Add(ParamStr);
+	}
+	const FString ReturnTypeStr = ReturnProperty ? ReturnProperty->GetCPPType() : TEXT("void");
+	FString Signature = FString::Printf(TEXT("%s %s(%s)"), *ReturnTypeStr, *Function->GetName(), *FString::Join(ParamStrings, TEXT(", ")));
+	if (Function->HasAnyFunctionFlags(FUNC_Const))
+	{
+		Signature += TEXT(" const");
+	}
+	return Signature;
+}
+
+// Fills the symbol common fields: module + headerPath + absoluteHeaderPath + comment + metadata.
+// Returns true if the field was a reflected C++ symbol with ModuleRelativePath, false otherwise.
+static bool FillSymbolSourceLocation(const FField* Field, TSharedRef<FJsonObject>& OutResult)
+{
+	if (!Field)
+	{
+		return false;
+	}
+	if (!Field->HasMetaData(TEXT("ModuleRelativePath")))
+	{
+		return false;
+	}
+	const UStruct* Owner = Field->GetOwnerStruct();
+	const FString ModuleName = ExtractModuleNameFromClass(Owner ? Owner->GetClass() : nullptr);
+	// FProperty's owner is a UStruct; ExtractModuleNameFromClass wants a UClass. Fall back via package.
+	FString DerivedModule = ModuleName;
+	if (DerivedModule.IsEmpty() && Owner)
+	{
+		const UPackage* Package = Owner->GetPackage();
+		if (Package && Package->GetName().StartsWith(TEXT("/Script/")))
+		{
+			DerivedModule = Package->GetName().RightChop(8);
+		}
+	}
+
+	const FString HeaderPath = Field->GetMetaData(TEXT("ModuleRelativePath"));
+	OutResult->SetStringField(TEXT("module"), DerivedModule);
+	OutResult->SetStringField(TEXT("headerPath"), HeaderPath);
+	const FString SourceRoot = ResolveModuleSourceRoot(DerivedModule);
+	if (!SourceRoot.IsEmpty())
+	{
+		const FString Absolute = FPaths::ConvertRelativePathToFull(SourceRoot / HeaderPath);
+		if (FPaths::FileExists(Absolute))
+		{
+			OutResult->SetStringField(TEXT("absoluteHeaderPath"), Absolute);
+		}
+	}
+	if (Field->HasMetaData(TEXT("Comment")))
+	{
+		OutResult->SetStringField(TEXT("comment"), Field->GetMetaData(TEXT("Comment")));
+	}
+	return true;
+}
+
+static bool FillSymbolSourceLocation(const UField* Field, TSharedRef<FJsonObject>& OutResult)
+{
+	if (!Field)
+	{
+		return false;
+	}
+	if (!Field->HasMetaData(TEXT("ModuleRelativePath")))
+	{
+		return false;
+	}
+	FString ModuleName;
+	if (const UClass* AsClass = Cast<UClass>(Field))
+	{
+		ModuleName = ExtractModuleNameFromClass(const_cast<UClass*>(AsClass));
+	}
+	if (ModuleName.IsEmpty())
+	{
+		// UField subclasses (UFunction, UEnum, ...) live in /Script/<ModuleName> packages, same shape as UClass.
+		const UPackage* Package = Field->GetPackage();
+		if (Package && Package->GetName().StartsWith(TEXT("/Script/")))
+		{
+			ModuleName = Package->GetName().RightChop(8);
+		}
+	}
+
+	const FString HeaderPath = Field->GetMetaData(TEXT("ModuleRelativePath"));
+	OutResult->SetStringField(TEXT("module"), ModuleName);
+	OutResult->SetStringField(TEXT("headerPath"), HeaderPath);
+	const FString SourceRoot = ResolveModuleSourceRoot(ModuleName);
+	if (!SourceRoot.IsEmpty())
+	{
+		const FString Absolute = FPaths::ConvertRelativePathToFull(SourceRoot / HeaderPath);
+		if (FPaths::FileExists(Absolute))
+		{
+			OutResult->SetStringField(TEXT("absoluteHeaderPath"), Absolute);
+		}
+	}
+	if (Field->HasMetaData(TEXT("Comment")))
+	{
+		OutResult->SetStringField(TEXT("comment"), Field->GetMetaData(TEXT("Comment")));
+	}
+	return true;
+}
+
+TSharedRef<FJsonObject> ResolveSymbol(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString Kind;
+	FString ClassPath;
+	if (!TryGetRequiredString(Params, TEXT("kind"), Kind) || !TryGetRequiredString(Params, TEXT("class"), ClassPath))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ResolveSymbol requires params.kind and params.class."));
+	}
+
+	UClass* Class = ResolveReflectionClass(ClassPath);
+	if (!Class)
+	{
+		return MakeBridgeError(Id, TEXT("ClassNotFound"), FString::Printf(TEXT("Could not resolve class '%s'."), *ClassPath));
+	}
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("owner"), Class->GetPathName());
+
+	if (Kind.Equals(TEXT("class"), ESearchCase::IgnoreCase))
+	{
+		Result->SetStringField(TEXT("name"), Class->GetName());
+		Result->SetObjectField(TEXT("metadata"), MakeFieldMetadata(Class));
+		if (!FillSymbolSourceLocation(Class, Result))
+		{
+			Result->SetStringField(TEXT("kind"), TEXT("blueprint"));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("kind"), TEXT("class"));
+		}
+		return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
+	}
+
+	FString MemberName;
+	if (!TryGetRequiredString(Params, TEXT("member"), MemberName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ResolveSymbol with kind=function|property|delegate requires params.member."));
+	}
+
+	if (Kind.Equals(TEXT("function"), ESearchCase::IgnoreCase))
+	{
+		UFunction* Function = FindFunctionByName(Class, MemberName);
+		if (!Function)
+		{
+			return MakeBridgeError(Id, TEXT("FunctionNotFound"), FString::Printf(TEXT("Could not find function '%s' on '%s'."), *MemberName, *ClassPath));
+		}
+		Result->SetStringField(TEXT("name"), Function->GetName());
+		Result->SetStringField(TEXT("signature"), BuildFunctionSignatureString(Function));
+		Result->SetObjectField(TEXT("metadata"), MakeFieldMetadata(Function));
+		if (!FillSymbolSourceLocation(Function, Result))
+		{
+			Result->SetStringField(TEXT("kind"), TEXT("blueprint"));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("kind"), TEXT("function"));
+		}
+		return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
+	}
+
+	if (Kind.Equals(TEXT("property"), ESearchCase::IgnoreCase) || Kind.Equals(TEXT("delegate"), ESearchCase::IgnoreCase))
+	{
+		FProperty* Property = FindPropertyByName(Class, MemberName);
+		if (!Property)
+		{
+			return MakeBridgeError(Id, TEXT("PropertyNotFound"), FString::Printf(TEXT("Could not find property '%s' on '%s'."), *MemberName, *ClassPath));
+		}
+		Result->SetStringField(TEXT("name"), Property->GetName());
+		Result->SetStringField(TEXT("cppType"), Property->GetCPPType());
+		Result->SetObjectField(TEXT("metadata"), MakeFieldMetadata(Property));
+		const bool bIsDelegate = GetDelegateSignature(Property) != nullptr;
+		const FString ExpectedKind = bIsDelegate ? TEXT("delegate") : TEXT("property");
+		if (!FillSymbolSourceLocation(Property, Result))
+		{
+			Result->SetStringField(TEXT("kind"), TEXT("blueprint"));
+		}
+		else
+		{
+			Result->SetStringField(TEXT("kind"), ExpectedKind);
+		}
+		return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
+	}
+
+	return MakeBridgeError(Id, TEXT("InvalidParams"), FString::Printf(TEXT("Unknown kind '%s'. Expected one of: class, function, property, delegate."), *Kind));
+}
 } // namespace BlueprintBridge

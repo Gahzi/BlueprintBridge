@@ -3,6 +3,7 @@
 #include "BlueprintBridgeCommandsPrivate.h"
 
 #include "BlueprintBridgeSemanticLowering.h"
+#include "Kismet2/CompilerResultsLog.h"
 
 namespace BlueprintBridge
 {
@@ -1290,6 +1291,22 @@ TSharedRef<FJsonObject> ApplyFunctionPatch(const FString& Id, const TSharedPtr<F
 	const TSharedPtr<FJsonObject>* Body = nullptr;
 	if (Params->TryGetObjectField(TEXT("body"), Body) && Body != nullptr && Body->IsValid())
 	{
+		// Body patches frequently link to result.execute (Semantic IR auto-fall-through, explicit `return`).
+		// Void functions don't have a result node by default — UE only lazy-creates it when outputs are added.
+		// Ensure one exists before applying the body so void-function bodies resolve `result` references.
+		if (!FindFunctionResultNode(Graph))
+		{
+			FGraphNodeCreator<UK2Node_FunctionResult> ResultNodeCreator(*Graph);
+			UK2Node_FunctionResult* ResultNode = ResultNodeCreator.CreateNode();
+			ResultNode->NodePosX = 320;
+			ResultNode->NodePosY = 0;
+			if (UK2Node_FunctionEntry* EntryNode = FindFunctionEntryNode(Graph))
+			{
+				ResultNode->FunctionReference = EntryNode->FunctionReference;
+			}
+			ResultNodeCreator.Finalize();
+		}
+
 		TSharedRef<FJsonObject> PatchParams = CloneJsonObjectWithBindings(*Body, nullptr);
 		PatchParams->SetStringField(TEXT("asset"), AssetPath);
 		PatchParams->SetStringField(TEXT("graph"), Graph->GetName());
@@ -1570,6 +1587,190 @@ TSharedRef<FJsonObject> ApplySemanticFunction(const FString& Id, const TSharedPt
 		}
 	}
 	return Response;
+}
+
+TSharedRef<FJsonObject> ApplyAndFix(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString FunctionName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("function"), FunctionName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ApplyAndFix requires params.asset and params.function."));
+	}
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	bool bRollbackOnCompileError = false;
+	bool bCreateIfMissing = false;
+	Params->TryGetBoolField(TEXT("rollbackOnCompileError"), bRollbackOnCompileError);
+	Params->TryGetBoolField(TEXT("createIfMissing"), bCreateIfMissing);
+
+	FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "ApplyAndFix", "Blueprint Bridge: Apply And Fix"));
+
+	FSemanticLowerResult LowerResult;
+	FString ErrorPointer;
+	FString ErrorMessage;
+	if (!LowerSemanticFunctionIR(Blueprint, Params, LowerResult, ErrorPointer, ErrorMessage))
+	{
+		Transaction.Cancel();
+		return MakeSemanticLoweringError(Id, ErrorPointer, ErrorMessage);
+	}
+
+	TSharedRef<FJsonObject> ApplyParams = MakeShared<FJsonObject>();
+	ApplyParams->SetStringField(TEXT("asset"), AssetPath);
+	ApplyParams->SetStringField(TEXT("function"), FunctionName);
+	ApplyParams->SetBoolField(TEXT("createIfMissing"), bCreateIfMissing);
+	ApplyParams->SetBoolField(TEXT("compile"), false);
+
+	const TArray<TSharedPtr<FJsonValue>>* Inputs = nullptr;
+	if (Params->TryGetArrayField(TEXT("inputs"), Inputs) && Inputs != nullptr)
+	{
+		ApplyParams->SetArrayField(TEXT("inputs"), *Inputs);
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Outputs = nullptr;
+	if (Params->TryGetArrayField(TEXT("outputs"), Outputs) && Outputs != nullptr)
+	{
+		ApplyParams->SetArrayField(TEXT("outputs"), *Outputs);
+	}
+	ApplyParams->SetObjectField(TEXT("body"), LowerResult.Patch);
+
+	TSharedRef<FJsonObject> ApplyResponse = ApplyFunctionPatch(Id, ApplyParams);
+	bool bApplyOk = false;
+	if (!ApplyResponse->TryGetBoolField(TEXT("ok"), bApplyOk) || !bApplyOk)
+	{
+		Transaction.Cancel();
+		return ApplyResponse;
+	}
+
+	FCompilerResultsLog ResultsLog;
+	ResultsLog.SetSourcePath(Blueprint->GetPathName());
+	FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::None, &ResultsLog);
+	const bool bCompileSuccess = (ResultsLog.NumErrors == 0) && (Blueprint->Status != BS_Error);
+
+	if (!bCompileSuccess)
+	{
+		if (bRollbackOnCompileError)
+		{
+			Transaction.Cancel();
+		}
+		TSharedRef<FJsonObject> Response = MakeBridgeError(Id, TEXT("CompileFailed"), FString::Printf(TEXT("Blueprint compiled with %d error(s)."), ResultsLog.NumErrors));
+		const TSharedPtr<FJsonObject>* ErrObj = nullptr;
+		if (Response->TryGetObjectField(TEXT("error"), ErrObj) && ErrObj != nullptr && (*ErrObj).IsValid())
+		{
+			(*ErrObj)->SetStringField(TEXT("compileStatus"), GetBlueprintStatusString(Blueprint->Status));
+			(*ErrObj)->SetNumberField(TEXT("errorCount"), ResultsLog.NumErrors);
+			(*ErrObj)->SetNumberField(TEXT("warningCount"), ResultsLog.NumWarnings);
+			(*ErrObj)->SetArrayField(TEXT("messages"), BuildCompileMessages(ResultsLog));
+			(*ErrObj)->SetObjectField(TEXT("appliedPatch"), LowerResult.Patch);
+			(*ErrObj)->SetObjectField(TEXT("resolutions"), LowerResult.Resolutions);
+			(*ErrObj)->SetBoolField(TEXT("rolledBack"), bRollbackOnCompileError);
+		}
+		return Response;
+	}
+
+	const TSharedPtr<FJsonObject>* ResultObj = nullptr;
+	if (ApplyResponse->TryGetObjectField(TEXT("result"), ResultObj) && ResultObj != nullptr && (*ResultObj).IsValid())
+	{
+		(*ResultObj)->SetStringField(TEXT("compileStatus"), GetBlueprintStatusString(Blueprint->Status));
+		(*ResultObj)->SetNumberField(TEXT("warningCount"), ResultsLog.NumWarnings);
+		(*ResultObj)->SetObjectField(TEXT("resolutions"), LowerResult.Resolutions);
+	}
+	return ApplyResponse;
+}
+
+TSharedRef<FJsonObject> ReplaceSemanticFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString FunctionName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) || !TryGetRequiredString(Params, TEXT("function"), FunctionName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ReplaceSemanticFunction requires params.asset and params.function."));
+	}
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+	UEdGraph* Graph = FindBlueprintGraph(Blueprint, FunctionName);
+	if (!Graph)
+	{
+		return MakeBridgeError(Id, TEXT("GraphNotFound"), FString::Printf(TEXT("Function graph '%s' does not exist. Use ApplySemanticFunction with createIfMissing for creation."), *FunctionName));
+	}
+
+	bool bCompile = false;
+	Params->TryGetBoolField(TEXT("compile"), bCompile);
+
+	FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "ReplaceSemanticFunction", "Blueprint Bridge: Replace Semantic Function"));
+	Blueprint->Modify();
+	Graph->Modify();
+
+	// Wipe non-entry/non-result nodes. Collect first so iteration is stable across removals.
+	TArray<UEdGraphNode*> ToRemove;
+	ToRemove.Reserve(Graph->Nodes.Num());
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		if (Node->IsA<UK2Node_FunctionEntry>() || Node->IsA<UK2Node_FunctionResult>())
+		{
+			continue;
+		}
+		ToRemove.Add(Node);
+	}
+	for (UEdGraphNode* Node : ToRemove)
+	{
+		Node->Modify();
+		Graph->RemoveNode(Node);
+	}
+
+	// Lower the new IR.
+	FSemanticLowerResult LowerResult;
+	FString ErrorPointer;
+	FString ErrorMessage;
+	if (!LowerSemanticFunctionIR(Blueprint, Params, LowerResult, ErrorPointer, ErrorMessage))
+	{
+		Transaction.Cancel();
+		return MakeSemanticLoweringError(Id, ErrorPointer, ErrorMessage);
+	}
+
+	// Apply via ApplyFunctionPatch (handles signature merge + body patch).
+	TSharedRef<FJsonObject> ApplyParams = MakeShared<FJsonObject>();
+	ApplyParams->SetStringField(TEXT("asset"), AssetPath);
+	ApplyParams->SetStringField(TEXT("function"), FunctionName);
+	ApplyParams->SetBoolField(TEXT("createIfMissing"), false);
+	ApplyParams->SetBoolField(TEXT("compile"), bCompile);
+
+	const TArray<TSharedPtr<FJsonValue>>* Inputs = nullptr;
+	if (Params->TryGetArrayField(TEXT("inputs"), Inputs) && Inputs != nullptr)
+	{
+		ApplyParams->SetArrayField(TEXT("inputs"), *Inputs);
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Outputs = nullptr;
+	if (Params->TryGetArrayField(TEXT("outputs"), Outputs) && Outputs != nullptr)
+	{
+		ApplyParams->SetArrayField(TEXT("outputs"), *Outputs);
+	}
+	ApplyParams->SetObjectField(TEXT("body"), LowerResult.Patch);
+
+	TSharedRef<FJsonObject> ApplyResponse = ApplyFunctionPatch(Id, ApplyParams);
+	bool bOk = false;
+	if (!ApplyResponse->TryGetBoolField(TEXT("ok"), bOk) || !bOk)
+	{
+		Transaction.Cancel();
+		return ApplyResponse;
+	}
+
+	const TSharedPtr<FJsonObject>* ResultObj = nullptr;
+	if (ApplyResponse->TryGetObjectField(TEXT("result"), ResultObj) && ResultObj != nullptr && (*ResultObj).IsValid())
+	{
+		(*ResultObj)->SetObjectField(TEXT("resolutions"), LowerResult.Resolutions);
+	}
+	return ApplyResponse;
 }
 
 } // namespace BlueprintBridge

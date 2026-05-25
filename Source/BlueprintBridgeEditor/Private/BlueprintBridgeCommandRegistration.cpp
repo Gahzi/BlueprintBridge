@@ -383,6 +383,14 @@ static TSharedPtr<FJsonObject> MakeFindFunctionsSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeResolveSymbolSchema()
+{
+	return AddFieldSelection(FSchemaBuilder::Object()
+		.RequiredStringEnum(TEXT("kind"), TEXT("Symbol kind."), { TEXT("class"), TEXT("function"), TEXT("property"), TEXT("delegate") })
+		.RequiredString(TEXT("class"), TEXT("Owner class path, e.g. /Script/Engine.Actor, or Blueprint asset path."))
+		.OptionalString(TEXT("member"), TEXT("Member name (function/property/delegate). Omit when kind=class."))).Build();
+}
+
 static TSharedPtr<FJsonObject> MakeDescribeFunctionSchema()
 {
 	return AddFieldSelection(FSchemaBuilder::Object()
@@ -647,6 +655,29 @@ static TSharedPtr<FJsonObject> MakeApplySemanticFunctionSchema()
 		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
 		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after applying."))
 		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to roll back created nodes on failure. Defaults true."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeApplyAndFixSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("function"), TEXT("Function graph name."))
+		.OptionalBoolean(TEXT("createIfMissing"), TEXT("Whether to create the function when missing."))
+		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
+		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.OptionalBoolean(TEXT("rollbackOnCompileError"), TEXT("Roll back the function body if compilation produces errors. Default false; the broken state is usually more useful for diagnosis."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeReplaceSemanticFunctionSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("function"), TEXT("Function graph name. Must already exist — use ApplySemanticFunction for creation."))
+		.OptionalArray(TEXT("inputs"), TEXT("Optional new function input pins. If omitted, the existing signature is preserved."))
+		.OptionalArray(TEXT("outputs"), TEXT("Optional new function output pins. If omitted, the existing signature is preserved."))
+		.OptionalArray(TEXT("flow"), TEXT("New Semantic IR statement list. Replaces the entire current body."))
+		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after replacing."))
 		.Build();
 }
 
@@ -1022,6 +1053,7 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("DescribeDelegate"), TEXT("Returns reflected delegate property and signature metadata."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeDescribeDelegateSchema(), &DescribeDelegate);
 	RegisterCommand(TEXT("CheckDelegateCompatibility"), TEXT("Checks whether a function signature is compatible with a delegate."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeCheckDelegateCompatibilitySchema(), &CheckDelegateCompatibility);
 	RegisterCommand(TEXT("FindReflectionSymbols"), TEXT("Finds loaded reflected classes, functions, properties, and delegates by name."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeFindReflectionSymbolsSchema(), &FindReflectionSymbols);
+	RegisterCommand(TEXT("ResolveSymbol"), TEXT("Resolves a reflected C++ symbol to its module + header path + doxygen comment + signature. Returns kind=blueprint for Blueprint-defined symbols (no C++ source)."), TEXT("Reflection"), ECommandRisk::ReadOnly, MakeResolveSymbolSchema(), &ResolveSymbol);
 	RegisterCommand(TEXT("DescribeComponents"), TEXT("Returns Blueprint SCS component information."), TEXT("ComponentInspection"), ECommandRisk::ReadOnly, MakeDescribeComponentsSchema(), &DescribeComponents);
 	RegisterCommand(TEXT("DescribeWidgetTree"), TEXT("Returns UMG widget tree information for a Widget Blueprint."), TEXT("WidgetInspection"), ECommandRisk::ReadOnly, MakeDescribeWidgetTreeSchema(), &DescribeWidgetTree);
 	RegisterCommand(TEXT("DescribeSubobjects"), TEXT("Returns Blueprint subobject data."), TEXT("BlueprintInspection"), ECommandRisk::ReadOnly, MakeDescribeSubobjectsSchema(), &DescribeSubobjects);
@@ -1051,6 +1083,8 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("ApplyFunctionPatch"), TEXT("Creates or updates a function signature and graph body."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyFunctionPatchSchema(), &ApplyFunctionPatch);
 	RegisterCommand(TEXT("LowerSemanticFunction"), TEXT("Lowers Semantic IR to an ApplyFunctionPatch body without mutating the asset."), TEXT("GraphEditing"), ECommandRisk::ReadOnly, MakeLowerSemanticFunctionSchema(), &LowerSemanticFunction);
 	RegisterCommand(TEXT("ApplySemanticFunction"), TEXT("Lowers Semantic IR and applies it as a function signature + body."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplySemanticFunctionSchema(), &ApplySemanticFunction);
+	RegisterCommand(TEXT("ApplyAndFix"), TEXT("Applies Semantic IR, compiles, and returns structured compile diagnostics in the same response. Eliminates the apply→compile→read-errors round-trip loop."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyAndFixSchema(), &ApplyAndFix);
+	RegisterCommand(TEXT("ReplaceSemanticFunction"), TEXT("Wipes a function's body and re-lowers a new IR over it in one transaction. Use for whole-function rewrites; for surgical edits use ApplyGraphPatch with existingGuid refs."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeReplaceSemanticFunctionSchema(), &ReplaceSemanticFunction);
 	RegisterCommand(TEXT("ApplyGraphSnippet"), TEXT("Applies a reusable graph snippet with optional bindings."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeApplyGraphSnippetSchema(), &ApplyGraphSnippet);
 	RegisterCommand(TEXT("ExportGraphPatch"), TEXT("Exports a graph into reusable patch JSON."), TEXT("GraphEditing"), ECommandRisk::ReadOnly, MakeExportGraphPatchSchema(), &ExportGraphPatch);
 	RegisterCommand(TEXT("ImportGraphPatch"), TEXT("Imports reusable patch JSON with optional bindings."), TEXT("GraphEditing"), ECommandRisk::ModifiesAsset, MakeImportGraphPatchSchema(), &ImportGraphPatch);

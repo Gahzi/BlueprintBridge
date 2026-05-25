@@ -101,6 +101,7 @@ namespace BlueprintBridge
 TSharedRef<FJsonObject> DuplicateAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CheckoutAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 FString GetBlueprintStatusString(const EBlueprintStatus Status);
+TArray<TSharedPtr<FJsonValue>> BuildCompileMessages(const class FCompilerResultsLog& ResultsLog);
 TSharedRef<FJsonObject> CompileBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SaveAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CreateBlueprintAsset(const FString& Id, const TSharedPtr<FJsonObject>& Params);
@@ -234,6 +235,8 @@ TSharedRef<FJsonObject> FindVariableReferences(const FString& Id, const TSharedP
 TSharedRef<FJsonObject> AnalyzeGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SummarizeBlueprintGraph(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SummarizeBlueprint(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ApplyAndFix(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ReplaceSemanticFunction(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 UBlueprint* CreateBlueprintAssetWorker(const FString& AssetPath, const FString& ParentClassPath, FString& OutErrorCode, FString& OutErrorMessage);
 bool AddBlueprintVariableWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage);
 USCS_Node* AddComponentWorker(UBlueprint* Blueprint, const TSharedPtr<FJsonObject>& Params, FString& OutErrorCode, FString& OutErrorMessage);
@@ -253,6 +256,7 @@ TSharedRef<FJsonObject> DescribeProperty(const FString& Id, const TSharedPtr<FJs
 TSharedRef<FJsonObject> DescribeDelegate(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> CheckDelegateCompatibility(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> FindReflectionSymbols(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> ResolveSymbol(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> ListCommands(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> BatchCommand(const FString& Id, const TSharedPtr<FJsonObject>& Params);
