@@ -1306,6 +1306,22 @@ Then use `DescribeGraph` to find the result node GUID and connect pins with `Con
 
 External clients (agents, scripts, CI jobs) drive BlueprintBridge through opaque JSON. The habits below keep round-trips low and avoid recurring dead ends. For exact common request shapes, see [`docs/blueprint_bridge_commands.md`](docs/blueprint_bridge_commands.md).
 
+### Cost-aware inspection (especially for AI agents)
+
+Inspection responses can be large — a `DescribeGraphFull` on a 30-node function easily exceeds 90 KB, and most of that bulk is per-pin metadata the caller never reads. For agents on a token budget, response size is the dominant cost, not request count. Reach for the cheapest command that answers your question and escalate only when stuck:
+
+1. **`SummarizeBlueprint`** — start here when you don't know the asset. One round-trip for parent class, interfaces, variables, components, delegates, and per-graph summaries.
+2. **`DescribeGraph`** (compact) — for "what's in this function." Returns entry/result nodes, execution chains, function calls, branches, and per-variable reads/writes. Roughly 5% the size of `DescribeGraphFull` and usually enough to identify a suspect node.
+3. **`DescribeSubgraph`** — when you have a seed node (or a few) and want only its neighborhood. Pass `seeds` (node GUIDs) and an optional `hops` limit. This is the right tool for "what feeds into this `RotateAngleAxis`?" — not `DescribeGraphFull`.
+4. **`GetConnectedNodes`** / **`DescribeNode`** — single-node detail. Use after `DescribeGraph` has named the suspect.
+5. **`DescribeGraphFull`** — last resort. The full per-node, per-pin dump. Almost always pair with `fields` (below).
+
+**Use the `fields` selector.** Most inspection commands — `SummarizeBlueprint`, `DescribeBlueprint`, `DescribeGraph`, `DescribeGraphFull`, `DescribeNode`, `DescribeSubgraph`, `GetConnectedNodes`, `DescribeComponents`, and several `Describe*` reflection commands — accept an optional `fields` array of JSON path projections, returning only the listed paths. A `DescribeGraphFull` with `fields: ["nodes.title", "nodes.pins.name", "nodes.pins.linkedTo"]` is typically 10–20% the size of the unfiltered response and still answers "what connects to what." This is the single largest cost win on heavy graphs. If a response comes back unfiltered, the command may not yet route through `ApplyFieldSelection` — fall back to a cheaper command or open a ticket.
+
+**Use `ListCommands` / `DescribeCommand` for discovery.** The plugin exposes 80+ commands; do not rely on a hand-maintained list in a wrapper or a memory note. `ListCommands` enumerates everything currently registered, and `DescribeCommand <name>` returns the input and output schemas. Both are cheap.
+
+**Don't widen scope speculatively.** When diagnosing a specific function, a `DescribeGraph` plus a targeted `DescribeSubgraph` is normally enough. Pulling the caller's full graph "just to verify what gets passed in" typically doubles the cost and rarely changes the diagnosis — trust the function-under-inspection's signature and only widen if the in-function evidence is genuinely inconclusive.
+
 ### Resolve schemas before scripting, not by guessing
 
 The shortest path to a correct `params` shape is `DescribeCommand`, the generated reference produced by `GenerateCommandDocs`, or the checked-in quick reference in `docs/blueprint_bridge_commands.md`. Param names are not always obvious from the command name. Common mismatches that have bitten clients:

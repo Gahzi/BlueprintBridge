@@ -121,6 +121,7 @@ TSharedRef<FJsonObject> SetRootWidget(const FString& Id, const TSharedPtr<FJsonO
 TSharedRef<FJsonObject> AddWidgetToParent(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetWidgetSlotLayout(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> GetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetSubobjectDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params);

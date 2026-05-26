@@ -1925,6 +1925,34 @@ bool FBlueprintBridgeAssetLifecycleAndDefaultsTest::RunTest(const FString& Param
 		}
 	}
 
+	TSharedRef<FJsonObject> GetDefaultParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	GetDefaultParams->SetStringField(TEXT("property"), TEXT("Health"));
+	const TSharedRef<FJsonObject> GetDefaultResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GetBlueprintDefault"), GetDefaultParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, GetDefaultResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GetDefaultResult = BlueprintBridgeTests::GetResultObject(*this, GetDefaultResponse);
+	if (GetDefaultResult)
+	{
+		FString ReturnedValue;
+		FString ReturnedProperty;
+		FString ReturnedType;
+		TestTrue(TEXT("GetBlueprintDefault should include value."), (*GetDefaultResult)->TryGetStringField(TEXT("value"), ReturnedValue));
+		TestTrue(TEXT("GetBlueprintDefault should include property."), (*GetDefaultResult)->TryGetStringField(TEXT("property"), ReturnedProperty));
+		TestTrue(TEXT("GetBlueprintDefault should include type."), (*GetDefaultResult)->TryGetStringField(TEXT("type"), ReturnedType));
+		TestEqual(TEXT("GetBlueprintDefault should round-trip the CDO value."), ReturnedValue, FString(TEXT("123")));
+		TestEqual(TEXT("GetBlueprintDefault should echo the property name."), ReturnedProperty, FString(TEXT("Health")));
+		TestEqual(TEXT("GetBlueprintDefault should report the int type."), ReturnedType, FString(TEXT("int32")));
+	}
+
+	TSharedRef<FJsonObject> GetMissingParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	GetMissingParams->SetStringField(TEXT("property"), TEXT("NoSuchProperty"));
+	const TSharedRef<FJsonObject> GetMissingResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("GetBlueprintDefault"), GetMissingParams);
+	bool bMissingOk = true;
+	GetMissingResponse->TryGetBoolField(TEXT("ok"), bMissingOk);
+	TestFalse(TEXT("GetBlueprintDefault should fail for unknown properties."), bMissingOk);
+
 	const TSharedRef<FJsonObject> SaveResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("SaveAsset"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
 	if (!BlueprintBridgeTests::ExpectSuccess(*this, SaveResponse))
 	{

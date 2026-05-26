@@ -266,6 +266,7 @@ TSharedRef<FJsonObject> GetEngineVersionCommand(const FString& Id, const TShared
 bool DoesJsonValueMatchType(const TSharedPtr<FJsonValue>& Value, const FString& ExpectedType);
 bool ValidateCommandParamsAgainstSchema(const FString& CommandName, const TSharedPtr<FJsonObject>& Params, const TSharedPtr<FJsonObject>& Schema, FString& OutError);
 TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> GetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> DescribeSubobject(UObject* Subobject, const bool bIncludeProperties);
 void GetBlueprintCDOSubobjects(UBlueprint* Blueprint, TArray<UObject*>& OutSubobjects);
 bool SubobjectMatchesIdentifier(const UObject* Subobject, const FString& Identifier);

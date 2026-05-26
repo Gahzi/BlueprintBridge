@@ -975,7 +975,7 @@ TSharedRef<FJsonObject> GetConnectedNodes(const FString& Id, const TSharedPtr<FJ
 	Result->SetObjectField(TEXT("center"), MakeCompactNodeJson(Center, NodeToId));
 	Result->SetArrayField(TEXT("nodes"), Nodes);
 	Result->SetArrayField(TEXT("links"), Links);
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> FindExecutionPath(const FString& Id, const TSharedPtr<FJsonObject>& Params)
@@ -1103,7 +1103,7 @@ TSharedRef<FJsonObject> DescribeSubgraph(const FString& Id, const TSharedPtr<FJs
 	Result->SetStringField(TEXT("graph"), Graph->GetName());
 	Result->SetArrayField(TEXT("nodes"), Nodes);
 	Result->SetArrayField(TEXT("links"), Links);
-	return MakeSuccess(Id, Result);
+	return MakeSuccess(Id, ApplyFieldSelection(Params, Result));
 }
 
 TSharedRef<FJsonObject> FindFunctionCallNodes(const FString& Id, const TSharedPtr<FJsonObject>& Params)

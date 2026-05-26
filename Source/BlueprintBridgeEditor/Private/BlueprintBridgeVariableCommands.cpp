@@ -45,6 +45,40 @@ TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<
 	return MakeSuccessMessage(Id, TEXT("DefaultSet"));
 }
 
+TSharedRef<FJsonObject> GetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString PropertyName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
+		!TryGetRequiredString(Params, TEXT("property"), PropertyName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("GetBlueprintDefault requires params.asset and params.property."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint || !Blueprint->GeneratedClass)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load compiled Blueprint '%s'."), *AssetPath));
+	}
+
+	UObject* CDO = Blueprint->GeneratedClass->GetDefaultObject();
+	FProperty* Property = Blueprint->GeneratedClass->FindPropertyByName(*PropertyName);
+	if (!CDO || !Property)
+	{
+		return MakeBridgeError(Id, TEXT("PropertyNotFound"), FString::Printf(TEXT("Could not find property '%s' on '%s'."), *PropertyName, *AssetPath));
+	}
+
+	FString Value;
+	Property->ExportText_InContainer(0, Value, CDO, CDO, CDO, PPF_None);
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("asset"), AssetPath);
+	Result->SetStringField(TEXT("property"), PropertyName);
+	Result->SetStringField(TEXT("value"), Value);
+	Result->SetStringField(TEXT("type"), Property->GetCPPType());
+	return MakeSuccess(Id, Result);
+}
+
 TSharedRef<FJsonObject> DescribeSubobject(UObject* Subobject, const bool bIncludeProperties)
 {
 	TSharedRef<FJsonObject> Json = MakeShared<FJsonObject>();

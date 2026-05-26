@@ -973,6 +973,23 @@ static TSharedPtr<FJsonObject> MakeSetBlueprintDefaultSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeGetBlueprintDefaultSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("property"), TEXT("Property name."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeGetBlueprintDefaultOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("asset"), TEXT("Blueprint asset path."))
+		.RequiredString(TEXT("property"), TEXT("Property name."))
+		.RequiredString(TEXT("value"), TEXT("Property value as text (ExportText form)."))
+		.RequiredString(TEXT("type"), TEXT("Property C++ type."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeSetSubobjectDefaultSchema()
 {
 	return AddAsset(FSchemaBuilder::Object())
@@ -1143,6 +1160,7 @@ void RegisterBlueprintBridgeCommands()
 	RegisterCommand(TEXT("SetWidgetSlotLayout"), TEXT("Sets slot layout data for a widget."), TEXT("WidgetEditing"), ECommandRisk::ModifiesAsset, MakeSetWidgetSlotLayoutSchema(), &SetWidgetSlotLayout);
 
 	RegisterCommand(TEXT("SetBlueprintDefault"), TEXT("Sets a Blueprint class default value."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetBlueprintDefaultSchema(), &SetBlueprintDefault);
+	RegisterCommand(TEXT("GetBlueprintDefault"), TEXT("Returns a Blueprint class default (CDO) value for a named property."), TEXT("BlueprintVariables"), ECommandRisk::ReadOnly, MakeGetBlueprintDefaultSchema(), &GetBlueprintDefault, MakeGetBlueprintDefaultOutputSchema());
 	RegisterCommand(TEXT("SetSubobjectDefault"), TEXT("Sets a Blueprint subobject default value."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetSubobjectDefaultSchema(), &SetSubobjectDefault);
 	RegisterCommand(TEXT("SetBlueprintVariableFlags"), TEXT("Sets Blueprint variable flags."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetBlueprintVariableFlagsSchema(), &SetBlueprintVariableFlags);
 	RegisterCommand(TEXT("AddBlueprintVariable"), TEXT("Adds a Blueprint member variable."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeAddBlueprintVariableSchema(), &AddBlueprintVariable);
