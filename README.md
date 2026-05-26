@@ -1439,6 +1439,49 @@ Do not paste GitHub credentials, tokens, or passwords into AI chats or logs. Use
 - Animation Blueprints, Materials, Niagara, Behavior Trees, and State Trees are not covered as separate graph systems yet.
 - Command implementations are split into domain `.cpp` files, with shared private helpers declared in `BlueprintBridgeCommandsPrivate.h`.
 
+## Open issues from real use
+
+Concrete bugs and rough edges observed while dogfooding the bridge. Each item is self-contained — pick one up directly during a maintenance pass without needing additional context.
+
+### `AddVariableGetNode` silently produces an unresolved node for function-scope variables
+
+`AddVariableGetNode` returns `ok:true` with a valid GUID even when the named variable can't be resolved as a class member — e.g. when the caller passes a function input parameter or function-local. The resulting node has `pins: []`, and the failure only surfaces downstream when a `ConnectPins` against it fails with `PinNotFound`. A subsequent `CompileBlueprint` does not reconstruct the missing pins.
+
+**Fix:** validate the variable resolves at creation time and return `VariableNotFound` if it doesn't. Optionally accept a `scope` parameter (`"member" | "local" | "input"`) so callers can target function-scope variables explicitly. Current workaround: reuse an existing in-graph getter for function parameters rather than adding a new `VariableGet`.
+
+### `Batch` cannot reference earlier results
+
+`Batch` runs a list of independent requests but offers no syntax for request `N+1` to use a value produced by request `N`. Graph-construction work — "add four nodes, then wire them" — therefore can't use `Batch` at all and must run serial. A typical small edit (one CDO change, three new function-call nodes, one variable get, four connections, one compile, one save) ends up being ~10 round trips instead of 1 transactional batch.
+
+**Fix:** add a JSON-pointer-style reference syntax (e.g. `$ref:requests[2].result.node.guid`) resolved server-side at batch execution time. If `ApplyGraphPatch` / `ApplyFunctionPatch` already covers this use case via the declarative patch surface, document the patch shape more visibly in the README so callers reach for it instead of `Batch + serial`. Distinct from the existing Roadmap item on "Batch read parallelization", which solves a different problem (parallelizing reads, not chaining mutations).
+
+### Param naming differs across commands and burns first-time callers
+
+Different commands use different keys for the same concept: `ConnectPins` uses `fromNode/fromPin/toNode/toPin`, other commands use `node` / `sourceNode` / `targetNode` / `subobject` / etc. A new caller (human or agent) frequently guesses the wrong key and pays a round-trip per command before reading the error message. The error text is good — the underlying inconsistency keeps generating the mistake.
+
+**Fix, smallest first:**
+1. Accept `source`/`target` (or `sourceNode`/`targetNode`) as aliases for `from`/`to` on `ConnectPins` — one-line additive change.
+2. Audit command schemas for a single canonical vocabulary, add aliases where commands diverge.
+3. Mention `DescribeCommand` prominently in the cost-aware tips section as the recommended preflight, and consider a `--describe` flag on the PowerShell wrapper that emits the schema without dispatching the call.
+
+### `CheckoutAsset` error message swallows the underlying Perforce reason
+
+`CheckoutAsset` returns `CheckoutFailed` with the message `"Could not check out '<path>'."` — no details about *why*. Common causes (already opened for edit, not under source control, P4 server unreachable, file not in any depot) are indistinguishable, so callers can't decide whether to proceed or abort. During dogfooding, the call returned `CheckoutFailed` but the subsequent `SaveAsset` still succeeded — suggesting the file was already opened and the failure was benign.
+
+**Fix:** include the underlying `ISourceControlProvider` error in the response payload. Consider treating "already opened for edit" as a successful no-op (`ok:true` with `state: "AlreadyCheckedOut"`) rather than an error.
+
+### `FindFunctions` lacks an exact-match filter
+
+`FindFunctions` accepts `nameContains` but not `nameEquals`. For common substrings (e.g. `Normal` returns 25+ matches including `MirrorVectorByNormal`, `MakePlaneFromPointAndNormal`, `LinePlaneIntersection_OriginNormal`, …), the response carries 15 KB+ of irrelevant entries when the caller already knows the exact name and just wants to confirm it exists.
+
+**Fix:** add an optional `nameEquals` parameter, or document `ResolveSymbol` more prominently as the preferred path for confirming a known function name resolves.
+
+### `AddVariableGetNode` (and possibly other node-creation commands) return compact responses with empty `pins` arrays
+
+Even when `AddVariableGetNode` succeeds normally on a valid class member, the response body returns `pins: []`. The pins exist on the actual node (subsequent `DescribeNode` calls show them after a `CompileBlueprint`), but the immediate creation response omits them. Callers that want to chain a `ConnectPins` right after creation can't look up the new pin's name from the response — they have to either know the variable's pin name a priori or follow up with `DescribeNode`.
+
+**Fix:** populate `pins` in the creation response so callers can wire the new node in the same batch without a roundtrip-and-describe.
+
 ## Roadmap
 
 The bridge's authoring surface is wide enough for most workflows now. Future work prioritizes **making what's already here cheaper and faster** over adding new commands. Items are ordered by expected leverage.
