@@ -251,6 +251,33 @@ TSharedRef<FJsonObject> FinishGraphEdit(const FString& Id, UBlueprint* Blueprint
 	return FinishGraphEdit(Id, Blueprint, nullptr, Node);
 }
 
+// Pre-check that a variable name resolves to a real class property on the Blueprint.
+// UEdGraphSchema_K2::SpawnVariableGetNode does not fail for unknown names — it can return
+// a placeholder node with wildcard pins, or a half-allocated node with no pins, depending on
+// the input. Either case silently breaks downstream ConnectPins. Validate before spawning so
+// we never produce an orphan in the graph.
+static bool BlueprintHasMemberVariable(UBlueprint* Blueprint, const FString& VariableName)
+{
+	UClass* OwnerClass = Blueprint->SkeletonGeneratedClass ? Blueprint->SkeletonGeneratedClass : Blueprint->GeneratedClass;
+	return OwnerClass && OwnerClass->FindPropertyByName(*VariableName) != nullptr;
+}
+
+// Defensive cleanup in case the schema still produces an orphan on a name that passed
+// BlueprintHasMemberVariable (e.g. a property exists but the schema rejected the spawn).
+static bool DiscardOrphanVariableNode(UEdGraph* Graph, UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return true;
+	}
+	if (Node->Pins.Num() == 0)
+	{
+		Graph->RemoveNode(Node);
+		return true;
+	}
+	return false;
+}
+
 TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
@@ -267,12 +294,21 @@ TSharedRef<FJsonObject> AddVariableGetNode(const FString& Id, const TSharedPtr<F
 		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddVariableGetNode requires params.variable."));
 	}
 
+	if (!BlueprintHasMemberVariable(Blueprint, VariableName))
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not resolve variable '%s' as a class member of the Blueprint. Function parameters and locals aren't supported by this command yet; reuse an existing in-graph getter instead."), *VariableName));
+	}
+
 	const int32 X = Params->GetIntegerField(TEXT("x"));
 	const int32 Y = Params->GetIntegerField(TEXT("y"));
 	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddVariableGetNode", "Blueprint Bridge: Add Variable Get Node"));
 	Blueprint->Modify();
 	Graph->Modify();
 	UK2Node_VariableGet* Node = SpawnVariableGetNode(Blueprint, Graph, *VariableName, X, Y);
+	if (DiscardOrphanVariableNode(Graph, Node))
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Schema rejected variable '%s' even though it resolves as a class member."), *VariableName));
+	}
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
@@ -292,12 +328,21 @@ TSharedRef<FJsonObject> AddVariableSetNode(const FString& Id, const TSharedPtr<F
 		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("AddVariableSetNode requires params.variable."));
 	}
 
+	if (!BlueprintHasMemberVariable(Blueprint, VariableName))
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not resolve variable '%s' as a class member of the Blueprint. Function parameters and locals aren't supported by this command yet; reuse an existing in-graph getter instead."), *VariableName));
+	}
+
 	const int32 X = Params->GetIntegerField(TEXT("x"));
 	const int32 Y = Params->GetIntegerField(TEXT("y"));
 	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "AddVariableSetNode", "Blueprint Bridge: Add Variable Set Node"));
 	Blueprint->Modify();
 	Graph->Modify();
 	UK2Node_VariableSet* Node = SpawnVariableSetNode(Blueprint, Graph, *VariableName, X, Y);
+	if (DiscardOrphanVariableNode(Graph, Node))
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Schema rejected variable '%s' even though it resolves as a class member."), *VariableName));
+	}
 	return FinishGraphEdit(Id, Blueprint, Node);
 }
 
@@ -1220,6 +1265,20 @@ TSharedRef<FJsonObject> AddBreakStructNode(const FString& Id, const TSharedPtr<F
 	return AddStructNode(Id, Params, false);
 }
 
+static bool TryReadPinConnectionParams(const TSharedPtr<FJsonObject>& Params, FString& OutFromNode, FString& OutFromPin, FString& OutToNode, FString& OutToPin)
+{
+	const bool bHasFrom = Params->TryGetStringField(TEXT("fromNode"), OutFromNode) && Params->TryGetStringField(TEXT("fromPin"), OutFromPin);
+	const bool bHasTo = Params->TryGetStringField(TEXT("toNode"), OutToNode) && Params->TryGetStringField(TEXT("toPin"), OutToPin);
+	if (bHasFrom && bHasTo)
+	{
+		return true;
+	}
+	// Accept source/target as aliases for from/to so callers don't have to remember the bridge-specific vocabulary.
+	const bool bHasSource = Params->TryGetStringField(TEXT("sourceNode"), OutFromNode) && Params->TryGetStringField(TEXT("sourcePin"), OutFromPin);
+	const bool bHasTarget = Params->TryGetStringField(TEXT("targetNode"), OutToNode) && Params->TryGetStringField(TEXT("targetPin"), OutToPin);
+	return bHasSource && bHasTarget;
+}
+
 TSharedRef<FJsonObject> ConnectPins(const FString& Id, const TSharedPtr<FJsonObject>& Params)
 {
 	UBlueprint* Blueprint = nullptr;
@@ -1234,10 +1293,9 @@ TSharedRef<FJsonObject> ConnectPins(const FString& Id, const TSharedPtr<FJsonObj
 	FString FromPinName;
 	FString ToNodeGuid;
 	FString ToPinName;
-	if (!TryGetRequiredString(Params, TEXT("fromNode"), FromNodeGuid) || !TryGetRequiredString(Params, TEXT("fromPin"), FromPinName) ||
-		!TryGetRequiredString(Params, TEXT("toNode"), ToNodeGuid) || !TryGetRequiredString(Params, TEXT("toPin"), ToPinName))
+	if (!TryReadPinConnectionParams(Params, FromNodeGuid, FromPinName, ToNodeGuid, ToPinName))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ConnectPins requires params.fromNode, fromPin, toNode, and toPin."));
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("ConnectPins requires fromNode/fromPin/toNode/toPin (sourceNode/sourcePin/targetNode/targetPin also accepted)."));
 	}
 
 	UEdGraphNode* FromNode = FindNodeByGuid(Graph, FromNodeGuid);
@@ -1275,10 +1333,9 @@ TSharedRef<FJsonObject> MovePinLinksCommand(const FString& Id, const TSharedPtr<
 	FString FromPinName;
 	FString ToNodeGuid;
 	FString ToPinName;
-	if (!TryGetRequiredString(Params, TEXT("fromNode"), FromNodeGuid) || !TryGetRequiredString(Params, TEXT("fromPin"), FromPinName) ||
-		!TryGetRequiredString(Params, TEXT("toNode"), ToNodeGuid) || !TryGetRequiredString(Params, TEXT("toPin"), ToPinName))
+	if (!TryReadPinConnectionParams(Params, FromNodeGuid, FromPinName, ToNodeGuid, ToPinName))
 	{
-		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("MovePinLinks requires params.fromNode, fromPin, toNode, and toPin."));
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("MovePinLinks requires fromNode/fromPin/toNode/toPin (sourceNode/sourcePin/targetNode/targetPin also accepted)."));
 	}
 
 	UEdGraphPin* FromPin = FindPinByName(FindNodeByGuid(Graph, FromNodeGuid), FromPinName);

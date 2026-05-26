@@ -7,6 +7,56 @@ DEFINE_LOG_CATEGORY_STATIC(LogBlueprintBridge, Log, All);
 namespace BlueprintBridge
 {
 
+static int32 ComputeEditDistance(const FString& A, const FString& B)
+{
+	const int32 LenA = A.Len();
+	const int32 LenB = B.Len();
+	if (LenA == 0) { return LenB; }
+	if (LenB == 0) { return LenA; }
+
+	TArray<int32> Prev;
+	TArray<int32> Curr;
+	Prev.SetNumUninitialized(LenB + 1);
+	Curr.SetNumUninitialized(LenB + 1);
+	for (int32 J = 0; J <= LenB; ++J) { Prev[J] = J; }
+
+	for (int32 I = 1; I <= LenA; ++I)
+	{
+		Curr[0] = I;
+		const TCHAR CharA = FChar::ToLower(A[I - 1]);
+		for (int32 J = 1; J <= LenB; ++J)
+		{
+			const TCHAR CharB = FChar::ToLower(B[J - 1]);
+			const int32 Cost = (CharA == CharB) ? 0 : 1;
+			Curr[J] = FMath::Min3(Curr[J - 1] + 1, Prev[J] + 1, Prev[J - 1] + Cost);
+		}
+		Swap(Prev, Curr);
+	}
+	return Prev[LenB];
+}
+
+static FString FindClosestCommandName(const FString& Unknown)
+{
+	if (Unknown.IsEmpty()) { return FString(); }
+
+	const int32 UnknownLen = Unknown.Len();
+	// Allow more slack on longer names. Cap at 4 to avoid wild suggestions.
+	const int32 MaxDistance = FMath::Clamp(UnknownLen / 3, 1, 4);
+
+	FString Best;
+	int32 BestDistance = MaxDistance + 1;
+	for (const TSharedRef<ICommand>& Command : GetCommandRegistry().GetCommands())
+	{
+		const int32 Distance = ComputeEditDistance(Unknown, Command->GetName());
+		if (Distance < BestDistance)
+		{
+			BestDistance = Distance;
+			Best = Command->GetName();
+		}
+	}
+	return (BestDistance <= MaxDistance) ? Best : FString();
+}
+
 static void EnsureCommandsRegistered()
 {
 	static bool bRegistered = false;
@@ -54,7 +104,11 @@ TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& RequestText)
 		return RegisteredCommand->Execute(Id, Params);
 	}
 
-	return MakeBridgeError(Id, TEXT("UnknownCommand"), FString::Printf(TEXT("Unknown command '%s'."), *Command));
+	const FString Suggestion = FindClosestCommandName(Command);
+	const FString Message = Suggestion.IsEmpty()
+		? FString::Printf(TEXT("Unknown command '%s'."), *Command)
+		: FString::Printf(TEXT("Unknown command '%s'. Did you mean '%s'?"), *Command, *Suggestion);
+	return MakeBridgeError(Id, TEXT("UnknownCommand"), Message);
 }
 
 TSharedRef<FJsonObject> ExecuteRequest(const FString& RequestText)

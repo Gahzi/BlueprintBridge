@@ -1038,7 +1038,7 @@ static TSharedPtr<FJsonObject> MakeAddBlueprintVariableSchema()
 
 void RegisterBlueprintBridgeCommands()
 {
-	RegisterCommand(TEXT("Batch"), TEXT("Executes multiple bridge requests and returns their responses."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeBatchSchema(), &BatchCommand);
+	RegisterCommand(TEXT("Batch"), TEXT("Executes multiple bridge requests and returns their responses. Supports $ref:N.path chaining so a later request can use a value from an earlier response (e.g. a freshly-created node's guid)."), TEXT("Protocol"), ECommandRisk::ReadOnly, MakeBatchSchema(), &BatchCommand);
 	RegisterCommand(TEXT("Ping"), TEXT("Returns Pong."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &PingCommand, MakePingOutputSchema());
 	RegisterCommand(TEXT("GetProjectName"), TEXT("Returns the current Unreal project name."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetProjectNameCommand, MakeTypeSchema(TEXT("string"), TEXT("Current Unreal project name.")));
 	RegisterCommand(TEXT("GetEngineVersion"), TEXT("Returns the current engine version string."), TEXT("Basic"), ECommandRisk::ReadOnly, MakeEmptyObjectSchema(), &GetEngineVersionCommand, MakeTypeSchema(TEXT("string"), TEXT("Current Unreal Engine version string.")));

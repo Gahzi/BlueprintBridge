@@ -545,6 +545,31 @@ bool FBlueprintBridgeUnknownCommandTest::RunTest(const FString& Parameters)
 	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("UnknownCommand"));
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeUnknownCommandDidYouMeanTest, "BlueprintBridge.Protocol.UnknownCommandDidYouMean", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeUnknownCommandDidYouMeanTest::RunTest(const FString& Parameters)
+{
+	// Near-miss typo of a real command should surface a 'Did you mean' suggestion.
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeGrafh"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("UnknownCommand")))
+	{
+		return false;
+	}
+	const FString Message = BlueprintBridgeTests::GetErrorMessage(Response);
+	TestTrue(TEXT("Near-miss unknown command should include a 'Did you mean' suggestion."), Message.Contains(TEXT("Did you mean")));
+	TestTrue(TEXT("Suggestion should point at DescribeGraph for the 'DescribeGrafh' typo."), Message.Contains(TEXT("DescribeGraph")));
+
+	// A name with no close match should still error but should NOT include a misleading suggestion.
+	const TSharedRef<FJsonObject> WildResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ZzzzNotCloseToAnything9999"), MakeShared<FJsonObject>());
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, WildResponse, TEXT("UnknownCommand")))
+	{
+		return false;
+	}
+	const FString WildMessage = BlueprintBridgeTests::GetErrorMessage(WildResponse);
+	TestFalse(TEXT("Far-from-anything unknown command should NOT include a 'Did you mean' suggestion."), WildMessage.Contains(TEXT("Did you mean")));
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeCaseInsensitiveCommandTest, "BlueprintBridge.Protocol.CaseInsensitiveCommand", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 
 bool FBlueprintBridgeCaseInsensitiveCommandTest::RunTest(const FString& Parameters)
@@ -4254,6 +4279,332 @@ bool FBlueprintBridgeSemanticIRApplyAndCompileTest::RunTest(const FString& Param
 	{
 		FString InputRes;
 		TestTrue(TEXT("'Input' in args should resolve to param."), (*Resolutions)->TryGetStringField(TEXT("flow[0].if.args.A"), InputRes) && InputRes == TEXT("param:Input"));
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeConnectPinsSourceTargetAliasTest, "BlueprintBridge.Blueprint.ConnectPins.SourceTargetAlias", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeConnectPinsSourceTargetAliasTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("ConnectAlias"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddVariableParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVariableParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVariableParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVariableParams)))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddGetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddGetParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	AddGetParams->SetNumberField(TEXT("x"), 100);
+	AddGetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> AddGetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetNode"), AddGetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddGetResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GetNodeObject = BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddGetResponse);
+	if (!GetNodeObject)
+	{
+		return false;
+	}
+	// Successful AddVariableGetNode for a real class member should return populated pins
+	// so callers can wire the new node in the same batch without a follow-up DescribeNode.
+	const TArray<TSharedPtr<FJsonValue>>* GetPins = nullptr;
+	TestTrue(TEXT("AddVariableGetNode response should include pins for a resolved variable."), (*GetNodeObject)->TryGetArrayField(TEXT("pins"), GetPins) && GetPins && GetPins->Num() > 0);
+	const FString GetNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *GetNodeObject);
+
+	TSharedRef<FJsonObject> AddSetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddSetParams->SetStringField(TEXT("variable"), TEXT("Health"));
+	AddSetParams->SetNumberField(TEXT("x"), 400);
+	AddSetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> AddSetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableSetNode"), AddSetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, AddSetResponse))
+	{
+		return false;
+	}
+	const FString SetNodeGuid = BlueprintBridgeTests::GetNodeGuid(*this, *BlueprintBridgeTests::GetNodeObjectFromResponse(*this, AddSetResponse));
+
+	// Use the source/target alias keys exclusively. If the dispatcher ignored them, this would fail with InvalidParams.
+	TSharedRef<FJsonObject> ConnectParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ConnectParams->SetStringField(TEXT("sourceNode"), GetNodeGuid);
+	ConnectParams->SetStringField(TEXT("sourcePin"), TEXT("Health"));
+	ConnectParams->SetStringField(TEXT("targetNode"), SetNodeGuid);
+	ConnectParams->SetStringField(TEXT("targetPin"), TEXT("Health"));
+	return BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("ConnectPins"), ConnectParams));
+}
+
+namespace BlueprintBridgeTests
+{
+static const TSharedPtr<FJsonObject>* GetBatchChildResult(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& BatchResponse, int32 ChildIndex, FString& OutChildErrorCode)
+{
+	OutChildErrorCode.Reset();
+	const TSharedPtr<FJsonObject>* BatchResult = GetResultObject(Test, BatchResponse);
+	if (!BatchResult) { return nullptr; }
+	const TArray<TSharedPtr<FJsonValue>>* Responses = nullptr;
+	if (!(*BatchResult)->TryGetArrayField(TEXT("responses"), Responses) || !Responses || ChildIndex >= Responses->Num())
+	{
+		Test.AddError(FString::Printf(TEXT("Batch response did not contain index %d."), ChildIndex));
+		return nullptr;
+	}
+	const TSharedPtr<FJsonObject>* ChildObj = nullptr;
+	if (!(*Responses)[ChildIndex]->TryGetObject(ChildObj) || !ChildObj || !(*ChildObj).IsValid())
+	{
+		Test.AddError(FString::Printf(TEXT("Batch response[%d] was not an object."), ChildIndex));
+		return nullptr;
+	}
+	bool bOk = true;
+	(*ChildObj)->TryGetBoolField(TEXT("ok"), bOk);
+	if (!bOk)
+	{
+		const TSharedPtr<FJsonObject>* ErrorObj = nullptr;
+		if ((*ChildObj)->TryGetObjectField(TEXT("error"), ErrorObj) && ErrorObj && (*ErrorObj).IsValid())
+		{
+			(*ErrorObj)->TryGetStringField(TEXT("code"), OutChildErrorCode);
+		}
+		return nullptr;
+	}
+	const TSharedPtr<FJsonObject>* ResultObj = nullptr;
+	(*ChildObj)->TryGetObjectField(TEXT("result"), ResultObj);
+	return ResultObj;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefBasicTest, "BlueprintBridge.Protocol.Batch.RefBasic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefBasicTest::RunTest(const FString& Parameters)
+{
+	// AddBlueprintVariable is inside the batch as request 0 so this also verifies the
+	// structural recompile it triggers is synchronous enough for the just-shipped
+	// BlueprintHasMemberVariable pre-check to see the new variable in requests 1 and 2.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("BatchRefBasic"));
+	if (!Asset.Blueprint) { return false; }
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("Health"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+
+	auto MakeNodeParams = [&](double X, double Y)
+	{
+		TSharedRef<FJsonObject> P = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+		P->SetStringField(TEXT("variable"), TEXT("Health"));
+		P->SetNumberField(TEXT("x"), X);
+		P->SetNumberField(TEXT("y"), Y);
+		return P;
+	};
+
+	TSharedRef<FJsonObject> ConnectParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	ConnectParams->SetStringField(TEXT("fromNode"), TEXT("$ref:1.result.node.guid"));
+	ConnectParams->SetStringField(TEXT("fromPin"), TEXT("Health"));
+	ConnectParams->SetStringField(TEXT("toNode"), TEXT("$ref:2.result.node.guid"));
+	ConnectParams->SetStringField(TEXT("toPin"), TEXT("Health"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("AddBlueprintVariable"), AddVarParams)));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("AddVariableGetNode"), MakeNodeParams(100, 100))));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("AddVariableSetNode"), MakeNodeParams(400, 100))));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("ConnectPins"), ConnectParams)));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	// AddBlueprintVariable returns a string result ("VariableAdded"), so use the error-code
+	// channel rather than asserting on an object result. The downstream children carry the
+	// usual {node: ...} object result.
+	FString ChildErr;
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 0, ChildErr);
+	TestTrue(TEXT("AddBlueprintVariable child should succeed (no error code)."), ChildErr.IsEmpty());
+	TestNotNull(TEXT("AddVariableGetNode child should have result."), BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr));
+	TestNotNull(TEXT("AddVariableSetNode child should have result."), BlueprintBridgeTests::GetBatchChildResult(*this, Response, 2, ChildErr));
+
+	// ConnectPins returns FinishGraphEdit which sets an empty object result, not the {node} shape.
+	// Verify it via ChildErr instead.
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 3, ChildErr);
+	TestTrue(TEXT("ConnectPins child should succeed (refs resolved)."), ChildErr.IsEmpty());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefArrayIndexTest, "BlueprintBridge.Protocol.Batch.RefArrayIndex", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefArrayIndexTest::RunTest(const FString& Parameters)
+{
+	// ListCommands returns { commands: [{name, ...}, ...] }. We pull the first command's
+	// name through an array-indexed $ref and pass it to DescribeCommand. Verifies bracket
+	// indexing in the path resolver end-to-end without depending on graph state.
+	TSharedRef<FJsonObject> DescribeParams = MakeShared<FJsonObject>();
+	DescribeParams->SetStringField(TEXT("command"), TEXT("$ref:0.result.commands[0].name"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("ListCommands"), MakeShared<FJsonObject>())));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeCommand"), DescribeParams)));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	FString ChildErr;
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr);
+	TestNotNull(TEXT("DescribeCommand child should succeed (array-indexed $ref resolved)."), DescribeResult);
+	if (DescribeResult)
+	{
+		FString ResolvedName;
+		TestTrue(TEXT("DescribeCommand result should have a name field."), (*DescribeResult)->TryGetStringField(TEXT("name"), ResolvedName) && !ResolvedName.IsEmpty());
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefForwardReferenceTest, "BlueprintBridge.Protocol.Batch.RefForwardReference", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefForwardReferenceTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Bad = MakeShared<FJsonObject>();
+	Bad->SetStringField(TEXT("command"), TEXT("$ref:1.result.commands[0].name"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeCommand"), Bad)));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("ListCommands"), MakeShared<FJsonObject>())));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	FString ChildErr;
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 0, ChildErr);
+	return TestEqual(TEXT("Forward $ref should produce RefForwardReference."), ChildErr, FString(TEXT("RefForwardReference")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefOutOfBoundsTest, "BlueprintBridge.Protocol.Batch.RefOutOfBounds", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefOutOfBoundsTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Bad = MakeShared<FJsonObject>();
+	Bad->SetStringField(TEXT("command"), TEXT("$ref:99.result.commands[0].name"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("ListCommands"), MakeShared<FJsonObject>())));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeCommand"), Bad)));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	FString ChildErr;
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr);
+	return TestEqual(TEXT("Past-end $ref should produce RefOutOfBounds."), ChildErr, FString(TEXT("RefOutOfBounds")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefUnresolvedPathTest, "BlueprintBridge.Protocol.Batch.RefUnresolvedPath", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefUnresolvedPathTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Bad = MakeShared<FJsonObject>();
+	Bad->SetStringField(TEXT("command"), TEXT("$ref:0.result.definitelyNotAField"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("ListCommands"), MakeShared<FJsonObject>())));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeCommand"), Bad)));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	FString ChildErr;
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr);
+	return TestEqual(TEXT("Missing path segment should produce RefUnresolved."), ChildErr, FString(TEXT("RefUnresolved")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeBatchRefPredecessorFailedTest, "BlueprintBridge.Protocol.Batch.RefPredecessorFailed", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeBatchRefPredecessorFailedTest::RunTest(const FString& Parameters)
+{
+	// Request 0 fails with UnknownCommand; request 1's $ref:0... should report
+	// RefPredecessorFailed rather than a path-walking error.
+	TSharedRef<FJsonObject> Bad = MakeShared<FJsonObject>();
+	Bad->SetStringField(TEXT("command"), TEXT("$ref:0.result.node.guid"));
+
+	TArray<TSharedPtr<FJsonValue>> Requests;
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DefinitelyUnknownCommand"), MakeShared<FJsonObject>())));
+	Requests.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakeRequest(TEXT("DescribeCommand"), Bad)));
+
+	TSharedRef<FJsonObject> BatchParams = MakeShared<FJsonObject>();
+	BatchParams->SetArrayField(TEXT("requests"), Requests);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("Batch"), BatchParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	FString ChildErr;
+	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr);
+	return TestEqual(TEXT("Ref to failed predecessor should produce RefPredecessorFailed."), ChildErr, FString(TEXT("RefPredecessorFailed")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAddVariableGetNodeUnresolvedTest, "BlueprintBridge.Blueprint.AddVariableGetNode.Unresolved", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAddVariableGetNodeUnresolvedTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Unresolved"));
+	if (!Asset.Blueprint)
+	{
+		return false;
+	}
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+
+	TSharedRef<FJsonObject> AddGetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddGetParams->SetStringField(TEXT("variable"), TEXT("DefinitelyNotAClassMember_9001"));
+	AddGetParams->SetNumberField(TEXT("x"), 100);
+	AddGetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetNode"), AddGetParams);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("VariableNotFound")))
+	{
+		return false;
+	}
+
+	TSharedRef<FJsonObject> AddSetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddSetParams->SetStringField(TEXT("variable"), TEXT("DefinitelyNotAClassMember_9001"));
+	AddSetParams->SetNumberField(TEXT("x"), 200);
+	AddSetParams->SetNumberField(TEXT("y"), 200);
+	const TSharedRef<FJsonObject> SetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableSetNode"), AddSetParams);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, SetResponse, TEXT("VariableNotFound")))
+	{
+		return false;
+	}
+
+	// After failure, the orphan node should not be left in the graph.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::DescribeGraphRequest(Asset.AssetPath, EventGraphName);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse))
+	{
+		return false;
+	}
+	const TSharedPtr<FJsonObject>* GraphResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	if (!GraphResult)
+	{
+		return false;
+	}
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	if ((*GraphResult)->TryGetArrayField(TEXT("nodes"), Nodes) && Nodes)
+	{
+		for (const TSharedPtr<FJsonValue>& NodeValue : *Nodes)
+		{
+			const TSharedPtr<FJsonObject>* NodeObj = nullptr;
+			FString Title;
+			if (NodeValue->TryGetObject(NodeObj) && NodeObj && (*NodeObj)->TryGetStringField(TEXT("title"), Title))
+			{
+				TestFalse(TEXT("Failed AddVariableGetNode should not leave an orphan node in the graph."), Title.Contains(TEXT("DefinitelyNotAClassMember_9001")));
+			}
+		}
 	}
 	return true;
 }

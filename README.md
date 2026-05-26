@@ -1353,6 +1353,49 @@ When mirroring an existing graph as a template, trace execute and data reachabil
 
 When building a graph with many nodes and connections, prefer `Batch` over a serial stream of requests. A serial failure mid-stream leaves orphan nodes in the graph that you have to find and `DeleteNode` before retrying. `Batch` plus a single retry is the cleaner default for non-trivial graph construction.
 
+### Chaining requests with `$ref`
+
+`Batch` resolves `$ref:<index>.<path>` tokens in any string field of a child request's `params` before dispatching that request. This lets later steps consume freshly-minted values — most commonly the GUID of a node created earlier in the same batch — without a round trip to fish out the result. Combined with `rollbackOnFailure`, a whole graph-construction sequence becomes a single transactional call.
+
+```json
+{"command": "Batch", "params": {
+  "rollbackOnFailure": true,
+  "requests": [
+    {"command": "AddVariableGetNode", "params": {"asset":"/Game/X.X", "graph":"EventGraph", "variable":"Health", "x":100, "y":100}},
+    {"command": "AddVariableSetNode", "params": {"asset":"/Game/X.X", "graph":"EventGraph", "variable":"Health", "x":400, "y":100}},
+    {"command": "ConnectPins", "params": {
+      "asset":"/Game/X.X", "graph":"EventGraph",
+      "fromNode": "$ref:0.result.node.guid",
+      "fromPin":  "Health",
+      "toNode":   "$ref:1.result.node.guid",
+      "toPin":    "Health"
+    }}
+  ]
+}}
+```
+
+**Path syntax.** Segments are dot-separated; bracketed integers index into JSON arrays.
+
+- `$ref:0.result.node.guid` — field access into a previous response's `result` payload
+- `$ref:0.result.commands[0].name` — first element of an array, then a field
+- `$ref:2.result.node.pins[3].id` — typically you don't need pin GUIDs (the connect commands accept pin names), but it works if you do
+
+**Errors.** Each child request that fails to resolve a `$ref` returns its own error response in the batch's `responses` array (the rest of the batch still runs unless `rollbackOnFailure` is true):
+
+| Error code | Meaning |
+|---|---|
+| `RefForwardReference` | A request used `$ref:N` where N is its own index or later. Refs may only point at earlier requests. |
+| `RefOutOfBounds` | `$ref:N` where N is past the end of the `requests` array. |
+| `RefUnresolved` | The dotted path didn't match the shape of the prior response. |
+| `RefPredecessorFailed` | The referenced request failed; its `result` is not available. |
+| `InvalidRefSyntax` | The path before the first `.` wasn't a valid request index, or a `[N]` segment wasn't a non-negative integer. |
+
+**Escaping.** If you genuinely need a literal `"$ref:"` string in a param (extremely rare in this domain), prefix with an extra `$` — `"$$ref:..."` substitutes to `"$ref:..."`. Anything else starting with `$ref:` is interpreted as a reference.
+
+**Type preservation.** The resolved value keeps its original JSON type — a number stays a number, a string stays a string, a boolean stays a boolean. The downstream command then sees that type. If you `$ref` a number into a field the command expects to be a string, the command will reject it with its own `InvalidParams` error, not a `$ref` error. Ref into the right type or use a command that returns the type you need.
+
+**What's not in v1.** Filter expressions (`pins[name=A]`), cross-batch refs, and refs that depend on the substituted output of *another* ref (chained refs in the same field) are intentionally out. Add a workaround request that surfaces the value you need rather than reaching for a tinier interpreter.
+
 ### PowerShell helper compatibility
 
 On Windows, invoke BlueprintBridge through the PowerShell helper or a direct named-pipe client, not Bash. Git-for-Windows Bash can rewrite Unreal package paths like `/Game/...` into host file-system paths before the bridge sees them.
