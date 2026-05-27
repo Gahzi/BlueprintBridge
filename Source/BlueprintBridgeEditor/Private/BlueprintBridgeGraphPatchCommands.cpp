@@ -576,6 +576,10 @@ static UEdGraphNode* CreatePatchNode(FGraphPatchContext& Context, const TSharedP
 	{
 		Node = SpawnMacroPatchNode(Context.Graph, NodeObject, TEXT("ForEachLoop"), TEXT("/Engine/EditorBlueprintResources/StandardMacros.StandardMacros"), OutError);
 	}
+	else if (NodeType.Equals(TEXT("WhileLoop"), ESearchCase::IgnoreCase))
+	{
+		Node = SpawnMacroPatchNode(Context.Graph, NodeObject, TEXT("WhileLoop"), TEXT("/Engine/EditorBlueprintResources/StandardMacros.StandardMacros"), OutError);
+	}
 	else if (NodeType.Equals(TEXT("AuthoritySwitch"), ESearchCase::IgnoreCase))
 	{
 		Node = SpawnMacroPatchNode(Context.Graph, NodeObject, TEXT("Switch Has Authority"), TEXT("/Engine/EditorBlueprintResources/ActorMacros.ActorMacros"), OutError);

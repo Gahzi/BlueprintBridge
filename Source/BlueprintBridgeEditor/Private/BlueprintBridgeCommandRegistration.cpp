@@ -641,7 +641,8 @@ static TSharedPtr<FJsonObject> MakeLowerSemanticFunctionSchema()
 		.RequiredString(TEXT("function"), TEXT("Function graph name."))
 		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
 		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
-		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list. Statements: call/set/if/seq/return/let/cast/forEach/for/while/break/continue. Expressions: var/in/self/lit/call plus operator sugar (==, !=, <, <=, >, >=, and, or, not)."))
+		.OptionalBoolean(TEXT("strictPureExpressions"), TEXT("If true, impure calls in expression position error instead of auto-hoisting (restores v1 behavior). Defaults false."))
 		.Build();
 }
 
@@ -652,9 +653,10 @@ static TSharedPtr<FJsonObject> MakeApplySemanticFunctionSchema()
 		.OptionalBoolean(TEXT("createIfMissing"), TEXT("Whether to create the function when missing."))
 		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
 		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
-		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list. Statements: call/set/if/seq/return/let/cast/forEach/for/while/break/continue. Expressions: var/in/self/lit/call plus operator sugar (==, !=, <, <=, >, >=, and, or, not)."))
 		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after applying."))
 		.OptionalBoolean(TEXT("rollbackOnFailure"), TEXT("Whether to roll back created nodes on failure. Defaults true."))
+		.OptionalBoolean(TEXT("strictPureExpressions"), TEXT("If true, impure calls in expression position error instead of auto-hoisting. Defaults false."))
 		.Build();
 }
 
@@ -665,7 +667,7 @@ static TSharedPtr<FJsonObject> MakeApplyAndFixSchema()
 		.OptionalBoolean(TEXT("createIfMissing"), TEXT("Whether to create the function when missing."))
 		.OptionalArray(TEXT("inputs"), TEXT("Function input pins."))
 		.OptionalArray(TEXT("outputs"), TEXT("Function output pins."))
-		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return)."))
+		.OptionalArray(TEXT("flow"), TEXT("Semantic IR statement list (call/set/if/seq/return/let/cast/forEach/for/while/break/continue)."))
 		.OptionalBoolean(TEXT("rollbackOnCompileError"), TEXT("Roll back the function body if compilation produces errors. Default false; the broken state is usually more useful for diagnosis."))
 		.Build();
 }
@@ -676,7 +678,7 @@ static TSharedPtr<FJsonObject> MakeReplaceSemanticFunctionSchema()
 		.RequiredString(TEXT("function"), TEXT("Function graph name. Must already exist — use ApplySemanticFunction for creation."))
 		.OptionalArray(TEXT("inputs"), TEXT("Optional new function input pins. If omitted, the existing signature is preserved."))
 		.OptionalArray(TEXT("outputs"), TEXT("Optional new function output pins. If omitted, the existing signature is preserved."))
-		.OptionalArray(TEXT("flow"), TEXT("New Semantic IR statement list. Replaces the entire current body."))
+		.OptionalArray(TEXT("flow"), TEXT("New Semantic IR statement list. Replaces the entire current body. Supports call/set/if/seq/return/let/cast/forEach/for/while/break/continue statements."))
 		.OptionalBoolean(TEXT("compile"), TEXT("Whether to compile after replacing."))
 		.Build();
 }
@@ -980,6 +982,53 @@ static TSharedPtr<FJsonObject> MakeGetBlueprintDefaultSchema()
 		.Build();
 }
 
+static TSharedPtr<FJsonObject> MakeRenameBlueprintVariableSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("variable"), TEXT("Existing variable name."))
+		.RequiredString(TEXT("newName"), TEXT("New variable name. Must not collide with an existing variable."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeRemoveBlueprintVariableSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.RequiredString(TEXT("variable"), TEXT("Variable name to remove. In-graph references are NOT validated; call FindVariableReferences first if you need a pre-check."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindAssetReferencesSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("includeSoft"), TEXT("Include soft (TSoftObjectPtr / lazy) references. Default true."))
+		.OptionalString(TEXT("assetClassFilter"), TEXT("Optional class path; only return assets whose primary class matches."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindAssetDependenciesSchema()
+{
+	return AddAsset(FSchemaBuilder::Object())
+		.OptionalBoolean(TEXT("includeSoft"), TEXT("Include soft (TSoftObjectPtr / lazy) references. Default true."))
+		.OptionalString(TEXT("assetClassFilter"), TEXT("Optional class path; only return assets whose primary class matches."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeFindInterfaceImplementationsSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredString(TEXT("interfaceClass"), TEXT("Interface class path (e.g. /Game/X/BPI_MyInterface.BPI_MyInterface_C or /Script/Engine.MyInterface)."))
+		.OptionalBoolean(TEXT("includeChildClasses"), TEXT("Include implementations of subinterfaces. Default true."))
+		.Build();
+}
+
+static TSharedPtr<FJsonObject> MakeAssetListOutputSchema()
+{
+	return FSchemaBuilder::Object()
+		.RequiredArray(TEXT("assets"), TEXT("Matching asset paths."))
+		.RequiredNumber(TEXT("count"), TEXT("Number of matching assets."))
+		.Build();
+}
+
 static TSharedPtr<FJsonObject> MakeGetBlueprintDefaultOutputSchema()
 {
 	return FSchemaBuilder::Object()
@@ -1161,6 +1210,11 @@ void RegisterBlueprintBridgeCommands()
 
 	RegisterCommand(TEXT("SetBlueprintDefault"), TEXT("Sets a Blueprint class default value."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetBlueprintDefaultSchema(), &SetBlueprintDefault);
 	RegisterCommand(TEXT("GetBlueprintDefault"), TEXT("Returns a Blueprint class default (CDO) value for a named property."), TEXT("BlueprintVariables"), ECommandRisk::ReadOnly, MakeGetBlueprintDefaultSchema(), &GetBlueprintDefault, MakeGetBlueprintDefaultOutputSchema());
+	RegisterCommand(TEXT("RenameBlueprintVariable"), TEXT("Renames a Blueprint member variable. UE rewrites in-graph references to the renamed variable in the same Blueprint automatically. Errors if newName already exists."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeRenameBlueprintVariableSchema(), &RenameBlueprintVariable);
+	RegisterCommand(TEXT("RemoveBlueprintVariable"), TEXT("Removes a Blueprint member variable. In-graph references are NOT validated; orphaned references will surface at compile time. Use FindVariableReferences first to pre-check."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeRemoveBlueprintVariableSchema(), &RemoveBlueprintVariable);
+	RegisterCommand(TEXT("FindAssetReferences"), TEXT("Returns asset paths that reference the given asset (incoming references via the asset registry). Cross-asset; for in-graph variable references inside one Blueprint, use FindVariableReferences."), TEXT("AssetRegistry"), ECommandRisk::ReadOnly, MakeFindAssetReferencesSchema(), &FindAssetReferences, MakeAssetListOutputSchema());
+	RegisterCommand(TEXT("FindAssetDependencies"), TEXT("Returns asset paths that the given asset depends on (outgoing references via the asset registry)."), TEXT("AssetRegistry"), ECommandRisk::ReadOnly, MakeFindAssetDependenciesSchema(), &FindAssetDependencies, MakeAssetListOutputSchema());
+	RegisterCommand(TEXT("FindInterfaceImplementations"), TEXT("Returns Blueprint asset paths that implement the given interface class."), TEXT("AssetRegistry"), ECommandRisk::ReadOnly, MakeFindInterfaceImplementationsSchema(), &FindInterfaceImplementations, MakeAssetListOutputSchema());
 	RegisterCommand(TEXT("SetSubobjectDefault"), TEXT("Sets a Blueprint subobject default value."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetSubobjectDefaultSchema(), &SetSubobjectDefault);
 	RegisterCommand(TEXT("SetBlueprintVariableFlags"), TEXT("Sets Blueprint variable flags."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeSetBlueprintVariableFlagsSchema(), &SetBlueprintVariableFlags);
 	RegisterCommand(TEXT("AddBlueprintVariable"), TEXT("Adds a Blueprint member variable."), TEXT("BlueprintVariables"), ECommandRisk::ModifiesAsset, MakeAddBlueprintVariableSchema(), &AddBlueprintVariable);

@@ -26,7 +26,7 @@ BlueprintBridge is functional and has been used to create and iterate on real Bl
 - event graph and function graph creation/editing
 - node creation for variables, branches, sequences, functions, events, custom events, dynamic casts, spawn actor, macros, structs, delegates, timers, traces, arrays, math helpers, UMG runtime calls, and Create Widget
 - pin linking, link movement, link breaking, pin defaults, type copying, safer pin lookup aliases, node movement, and node deletion
-- declarative graph patches (`ApplyGraphPatch`/`ApplyFunctionPatch`) and a Semantic IR (`LowerSemanticFunction`/`ApplySemanticFunction`) that lowers high-level intent (`if`, `return`, pure/impure `call`, `set`, `seq`) into patches
+- declarative graph patches (`ApplyGraphPatch`/`ApplyFunctionPatch`) and a Semantic IR (`LowerSemanticFunction`/`ApplySemanticFunction`) that lowers high-level intent (`if`, `return`, pure/impure `call`, `set`, `seq`, `let`, `cast`, `forEach`, `for`, `while`, `break`, `continue`) into patches
 - optional `fields` selector on every inspection command for trimmed responses (`["nodes.title"]`, `["variables.name"]`, etc.)
 - `DescribeGraph` defaults to the compact summary shape (entry/result nodes, execution chains, function calls, branches, variable reads/writes); the previous per-node/per-pin dump is available as `DescribeGraphFull`
 - one-shot asset description via `SummarizeBlueprint` — parent class, interfaces, variables, components, delegates, and per-graph summaries in a single response
@@ -939,7 +939,100 @@ A higher-level layer above `ApplyFunctionPatch`. The caller writes a function si
 }
 ```
 
-v1 statement forms: `call` (impure), `set`, `if`/`then`/`else`, `seq`, `return`. v1 expression forms: `var`, `in`, `self`, `lit`, `call` (pure). Function references use the full UFunction path (`/Script/Package.Class.Function`). Calling a pure function in statement position or an impure function in expression position is a lowering error and the response carries a `pointer` field locating the offending IR node (e.g. `flow[0].if.args.Context`). Loops, `cast`, `switch`, `let` bindings, and delegate bind/broadcast are scheduled for v2.
+Statement forms: `call` (impure), `set`, `if`/`then`/`else`, `seq`, `return`, **`let`** (v2), **`cast`** (v2), **`forEach`/`for`** (v2), **`while`/`break`/`continue`** (v2). Expression forms: `var`, `in`, `self`, `lit`, `call` (pure or impure with auto-hoist), and v2 sugar — **`==` `!=` `<` `<=` `>` `>=`** (comparison), **`and` `or` `not`** (logical). Function references use the full UFunction path (`/Script/Package.Class.Function`). Calling a pure function in statement position is a lowering error; impure functions in expression position **auto-hoist by default** (set `strictPureExpressions: true` on the request to restore the v1 error). `switch` and delegate bind/broadcast are scheduled for later v2 PRs.
+
+##### `let` bindings (v2)
+
+Name a value, reuse it without re-computing. Bindings are visible only inside the `in` block; inner `let`s can shadow outer names.
+
+```json
+{"let": [
+   {"name": "n", "value": {"call": "/Script/X.GetCount", "args": {}}},
+   {"name": "high", "value": {">": ["n", 10]}}
+ ],
+ "in": [
+   {"if": "high", "then": [{"return": {"Out": "n"}}]}
+ ]}
+```
+
+If a binding's value contains an impure call (or is itself impure), the call's exec is sequenced into the surrounding flow automatically. The result pin is bound to the name; multiple references reuse the same node, so the side-effect runs once.
+
+**Eager binding semantics.** Binding values are evaluated when the `let` statement runs, not lazily on first use. An impure binding always executes, even if `in` doesn't reference the name. If you want conditional evaluation, put the impure call inside the conditional branch rather than in the `let`.
+
+##### `cast` statements (v2)
+
+Branch on a runtime object cast. The `as` binding is visible only inside `then`; it does not leak into `else` or following statements.
+
+```json
+{"cast": {"self": true},
+ "to": "/Script/Engine.Actor",
+ "as": "ActorSelf",
+ "then": [{"return": {"Actor": "ActorSelf"}}],
+ "else": []}
+```
+
+Lowering emits a `K2Node_DynamicCast`, wires the input expression into `Object`, starts `then` from the cast success pin, starts `else` from `CastFailed`, and unions both exits for downstream statements. The cast target must be a loadable class path.
+
+##### `forEach` / `for` loops (v2)
+
+`forEach` iterates an array expression. The `as` binding is visible only inside `body`; `<as>_Index` is also available as an `int` index binding.
+
+```json
+{"forEach": "Targets",
+ "as": "Target",
+ "body": [
+   {"call": "/Script/MyGame.TargetLibrary.Mark", "args": {"Target": "Target", "Index": "Target_Index"}}
+ ]}
+```
+
+`for` emits the standard Blueprint `ForLoop` macro. `as` is an `int` induction variable scoped to `body`.
+
+```json
+{"for": {"from": 0, "to": 5},
+ "as": "i",
+ "body": [{"call": "/Script/MyGame.LoopLibrary.Visit", "args": {"Index": "i"}}]}
+```
+
+Loop induction bindings shadow outer `let`/loop bindings for the body only. After the body exits, the outer binding (if any) is restored; otherwise the bare name falls back through normal resolution.
+
+##### `while`, `break`, and `continue` (v2)
+
+`while` emits the standard Blueprint `WhileLoop` macro. The condition must lower to bool. `break` and `continue` are valid only inside loop bodies and target the innermost loop.
+
+```json
+{"while": {"<": ["i", 10]},
+ "body": [
+   {"if": "Done", "then": [{"break": true}]},
+   {"if": "Skip", "then": [{"continue": true}]}
+ ]}
+```
+
+`break` exits to the next statement after the loop. `continue` links back to the loop test. A `break` or `continue` outside a loop is a lowering error.
+
+##### Operator sugar (v2)
+
+| Operator | IR | Lowers to (`/Script/Engine.KismetMathLibrary`) |
+|---|---|---|
+| `==` `!=` `<` `<=` `>` `>=` | `{"==": [a, b]}` | `EqualEqual_IntInt` / `EqualEqual_FloatFloat` / `EqualEqual_BoolBool` / `EqualEqual_NameName` / `EqualEqual_StrStr` / `EqualEqual_ObjectObject`, type-dispatched on operands |
+| `and` / `or` | `{"and": [a, b, c]}` (n-ary) | nested `BooleanAND` / `BooleanOR`, chained left-to-right |
+| `not` | `{"not": a}` | `Not_PreBool` |
+
+Type dispatch reads the resolved type of each operand. Literals on one side use the other side's type. Mixed numeric types (int + float) lift to float. Logical operators require bool operands; non-bool input is a lowering error with a pointer to the offending operand.
+
+##### Auto-hoist (v2)
+
+Impure calls in expression position are sequenced into the exec chain automatically.
+
+```json
+// you write
+{"return": {"X": {"call": "/Script/Impure.GetThing", "args": {}}}}
+
+// the bridge emits the impure call, wires its exec into the enclosing flow, and uses
+// its ReturnValue pin as the 'X' return value. The resolutions map records the call
+// site as 'hoist:impure' so callers can audit.
+```
+
+Opt out per-request with `"strictPureExpressions": true` — useful for callers that want the v1 hard error as a validation gate.
 
 #### `ReplaceSemanticFunction`
 
@@ -1322,6 +1415,17 @@ Inspection responses can be large — a `DescribeGraphFull` on a 30-node functio
 
 **Don't widen scope speculatively.** When diagnosing a specific function, a `DescribeGraph` plus a targeted `DescribeSubgraph` is normally enough. Pulling the caller's full graph "just to verify what gets passed in" typically doubles the cost and rarely changes the diagnosis — trust the function-under-inspection's signature and only widen if the in-function evidence is genuinely inconclusive.
 
+**Use the `assetVersion` short-circuit.** Every response that includes a `params.asset` carries `result.assetVersion: <int>` — a monotonic counter the bridge bumps on every successful mutation of that asset. Pass the stashed value back on any subsequent inspection of the same asset via `params.ifAssetVersionDiffersFrom: <int>`. If the asset hasn't changed, the bridge returns a minimal `{unchanged: true, assetVersion: <int>}` response and skips dispatch entirely — no full payload, no token cost beyond the envelope.
+
+```json
+{"command": "DescribeGraph", "params": {"asset": "/Game/X.X", "graph": "G", "ifAssetVersionDiffersFrom": 42}}
+```
+
+- Versions are **session-scoped** — they live in editor memory and reset to 1 on editor restart. Don't persist them across sessions; refetch on first call.
+- A passed value of **0 never matches** (versions start at 1), so stale `0` from prior storage always returns the full payload.
+- Mutations that return a string result (e.g. `AddBlueprintVariable` returns `"VariableAdded"`) cannot carry `assetVersion` in the response shape — do a quick describe afterward to learn the new version if you need it.
+- The counter is **per asset**, not per graph. Any mutation to any graph in an asset bumps that asset's version. Finer granularity is a future improvement.
+
 ### Resolve schemas before scripting, not by guessing
 
 The shortest path to a correct `params` shape is `DescribeCommand`, the generated reference produced by `GenerateCommandDocs`, or the checked-in quick reference in `docs/blueprint_bridge_commands.md`. Param names are not always obvious from the command name. Common mismatches that have bitten clients:
@@ -1405,6 +1509,18 @@ On Windows, invoke BlueprintBridge through the PowerShell helper or a direct nam
 ### Reuse rather than rebuild when the pattern repeats
 
 If you find yourself constructing a near-identical function graph for the Nth time (typical for per-ability scoring functions, per-state handlers, etc.), prefer `DuplicateFunctionGraph` with `renames` for functions within the same Blueprint, or `DuplicateAsset` on a template Blueprint when the whole asset is reusable. Rebuilding 15+ nodes via individual node and connection calls is the slowest path.
+
+### Cross-asset reference queries
+
+`FindAssetReferences`, `FindAssetDependencies`, and `FindInterfaceImplementations` operate at the **asset registry** level. They answer questions like "which assets reference BP_Foo?" or "which Blueprints implement BPI_Damageable?" without loading any of those assets. They are the right tool when:
+
+- Refactoring — rename or move an asset, and you need to find consumers first.
+- Auditing — confirm a deprecated asset is unreferenced before deleting it.
+- Understanding — locate all implementers of an interface before changing its signature.
+
+For *in-graph* references (variable usage, function calls) inside a single Blueprint, use `FindVariableReferences` or `FindFunctionCallNodes` instead — those operate on the graph data, not the registry.
+
+`RemoveBlueprintVariable` does NOT validate in-graph references. The recommended pattern when removing a variable is: call `FindVariableReferences` first, decide how to handle any matches (`DeleteNode`, replace with a literal, etc.), then call `RemoveBlueprintVariable`. Skipping the pre-check is fine if you know there are none; otherwise dangling references will surface at compile time.
 
 ## Automation tests
 
@@ -1531,7 +1647,7 @@ The bridge's authoring surface is wide enough for most workflows now. Future wor
 
 ### Token efficiency & speed (priority)
 
-1. **Semantic IR v2** — Add `let` bindings, `forEach`/`for`, `switch`, `cast`, `bind`/`broadcast`, and auto-hoist of impure expressions to the IR. Each construct shipping in IR collapses multi-call `ApplyGraphPatch` fallback patterns into a single `ApplySemanticFunction` request. This is the highest-leverage future change because every gap in the IR forces the LLM into the lower-level patch surface.
+1. **Semantic IR v2** — `let` bindings, `cast`, `forEach`/`for`, `while`/`break`/`continue`, auto-hoist of impure expressions, and comparison + logical operator sugar (`==`, `!=`, `<`, `<=`, `>`, `>=`, `and`, `or`, `not`) **shipped**. Still queued: `switch`, local variable declarations, struct member assignment, `bind`/`broadcast`. Each follow-up PR reuses the scope-stack mechanism the foundation introduced.
 
 2. **Diff-based editing (`PatchSemanticFunction`)** — `insertBefore` / `replace` / `delete` operations on existing graph nodes. `ReplaceSemanticFunction` already handles whole-function rewrites; diffs would let small edits scale with the size of the change instead of the size of the function. Design is gated on dogfooding evidence about which edit patterns dominate.
 
@@ -1547,7 +1663,7 @@ The bridge's authoring surface is wide enough for most workflows now. Future wor
 
 8. **Incremental compile** — `CompileBlueprint` currently does a full compile pass. UE's KismetCompiler supports incremental compilation; exposing it would cut multi-second waits on big Blueprints during apply→compile→fix loops.
 
-9. **Reference queries** — `FindAllReferences(variable)`, `WhereIsUsed(function)`, `FindAllImplementations(interface)`. Reflection iterators have this information cheaply; surfacing it eliminates grep round-trips for "what calls this?" / "what implements this?" workflows. Borderline between capability and efficiency, but it replaces work the LLM does today via the file-search tool.
+9. **Reference queries** — ~~`FindAllReferences(variable)`, `WhereIsUsed(function)`, `FindAllImplementations(interface)`~~. **Shipped** as `FindAssetReferences`, `FindAssetDependencies`, and `FindInterfaceImplementations` (asset-registry-level); see "Cross-asset reference queries" under Tips for scripted clients.
 
 10. **Snippet/template library expansion** — Pre-built `ApplyGraphSnippet` templates for common patterns (event bind, scoring function, save handler, etc.) with binding substitution. Each snippet replaces a full IR construction.
 
@@ -1563,7 +1679,7 @@ Surface-area additions, deferred until dogfooding shows they unblock real workfl
 - Behavior Tree / StateTree asset operations
 - Material graph authoring (currently completely out of scope)
 - Niagara emitter/module operations
-- Remove/rename Blueprint variables (currently can only add)
+- ~~Remove/rename Blueprint variables (currently can only add)~~ — **Shipped** as `RemoveBlueprintVariable` and `RenameBlueprintVariable`.
 - More delegate unbind/clear helpers
 - Richer array/map/set graph operations
 - More trace/collision and math node helpers

@@ -9,7 +9,8 @@ param(
 	[string]$AuthToken = $env:BLUEPRINTBRIDGE_AUTH_TOKEN,
 	[string]$RequestJson,
 	[string]$RequestFile,
-	[string]$Fields
+	[string]$Fields,
+	[Nullable[long]]$IfAssetVersionDiffersFrom
 )
 
 $ErrorActionPreference = "Stop"
@@ -107,6 +108,30 @@ function New-RequestObject {
 			if ($RemainingArgs.Count -lt 2) { throw "get-blueprint-default requires: asset property." }
 			return @{ id = $id; version = 1; command = "GetBlueprintDefault"; params = @{ asset = $RemainingArgs[0]; property = $RemainingArgs[1] } }
 		}
+		"rename-blueprint-variable" {
+			if ($RemainingArgs.Count -lt 3) { throw "rename-blueprint-variable requires: asset variable newName." }
+			return @{ id = $id; version = 1; command = "RenameBlueprintVariable"; params = @{ asset = $RemainingArgs[0]; variable = $RemainingArgs[1]; newName = $RemainingArgs[2] } }
+		}
+		"remove-blueprint-variable" {
+			if ($RemainingArgs.Count -lt 2) { throw "remove-blueprint-variable requires: asset variable." }
+			return @{ id = $id; version = 1; command = "RemoveBlueprintVariable"; params = @{ asset = $RemainingArgs[0]; variable = $RemainingArgs[1] } }
+		}
+		"find-asset-references" {
+			if ($RemainingArgs.Count -lt 1) { throw "find-asset-references requires: asset [assetClassFilter]." }
+			$params = @{ asset = $RemainingArgs[0] }
+			if ($RemainingArgs.Count -ge 2) { $params.assetClassFilter = $RemainingArgs[1] }
+			return @{ id = $id; version = 1; command = "FindAssetReferences"; params = $params }
+		}
+		"find-asset-dependencies" {
+			if ($RemainingArgs.Count -lt 1) { throw "find-asset-dependencies requires: asset [assetClassFilter]." }
+			$params = @{ asset = $RemainingArgs[0] }
+			if ($RemainingArgs.Count -ge 2) { $params.assetClassFilter = $RemainingArgs[1] }
+			return @{ id = $id; version = 1; command = "FindAssetDependencies"; params = $params }
+		}
+		"find-interface-implementations" {
+			if ($RemainingArgs.Count -lt 1) { throw "find-interface-implementations requires: interfaceClass." }
+			return @{ id = $id; version = 1; command = "FindInterfaceImplementations"; params = @{ interfaceClass = $RemainingArgs[0] } }
+		}
 		"find-variable-references" {
 			if ($RemainingArgs.Count -lt 2) { throw "find-variable-references requires: asset variable." }
 			return @{ id = $id; version = 1; command = "FindVariableReferences"; params = @{ asset = $RemainingArgs[0]; variable = $RemainingArgs[1] } }
@@ -173,7 +198,7 @@ function New-RequestObject {
 			if ($RemainingArgs.Count -ge 5) { $params.subCategoryObject = $RemainingArgs[4] }
 			return @{ id = $id; version = 1; command = "AddBlueprintVariable"; params = $params }
 		}
-		default { throw "Unknown command '$Command'. Inspection: ping, project, engine-version, list-commands, describe-command, describe-blueprint, summarize-blueprint, describe-graph, describe-graph-full, describe-node, describe-subgraph, get-connected-nodes, find-nodes, find-variable-references, describe-components, describe-subobjects, get-blueprint-default. Mutation: add-component, attach-component, set-component-property, create-blueprint-asset, duplicate-asset, checkout-asset, compile-blueprint, save-asset, set-blueprint-default, set-subobject-default, add-blueprint-variable. Escape hatch: -RequestJson, -RequestFile (see ListCommands for every supported command)." }
+		default { throw "Unknown command '$Command'. Inspection: ping, project, engine-version, list-commands, describe-command, describe-blueprint, summarize-blueprint, describe-graph, describe-graph-full, describe-node, describe-subgraph, get-connected-nodes, find-nodes, find-variable-references, find-asset-references, find-asset-dependencies, find-interface-implementations, describe-components, describe-subobjects, get-blueprint-default. Mutation: add-component, attach-component, set-component-property, create-blueprint-asset, duplicate-asset, checkout-asset, compile-blueprint, save-asset, set-blueprint-default, set-subobject-default, add-blueprint-variable, rename-blueprint-variable, remove-blueprint-variable. Escape hatch: -RequestJson, -RequestFile (see ListCommands for every supported command)." }
 	}
 }
 
@@ -183,6 +208,24 @@ if ($RequestFile) {
 	$request = Parse-RequestJson $RequestJson
 } else {
 	$request = New-RequestObject $Command $RemainingArgs
+}
+
+if ($PSBoundParameters.ContainsKey('IfAssetVersionDiffersFrom')) {
+	if ($request -is [hashtable]) {
+		if (-not $request.ContainsKey('params') -or $null -eq $request['params']) { $request['params'] = @{} }
+		if ($request['params'] -is [hashtable]) {
+			$request['params']['ifAssetVersionDiffersFrom'] = [long]$IfAssetVersionDiffersFrom
+		} else {
+			$request['params'] | Add-Member -NotePropertyName ifAssetVersionDiffersFrom -NotePropertyValue ([long]$IfAssetVersionDiffersFrom) -Force
+		}
+	} else {
+		$paramsProp = $request.PSObject.Properties['params']
+		if (-not $paramsProp -or $null -eq $paramsProp.Value) {
+			$request | Add-Member -NotePropertyName params -NotePropertyValue ([pscustomobject]@{ ifAssetVersionDiffersFrom = [long]$IfAssetVersionDiffersFrom }) -Force
+		} else {
+			$paramsProp.Value | Add-Member -NotePropertyName ifAssetVersionDiffersFrom -NotePropertyValue ([long]$IfAssetVersionDiffersFrom) -Force
+		}
+	}
 }
 
 if ($Fields) {

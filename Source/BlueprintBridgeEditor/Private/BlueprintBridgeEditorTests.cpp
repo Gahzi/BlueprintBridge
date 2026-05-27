@@ -3621,7 +3621,10 @@ bool FBlueprintBridgeSemanticIRImpureInExpressionTest::RunTest(const FString& Pa
 	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
 	Params->SetArrayField(TEXT("outputs"), Outputs);
 
-	// Impure call (PrintString) used as a return-value expression — should error.
+	// v2 behavior: impure call (PrintString) used in expression position auto-hoists
+	// into the exec chain rather than erroring (the v1 error required the caller to
+	// manually hoist via set/var). The lowering should succeed and annotate the call
+	// site with 'hoist:impure' in the resolutions map.
 	TSharedRef<FJsonObject> CallExpr = MakeShared<FJsonObject>();
 	CallExpr->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.PrintString"));
 	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
@@ -3633,15 +3636,382 @@ bool FBlueprintBridgeSemanticIRImpureInExpressionTest::RunTest(const FString& Pa
 	Params->SetArrayField(TEXT("flow"), Flow);
 
 	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
-	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("SemanticLoweringFailed")))
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response))
 	{
 		return false;
 	}
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	TestTrue(TEXT("Lowering should succeed and surface a resolutions map."), Result && (*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) && Resolutions && Resolutions->IsValid());
+	if (!Resolutions || !Resolutions->IsValid()) { return false; }
+	FString Hoist;
+	TestTrue(TEXT("Auto-hoist should annotate the impure call site as 'hoist:impure'."), (*Resolutions)->TryGetStringField(TEXT("flow[0].return.Out.call"), Hoist) && Hoist == TEXT("hoist:impure"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRStrictPureExpressionsTest, "BlueprintBridge.Blueprint.SemanticIR.StrictPureExpressions", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRStrictPureExpressionsTest::RunTest(const FString& Parameters)
+{
+	// Opt-in: strictPureExpressions=true restores the v1 hard error for impure calls
+	// in expression position, for callers that want validation rather than auto-hoist.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemStrictPure"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("StrictFn"));
+	Params->SetBoolField(TEXT("strictPureExpressions"), true);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> CallExpr = MakeShared<FJsonObject>();
+	CallExpr->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.PrintString"));
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetObjectField(TEXT("Out"), CallExpr);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("SemanticLoweringFailed"))) { return false; }
 	const TSharedPtr<FJsonObject>* Error = nullptr;
 	Response->TryGetObjectField(TEXT("error"), Error);
-	FString Pointer;
-	TestTrue(TEXT("Error should carry a pointer to the offending IR location."), Error && (*Error)->TryGetStringField(TEXT("pointer"), Pointer) && Pointer.Contains(TEXT("flow[0].return.Out")));
+	FString Message;
+	Error && (*Error)->TryGetStringField(TEXT("message"), Message);
+	return TestTrue(TEXT("Strict error should mention strictPureExpressions."), Message.Contains(TEXT("strictPureExpressions")));
+}
+
+namespace BlueprintBridgeTests
+{
+// Count nodes of a specific 'type' (or matching FunctionCall by function name) in a lowered patch.
+static int32 CountPatchNodes(const TSharedPtr<FJsonObject>& Result, const FString& NodeType, const FString& FunctionName = FString())
+{
+	if (!Result.IsValid()) { return 0; }
+	const TSharedPtr<FJsonObject>* Patch = nullptr;
+	if (!Result->TryGetObjectField(TEXT("patch"), Patch) || !Patch || !(*Patch).IsValid()) { return 0; }
+	const TArray<TSharedPtr<FJsonValue>>* Nodes = nullptr;
+	if (!(*Patch)->TryGetArrayField(TEXT("nodes"), Nodes) || !Nodes) { return 0; }
+	int32 Count = 0;
+	for (const TSharedPtr<FJsonValue>& V : *Nodes)
+	{
+		const TSharedPtr<FJsonObject>* NodeObj = nullptr;
+		if (!V->TryGetObject(NodeObj) || !NodeObj) { continue; }
+		FString Type;
+		(*NodeObj)->TryGetStringField(TEXT("type"), Type);
+		if (Type != NodeType) { continue; }
+		if (FunctionName.IsEmpty()) { ++Count; continue; }
+		FString Func;
+		if ((*NodeObj)->TryGetStringField(TEXT("function"), Func) && Func == FunctionName) { ++Count; }
+	}
+	return Count;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLetMultipleUseTest, "BlueprintBridge.Blueprint.SemanticIR.Let.MultipleUse", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLetMultipleUseTest::RunTest(const FString& Parameters)
+{
+	// A let-bound value referenced twice should produce ONE source node, not two.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLetMulti"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("Hp"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams))) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LetMulti"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	// let n = Hp in [ if (n == 5) then return Out=n else return Out=n ]
+	TSharedRef<FJsonObject> Binding = MakeShared<FJsonObject>();
+	Binding->SetStringField(TEXT("name"), TEXT("n"));
+	Binding->SetStringField(TEXT("value"), TEXT("Hp"));
+	TArray<TSharedPtr<FJsonValue>> Bindings; Bindings.Add(MakeShared<FJsonValueObject>(Binding));
+
+	TSharedRef<FJsonObject> EqExpr = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> EqOps;
+	EqOps.Add(MakeShared<FJsonValueString>(TEXT("n")));
+	EqOps.Add(MakeShared<FJsonValueNumber>(5));
+	EqExpr->SetArrayField(TEXT("=="), EqOps);
+
+	auto MakeReturnN = []()
+	{
+		TSharedRef<FJsonObject> Ret = MakeShared<FJsonObject>();
+		TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+		Fields->SetStringField(TEXT("Out"), TEXT("n"));
+		Ret->SetObjectField(TEXT("return"), Fields);
+		return Ret;
+	};
+
+	TSharedRef<FJsonObject> IfStmt = MakeShared<FJsonObject>();
+	IfStmt->SetObjectField(TEXT("if"), EqExpr);
+	TArray<TSharedPtr<FJsonValue>> ThenArr; ThenArr.Add(MakeShared<FJsonValueObject>(MakeReturnN()));
+	TArray<TSharedPtr<FJsonValue>> ElseArr; ElseArr.Add(MakeShared<FJsonValueObject>(MakeReturnN()));
+	IfStmt->SetArrayField(TEXT("then"), ThenArr);
+	IfStmt->SetArrayField(TEXT("else"), ElseArr);
+
+	TSharedRef<FJsonObject> LetStmt = MakeShared<FJsonObject>();
+	LetStmt->SetArrayField(TEXT("let"), Bindings);
+	TArray<TSharedPtr<FJsonValue>> InArr; InArr.Add(MakeShared<FJsonValueObject>(IfStmt));
+	LetStmt->SetArrayField(TEXT("in"), InArr);
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(LetStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const int32 GetCount = BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("VariableGet"));
+	return TestEqual(TEXT("Let-bound variable referenced 3 times should produce exactly 1 VariableGet node."), GetCount, 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLetShadowingTest, "BlueprintBridge.Blueprint.SemanticIR.Let.Shadowing", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLetShadowingTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLetShadow"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LetShadow"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	// Outer: let n = 1 in [ Inner: let n = 2 in [ return Out=n ] ]
+	auto MakeLit = [](double V)
+	{
+		TSharedRef<FJsonObject> Binding = MakeShared<FJsonObject>();
+		Binding->SetStringField(TEXT("name"), TEXT("n"));
+		Binding->SetNumberField(TEXT("value"), V);
+		return Binding;
+	};
+
+	TSharedRef<FJsonObject> ReturnN = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+	Fields->SetStringField(TEXT("Out"), TEXT("n"));
+	ReturnN->SetObjectField(TEXT("return"), Fields);
+
+	TSharedRef<FJsonObject> InnerLet = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> InnerBindings; InnerBindings.Add(MakeShared<FJsonValueObject>(MakeLit(2)));
+	InnerLet->SetArrayField(TEXT("let"), InnerBindings);
+	TArray<TSharedPtr<FJsonValue>> InnerIn; InnerIn.Add(MakeShared<FJsonValueObject>(ReturnN));
+	InnerLet->SetArrayField(TEXT("in"), InnerIn);
+
+	TSharedRef<FJsonObject> OuterLet = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> OuterBindings; OuterBindings.Add(MakeShared<FJsonValueObject>(MakeLit(1)));
+	OuterLet->SetArrayField(TEXT("let"), OuterBindings);
+	TArray<TSharedPtr<FJsonValue>> OuterIn; OuterIn.Add(MakeShared<FJsonValueObject>(InnerLet));
+	OuterLet->SetArrayField(TEXT("in"), OuterIn);
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(OuterLet));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	TestTrue(TEXT("'n' in inner block should resolve to scope binding (inner shadow)."), (*Resolutions)->TryGetStringField(TEXT("flow[0].in[0].in[0].return.Out"), Resolved) && Resolved == TEXT("scope:n"));
 	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLetScopePopTest, "BlueprintBridge.Blueprint.SemanticIR.Let.ScopePop", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLetScopePopTest::RunTest(const FString& Parameters)
+{
+	// A name introduced by let must not leak past its 'in' block. A reference after the
+	// let should resolve as a string literal (existing bare-string fallback), not as the
+	// scoped binding.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLetPop"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LetPop"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> LetStmt = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Binding = MakeShared<FJsonObject>();
+	Binding->SetStringField(TEXT("name"), TEXT("scoped_name"));
+	Binding->SetNumberField(TEXT("value"), 99);
+	TArray<TSharedPtr<FJsonValue>> Bindings; Bindings.Add(MakeShared<FJsonValueObject>(Binding));
+	LetStmt->SetArrayField(TEXT("let"), Bindings);
+	TArray<TSharedPtr<FJsonValue>> InArr; // empty body — binding is unused
+	LetStmt->SetArrayField(TEXT("in"), InArr);
+
+	TSharedRef<FJsonObject> AfterReturn = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+	Fields->SetStringField(TEXT("Out"), TEXT("scoped_name"));
+	AfterReturn->SetObjectField(TEXT("return"), Fields);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(LetStmt));
+	Flow.Add(MakeShared<FJsonValueObject>(AfterReturn));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	TestTrue(TEXT("After let exits, name should fall through to string literal — not the popped scope binding."), (*Resolutions)->TryGetStringField(TEXT("flow[1].return.Out"), Resolved) && Resolved == TEXT("literal:string"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIROperatorEqIntTest, "BlueprintBridge.Blueprint.SemanticIR.Operator.EqInt", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIROperatorEqIntTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemOpEqInt"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("OpEqInt"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("X"), TEXT("int"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Eq"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> EqExpr = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> EqOps;
+	EqOps.Add(MakeShared<FJsonValueString>(TEXT("X")));
+	EqOps.Add(MakeShared<FJsonValueNumber>(5));
+	EqExpr->SetArrayField(TEXT("=="), EqOps);
+
+	TSharedRef<FJsonObject> Ret = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+	Fields->SetObjectField(TEXT("Eq"), EqExpr);
+	Ret->SetObjectField(TEXT("return"), Fields);
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(Ret));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const int32 EqIntInt = BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("FunctionCall"), TEXT("EqualEqual_IntInt"));
+	return TestEqual(TEXT("int == int should dispatch to EqualEqual_IntInt."), EqIntInt, 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIROperatorLogicalAndTest, "BlueprintBridge.Blueprint.SemanticIR.Operator.LogicalAnd", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIROperatorLogicalAndTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemOpAnd"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("OpAnd"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("A"), TEXT("bool"))));
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("B"), TEXT("bool"))));
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("C"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("R"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> AndExpr = MakeShared<FJsonObject>();
+	TArray<TSharedPtr<FJsonValue>> AndOps;
+	AndOps.Add(MakeShared<FJsonValueString>(TEXT("A")));
+	AndOps.Add(MakeShared<FJsonValueString>(TEXT("B")));
+	AndOps.Add(MakeShared<FJsonValueString>(TEXT("C")));
+	AndExpr->SetArrayField(TEXT("and"), AndOps);
+
+	TSharedRef<FJsonObject> Ret = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+	Fields->SetObjectField(TEXT("R"), AndExpr);
+	Ret->SetObjectField(TEXT("return"), Fields);
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(Ret));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const int32 AndCount = BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("FunctionCall"), TEXT("BooleanAND"));
+	return TestEqual(TEXT("Ternary 'and' should chain into 2 BooleanAND nodes."), AndCount, 2);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIROperatorLogicalNotTest, "BlueprintBridge.Blueprint.SemanticIR.Operator.LogicalNot", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIROperatorLogicalNotTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemOpNot"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("OpNot"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Flag"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("R"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> NotExpr = MakeShared<FJsonObject>();
+	NotExpr->SetStringField(TEXT("not"), TEXT("Flag"));
+
+	TSharedRef<FJsonObject> Ret = MakeShared<FJsonObject>();
+	TSharedRef<FJsonObject> Fields = MakeShared<FJsonObject>();
+	Fields->SetObjectField(TEXT("R"), NotExpr);
+	Ret->SetObjectField(TEXT("return"), Fields);
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(Ret));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const int32 NotCount = BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("FunctionCall"), TEXT("Not_PreBool"));
+	return TestEqual(TEXT("'not' should produce exactly one Not_PreBool node."), NotCount, 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRAutoHoistInIfTest, "BlueprintBridge.Blueprint.SemanticIR.AutoHoist.InIfCondition", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRAutoHoistInIfTest::RunTest(const FString& Parameters)
+{
+	// Impure call as an 'if' condition should auto-hoist with no error.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemHoistIf"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("HoistIf"));
+
+	TSharedRef<FJsonObject> CallExpr = MakeShared<FJsonObject>();
+	// PrintString returns nothing useful but the lowering shouldn't care about that —
+	// the hoist path just needs an impure UFunction. We pick PrintString because it's
+	// reliably present in the engine.
+	CallExpr->SetStringField(TEXT("call"), TEXT("/Script/Engine.KismetSystemLibrary.PrintString"));
+
+	TSharedRef<FJsonObject> IfStmt = MakeShared<FJsonObject>();
+	IfStmt->SetObjectField(TEXT("if"), CallExpr);
+	IfStmt->SetArrayField(TEXT("then"), TArray<TSharedPtr<FJsonValue>>());
+	IfStmt->SetArrayField(TEXT("else"), TArray<TSharedPtr<FJsonValue>>());
+
+	TArray<TSharedPtr<FJsonValue>> Flow; Flow.Add(MakeShared<FJsonValueObject>(IfStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Hoist;
+	return TestTrue(TEXT("Impure call in if-condition should be annotated as 'hoist:impure'."), (*Resolutions)->TryGetStringField(TEXT("flow[0].if.call"), Hoist) && Hoist == TEXT("hoist:impure"));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRPureCallAsStatementTest, "BlueprintBridge.Blueprint.SemanticIR.PureCallAsStatement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -3673,6 +4043,464 @@ bool FBlueprintBridgeSemanticIRPureCallAsStatementTest::RunTest(const FString& P
 	Error && (*Error)->TryGetStringField(TEXT("message"), Message);
 	TestTrue(TEXT("Error should mention dead-code purity."), Message.Contains(TEXT("dead code")));
 	return true;
+}
+
+namespace BlueprintBridgeTests
+{
+static int32 CountPatchLinksTo(const TSharedPtr<FJsonObject>& Result, const FString& FromSuffix, const FString& To)
+{
+	if (!Result.IsValid()) { return 0; }
+	const TSharedPtr<FJsonObject>* Patch = nullptr;
+	if (!Result->TryGetObjectField(TEXT("patch"), Patch) || !Patch || !(*Patch).IsValid()) { return 0; }
+	const TArray<TSharedPtr<FJsonValue>>* Links = nullptr;
+	if (!(*Patch)->TryGetArrayField(TEXT("links"), Links) || !Links) { return 0; }
+
+	int32 Count = 0;
+	for (const TSharedPtr<FJsonValue>& Value : *Links)
+	{
+		const TSharedPtr<FJsonObject>* LinkObj = nullptr;
+		if (!Value.IsValid() || !Value->TryGetObject(LinkObj) || !LinkObj) { continue; }
+		FString From;
+		FString LinkTo;
+		(*LinkObj)->TryGetStringField(TEXT("from"), From);
+		(*LinkObj)->TryGetStringField(TEXT("to"), LinkTo);
+		if (From.EndsWith(FromSuffix) && LinkTo == To)
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRCastBasicTest, "BlueprintBridge.Blueprint.SemanticIR.Cast.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRCastBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemCastBasic"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("CastBasic"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("object"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> SelfExpr = MakeShared<FJsonObject>();
+	SelfExpr->SetBoolField(TEXT("self"), true);
+	TSharedRef<FJsonObject> CastStmt = MakeShared<FJsonObject>();
+	CastStmt->SetObjectField(TEXT("cast"), SelfExpr);
+	CastStmt->SetStringField(TEXT("to"), TEXT("/Script/Engine.Actor"));
+	CastStmt->SetStringField(TEXT("as"), TEXT("AsActor"));
+
+	TSharedRef<FJsonObject> ThenReturnFields = MakeShared<FJsonObject>();
+	ThenReturnFields->SetStringField(TEXT("Out"), TEXT("AsActor"));
+	TSharedRef<FJsonObject> ThenReturn = MakeShared<FJsonObject>();
+	ThenReturn->SetObjectField(TEXT("return"), ThenReturnFields);
+	TArray<TSharedPtr<FJsonValue>> ThenBlock;
+	ThenBlock.Add(MakeShared<FJsonValueObject>(ThenReturn));
+	CastStmt->SetArrayField(TEXT("then"), ThenBlock);
+
+	TSharedRef<FJsonObject> ElseSelf = MakeShared<FJsonObject>();
+	ElseSelf->SetBoolField(TEXT("self"), true);
+	TSharedRef<FJsonObject> ElseReturnFields = MakeShared<FJsonObject>();
+	ElseReturnFields->SetObjectField(TEXT("Out"), ElseSelf);
+	TSharedRef<FJsonObject> ElseReturn = MakeShared<FJsonObject>();
+	ElseReturn->SetObjectField(TEXT("return"), ElseReturnFields);
+	TArray<TSharedPtr<FJsonValue>> ElseBlock;
+	ElseBlock.Add(MakeShared<FJsonValueObject>(ElseReturn));
+	CastStmt->SetArrayField(TEXT("else"), ElseBlock);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CastStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("cast statement should emit exactly one DynamicCast node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("DynamicCast")), 1);
+
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("Cast result name should resolve from scope inside then."), (*Resolutions)->TryGetStringField(TEXT("flow[0].then[0].return.Out"), Resolved) && Resolved == TEXT("scope:AsActor"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRCastScopePopTest, "BlueprintBridge.Blueprint.SemanticIR.Cast.ScopePop", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRCastScopePopTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemCastPop"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("CastPop"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> SelfExpr = MakeShared<FJsonObject>();
+	SelfExpr->SetBoolField(TEXT("self"), true);
+	TSharedRef<FJsonObject> CastStmt = MakeShared<FJsonObject>();
+	CastStmt->SetObjectField(TEXT("cast"), SelfExpr);
+	CastStmt->SetStringField(TEXT("to"), TEXT("/Script/Engine.Actor"));
+	CastStmt->SetStringField(TEXT("as"), TEXT("AsActor"));
+	CastStmt->SetArrayField(TEXT("then"), TArray<TSharedPtr<FJsonValue>>());
+	CastStmt->SetArrayField(TEXT("else"), TArray<TSharedPtr<FJsonValue>>());
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetStringField(TEXT("Out"), TEXT("AsActor"));
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CastStmt));
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("Cast result name should not leak after then exits."), (*Resolutions)->TryGetStringField(TEXT("flow[1].return.Out"), Resolved) && Resolved == TEXT("literal:string"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRCastElseBranchTest, "BlueprintBridge.Blueprint.SemanticIR.Cast.ElseBranch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRCastElseBranchTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemCastElse"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("CastElse"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> SelfExpr = MakeShared<FJsonObject>();
+	SelfExpr->SetBoolField(TEXT("self"), true);
+	TSharedRef<FJsonObject> CastStmt = MakeShared<FJsonObject>();
+	CastStmt->SetObjectField(TEXT("cast"), SelfExpr);
+	CastStmt->SetStringField(TEXT("to"), TEXT("/Script/Engine.Pawn"));
+	CastStmt->SetStringField(TEXT("as"), TEXT("AsPawn"));
+	CastStmt->SetArrayField(TEXT("then"), TArray<TSharedPtr<FJsonValue>>());
+
+	TSharedRef<FJsonObject> ElseReturnFields = MakeShared<FJsonObject>();
+	ElseReturnFields->SetStringField(TEXT("Out"), TEXT("failed"));
+	TSharedRef<FJsonObject> ElseReturn = MakeShared<FJsonObject>();
+	ElseReturn->SetObjectField(TEXT("return"), ElseReturnFields);
+	TArray<TSharedPtr<FJsonValue>> ElseBlock;
+	ElseBlock.Add(MakeShared<FJsonValueObject>(ElseReturn));
+	CastStmt->SetArrayField(TEXT("else"), ElseBlock);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(CastStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("cast else branch should still emit exactly one DynamicCast node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("DynamicCast")), 1);
+	return TestEqual(TEXT("CastFailed pin should link into the else return path."), BlueprintBridgeTests::CountPatchLinksTo(*Result, TEXT(".CastFailed"), TEXT("result.execute")), 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRForEachBasicTest, "BlueprintBridge.Blueprint.SemanticIR.ForEach.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRForEachBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemForEach"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("ForEachBasic"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	TSharedRef<FJsonObject> TargetsInput = BlueprintBridgeTests::MakePinSpec(TEXT("Targets"), TEXT("object"));
+	TargetsInput->SetStringField(TEXT("subCategoryObject"), TEXT("/Script/Engine.Actor"));
+	TargetsInput->SetStringField(TEXT("containerType"), TEXT("Array"));
+	Inputs.Add(MakeShared<FJsonValueObject>(TargetsInput));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("object"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetStringField(TEXT("Out"), TEXT("Target"));
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Body;
+	Body.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+
+	TSharedRef<FJsonObject> LoopStmt = MakeShared<FJsonObject>();
+	LoopStmt->SetStringField(TEXT("forEach"), TEXT("Targets"));
+	LoopStmt->SetStringField(TEXT("as"), TEXT("Target"));
+	LoopStmt->SetArrayField(TEXT("body"), Body);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(LoopStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("forEach should emit one ForEachLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("ForEachLoop")), 1);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("Induction variable should resolve from forEach body scope."), (*Resolutions)->TryGetStringField(TEXT("flow[0].body[0].return.Out"), Resolved) && Resolved == TEXT("scope:Target"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRForBasicTest, "BlueprintBridge.Blueprint.SemanticIR.For.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRForBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemFor"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("ForBasic"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> Range = MakeShared<FJsonObject>();
+	Range->SetNumberField(TEXT("from"), 0);
+	Range->SetNumberField(TEXT("to"), 5);
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetStringField(TEXT("Out"), TEXT("i"));
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Body;
+	Body.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+
+	TSharedRef<FJsonObject> LoopStmt = MakeShared<FJsonObject>();
+	LoopStmt->SetObjectField(TEXT("for"), Range);
+	LoopStmt->SetStringField(TEXT("as"), TEXT("i"));
+	LoopStmt->SetArrayField(TEXT("body"), Body);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(LoopStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("for should emit one ForLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("ForLoop")), 1);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("Index variable should resolve from for body scope."), (*Resolutions)->TryGetStringField(TEXT("flow[0].body[0].return.Out"), Resolved) && Resolved == TEXT("scope:i"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLoopInductionVarScopePopTest, "BlueprintBridge.Blueprint.SemanticIR.Loop.InductionVarScopePop", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLoopInductionVarScopePopTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLoopPop"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LoopPop"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("string"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> Range = MakeShared<FJsonObject>();
+	Range->SetNumberField(TEXT("from"), 0);
+	Range->SetNumberField(TEXT("to"), 1);
+	TSharedRef<FJsonObject> LoopStmt = MakeShared<FJsonObject>();
+	LoopStmt->SetObjectField(TEXT("for"), Range);
+	LoopStmt->SetStringField(TEXT("as"), TEXT("i"));
+	LoopStmt->SetArrayField(TEXT("body"), TArray<TSharedPtr<FJsonValue>>());
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetStringField(TEXT("Out"), TEXT("i"));
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(LoopStmt));
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("Induction variable should not leak after loop body exits."), (*Resolutions)->TryGetStringField(TEXT("flow[1].return.Out"), Resolved) && Resolved == TEXT("literal:string"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRWhileBasicTest, "BlueprintBridge.Blueprint.SemanticIR.While.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRWhileBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemWhile"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("WhileBasic"));
+	TArray<TSharedPtr<FJsonValue>> Inputs;
+	Inputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Flag"), TEXT("bool"))));
+	Params->SetArrayField(TEXT("inputs"), Inputs);
+
+	TSharedRef<FJsonObject> WhileStmt = MakeShared<FJsonObject>();
+	WhileStmt->SetStringField(TEXT("while"), TEXT("Flag"));
+	WhileStmt->SetArrayField(TEXT("body"), TArray<TSharedPtr<FJsonValue>>());
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(WhileStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("while should emit one WhileLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("WhileLoop")), 1);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString Resolved;
+	return TestTrue(TEXT("while should annotate loop resolution."), (*Resolutions)->TryGetStringField(TEXT("flow[0]"), Resolved) && Resolved == TEXT("loop:while"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLoopBreakTest, "BlueprintBridge.Blueprint.SemanticIR.Loop.Break", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLoopBreakTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLoopBreak"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LoopBreak"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> BreakStmt = MakeShared<FJsonObject>();
+	BreakStmt->SetBoolField(TEXT("break"), true);
+	TArray<TSharedPtr<FJsonValue>> Body;
+	Body.Add(MakeShared<FJsonValueObject>(BreakStmt));
+	TSharedRef<FJsonObject> WhileStmt = MakeShared<FJsonObject>();
+	WhileStmt->SetBoolField(TEXT("while"), true);
+	WhileStmt->SetArrayField(TEXT("body"), Body);
+
+	TSharedRef<FJsonObject> ReturnFields = MakeShared<FJsonObject>();
+	ReturnFields->SetNumberField(TEXT("Out"), 1);
+	TSharedRef<FJsonObject> ReturnStmt = MakeShared<FJsonObject>();
+	ReturnStmt->SetObjectField(TEXT("return"), ReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(WhileStmt));
+	Flow.Add(MakeShared<FJsonValueObject>(ReturnStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("break should keep one WhileLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("WhileLoop")), 1);
+	return TestEqual(TEXT("break exit should link from loop body to downstream return."), BlueprintBridgeTests::CountPatchLinksTo(*Result, TEXT(".LoopBody"), TEXT("result.execute")), 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLoopContinueTest, "BlueprintBridge.Blueprint.SemanticIR.Loop.Continue", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLoopContinueTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLoopContinue"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LoopContinue"));
+	TSharedRef<FJsonObject> ContinueStmt = MakeShared<FJsonObject>();
+	ContinueStmt->SetBoolField(TEXT("continue"), true);
+	TArray<TSharedPtr<FJsonValue>> Body;
+	Body.Add(MakeShared<FJsonValueObject>(ContinueStmt));
+	TSharedRef<FJsonObject> WhileStmt = MakeShared<FJsonObject>();
+	WhileStmt->SetBoolField(TEXT("while"), true);
+	WhileStmt->SetArrayField(TEXT("body"), Body);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(WhileStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("continue should keep one WhileLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("WhileLoop")), 1);
+	return TestEqual(TEXT("continue should link loop body back to loop execute."), BlueprintBridgeTests::CountPatchLinksTo(*Result, TEXT(".LoopBody"), TEXT("n_1.execute")), 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLoopBreakOutsideLoopTest, "BlueprintBridge.Blueprint.SemanticIR.Loop.BreakOutsideLoop", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLoopBreakOutsideLoopTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemBreakOutside"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("BreakOutside"));
+	TSharedRef<FJsonObject> BreakStmt = MakeShared<FJsonObject>();
+	BreakStmt->SetBoolField(TEXT("break"), true);
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(BreakStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	return BlueprintBridgeTests::ExpectErrorCode(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params), TEXT("SemanticLoweringFailed"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeSemanticIRLoopNestedScopesTest, "BlueprintBridge.Blueprint.SemanticIR.Loop.NestedScopes", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeSemanticIRLoopNestedScopesTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("SemLoopNested"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("function"), TEXT("LoopNested"));
+	TArray<TSharedPtr<FJsonValue>> Outputs;
+	Outputs.Add(MakeShared<FJsonValueObject>(BlueprintBridgeTests::MakePinSpec(TEXT("Out"), TEXT("int"))));
+	Params->SetArrayField(TEXT("outputs"), Outputs);
+
+	TSharedRef<FJsonObject> Binding = MakeShared<FJsonObject>();
+	Binding->SetStringField(TEXT("name"), TEXT("i"));
+	Binding->SetNumberField(TEXT("value"), 7);
+	TArray<TSharedPtr<FJsonValue>> Bindings;
+	Bindings.Add(MakeShared<FJsonValueObject>(Binding));
+
+	TSharedRef<FJsonObject> Range = MakeShared<FJsonObject>();
+	Range->SetNumberField(TEXT("from"), 0);
+	Range->SetNumberField(TEXT("to"), 1);
+	TSharedRef<FJsonObject> BodyReturnFields = MakeShared<FJsonObject>();
+	BodyReturnFields->SetStringField(TEXT("Out"), TEXT("i"));
+	TSharedRef<FJsonObject> BodyReturn = MakeShared<FJsonObject>();
+	BodyReturn->SetObjectField(TEXT("return"), BodyReturnFields);
+	TArray<TSharedPtr<FJsonValue>> Body;
+	Body.Add(MakeShared<FJsonValueObject>(BodyReturn));
+	TSharedRef<FJsonObject> LoopStmt = MakeShared<FJsonObject>();
+	LoopStmt->SetObjectField(TEXT("for"), Range);
+	LoopStmt->SetStringField(TEXT("as"), TEXT("i"));
+	LoopStmt->SetArrayField(TEXT("body"), Body);
+
+	TSharedRef<FJsonObject> AfterReturnFields = MakeShared<FJsonObject>();
+	AfterReturnFields->SetStringField(TEXT("Out"), TEXT("i"));
+	TSharedRef<FJsonObject> AfterReturn = MakeShared<FJsonObject>();
+	AfterReturn->SetObjectField(TEXT("return"), AfterReturnFields);
+	TArray<TSharedPtr<FJsonValue>> InBlock;
+	InBlock.Add(MakeShared<FJsonValueObject>(LoopStmt));
+	InBlock.Add(MakeShared<FJsonValueObject>(AfterReturn));
+	TSharedRef<FJsonObject> LetStmt = MakeShared<FJsonObject>();
+	LetStmt->SetArrayField(TEXT("let"), Bindings);
+	LetStmt->SetArrayField(TEXT("in"), InBlock);
+
+	TArray<TSharedPtr<FJsonValue>> Flow;
+	Flow.Add(MakeShared<FJsonValueObject>(LetStmt));
+	Params->SetArrayField(TEXT("flow"), Flow);
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("LowerSemanticFunction"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	TestEqual(TEXT("nested-scope loop should emit one ForLoop node."), BlueprintBridgeTests::CountPatchNodes(*Result, TEXT("ForLoop")), 1);
+	const TSharedPtr<FJsonObject>* Resolutions = nullptr;
+	if (!Result || !(*Result)->TryGetObjectField(TEXT("resolutions"), Resolutions) || !Resolutions) { return false; }
+	FString InnerResolved;
+	FString OuterResolved;
+	TestTrue(TEXT("Loop body should resolve i from inner loop scope."), (*Resolutions)->TryGetStringField(TEXT("flow[0].in[0].body[0].return.Out"), InnerResolved) && InnerResolved == TEXT("scope:i"));
+	return TestTrue(TEXT("After loop, outer let binding should be restored."), (*Resolutions)->TryGetStringField(TEXT("flow[0].in[1].return.Out"), OuterResolved) && OuterResolved == TEXT("scope:i"));
 }
 
 namespace BlueprintBridgeTests
@@ -4549,6 +5377,361 @@ bool FBlueprintBridgeBatchRefPredecessorFailedTest::RunTest(const FString& Param
 	FString ChildErr;
 	BlueprintBridgeTests::GetBatchChildResult(*this, Response, 1, ChildErr);
 	return TestEqual(TEXT("Ref to failed predecessor should produce RefPredecessorFailed."), ChildErr, FString(TEXT("RefPredecessorFailed")));
+}
+
+namespace BlueprintBridgeTests
+{
+static int64 GetAssetVersionFromResponse(FAutomationTestBase& Test, const TSharedRef<FJsonObject>& Response)
+{
+	const TSharedPtr<FJsonObject>* Result = GetResultObject(Test, Response);
+	if (!Result) { return -1; }
+	double Version = -1.0;
+	if (!(*Result)->TryGetNumberField(TEXT("assetVersion"), Version))
+	{
+		Test.AddError(TEXT("Expected response to include result.assetVersion."));
+		return -1;
+	}
+	return static_cast<int64>(Version);
+}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionResponseIncludesVersionTest, "BlueprintBridge.Protocol.AssetVersion.ResponseIncludesVersion", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionResponseIncludesVersionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerResp"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const int64 Version = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, Response);
+	return TestTrue(TEXT("Inspection response should include assetVersion >= 1."), Version >= 1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionUnchangedShortCircuitsTest, "BlueprintBridge.Protocol.AssetVersion.UnchangedShortCircuits", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionUnchangedShortCircuitsTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerUnchanged"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> First = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, First)) { return false; }
+	const int64 Version = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, First);
+	if (Version < 1) { return false; }
+
+	TSharedRef<FJsonObject> SecondParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	SecondParams->SetNumberField(TEXT("ifAssetVersionDiffersFrom"), static_cast<double>(Version));
+	const TSharedRef<FJsonObject> Second = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), SecondParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Second)) { return false; }
+
+	const TSharedPtr<FJsonObject>* SecondResult = BlueprintBridgeTests::GetResultObject(*this, Second);
+	if (!SecondResult) { return false; }
+	bool bUnchanged = false;
+	TestTrue(TEXT("Matching version guard should produce unchanged:true."), (*SecondResult)->TryGetBoolField(TEXT("unchanged"), bUnchanged) && bUnchanged);
+	// The short-circuit response should be minimal — no full payload fields like 'variables'.
+	TestFalse(TEXT("Short-circuited response should NOT carry the full payload."), (*SecondResult)->HasField(TEXT("variables")));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionMutationBumpsVersionTest, "BlueprintBridge.Protocol.AssetVersion.MutationBumpsVersion", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionMutationBumpsVersionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerBump"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> Before = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Before)) { return false; }
+	const int64 V0 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, Before);
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("BumpProbe"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams))) { return false; }
+
+	const TSharedRef<FJsonObject> After = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, After)) { return false; }
+	const int64 V1 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, After);
+	if (!TestTrue(FString::Printf(TEXT("Mutation should bump assetVersion (V0=%lld, V1=%lld)."), V0, V1), V1 > V0)) { return false; }
+
+	// Verify the version stamp also appears on object-result mutations (FinishGraphEdit shape).
+	const FString EventGraphName = BlueprintBridgeTests::GetPrimaryEventGraphName(Asset.Blueprint);
+	TSharedRef<FJsonObject> AddGetParams = BlueprintBridgeTests::MakeGraphParams(Asset.AssetPath, EventGraphName);
+	AddGetParams->SetStringField(TEXT("variable"), TEXT("BumpProbe"));
+	AddGetParams->SetNumberField(TEXT("x"), 100);
+	AddGetParams->SetNumberField(TEXT("y"), 100);
+	const TSharedRef<FJsonObject> GetResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddVariableGetNode"), AddGetParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, GetResponse)) { return false; }
+	const int64 V2 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, GetResponse);
+	return TestTrue(FString::Printf(TEXT("Object-result mutation should also stamp and bump (V1=%lld, V2=%lld)."), V1, V2), V2 > V1);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionPathNormalizationTest, "BlueprintBridge.Protocol.AssetVersion.PathNormalization", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionPathNormalizationTest::RunTest(const FString& Parameters)
+{
+	// The same asset can be referenced as /Game/X or /Game/X.X (or /Game/X.X_C for class
+	// lookups, though that form requires the asset to be saved). All forms must share a
+	// single version counter so a caller that varies the form across calls doesn't silently
+	// miss real changes. This test covers the two LoadBlueprint-compatible forms; the _C
+	// form is normalized to the same key by NormalizeAssetPath but isn't load-testable
+	// against unsaved in-memory test BPs.
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerPathNorm"));
+	if (!Asset.Blueprint) { return false; }
+
+	const FString BasePath = Asset.AssetPath;
+	const FString ShortName = FPackageName::GetShortName(BasePath);
+	const FString DotForm = FString::Printf(TEXT("%s.%s"), *BasePath, *ShortName);
+
+	// 1) Read via the bare package form to seed the counter.
+	const TSharedRef<FJsonObject> First = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(BasePath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, First)) { return false; }
+	const int64 V0 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, First);
+
+	// 2) Mutate via the .Asset.Asset form — must bump the SAME counter, not a sibling.
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(DotForm);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("NormProbe"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams))) { return false; }
+
+	// 3) Read via the bare package form again with the OLD version as guard. If the bump
+	// in (2) keyed on a different normalization, this would short-circuit with unchanged:true
+	// and silently miss the mutation. We assert the FULL payload comes back.
+	TSharedRef<FJsonObject> StaleParams = BlueprintBridgeTests::MakeAssetParams(BasePath);
+	StaleParams->SetNumberField(TEXT("ifAssetVersionDiffersFrom"), static_cast<double>(V0));
+	const TSharedRef<FJsonObject> Third = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), StaleParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Third)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Third);
+	if (!Result) { return false; }
+	bool bUnchanged = false;
+	(*Result)->TryGetBoolField(TEXT("unchanged"), bUnchanged);
+	TestFalse(TEXT("Cross-form mutation must invalidate cached version (path normalization)."), bUnchanged);
+	const int64 V1 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, Third);
+	return TestTrue(FString::Printf(TEXT("Cross-form bump should advance the version (V0=%lld, V1=%lld)."), V0, V1), V1 > V0);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionDivergedReturnsFullTest, "BlueprintBridge.Protocol.AssetVersion.DivergedReturnsFull", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionDivergedReturnsFullTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerDiverged"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> Before = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Before)) { return false; }
+	const int64 V0 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, Before);
+
+	TSharedRef<FJsonObject> AddVarParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddVarParams->SetStringField(TEXT("name"), TEXT("DivergeProbe"));
+	AddVarParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddVarParams))) { return false; }
+
+	// Pass the stale V0 — bridge should NOT short-circuit; it should return the full payload with the new version.
+	TSharedRef<FJsonObject> StaleParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	StaleParams->SetNumberField(TEXT("ifAssetVersionDiffersFrom"), static_cast<double>(V0));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), StaleParams);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result) { return false; }
+	// Default false so a missing 'unchanged' field (the full-payload path) doesn't accidentally
+	// satisfy a "should NOT short-circuit" assertion.
+	bool bUnchanged = false;
+	(*Result)->TryGetBoolField(TEXT("unchanged"), bUnchanged);
+	TestFalse(TEXT("Diverged version should NOT short-circuit."), bUnchanged);
+	TestTrue(TEXT("Diverged response should include the full payload."), (*Result)->HasField(TEXT("variables")));
+	const int64 V1 = BlueprintBridgeTests::GetAssetVersionFromResponse(*this, Response);
+	return TestTrue(FString::Printf(TEXT("Diverged response should report newer version (V0=%lld, V1=%lld)."), V0, V1), V1 > V0);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAssetVersionZeroNeverMatchesTest, "BlueprintBridge.Protocol.AssetVersion.ZeroNeverMatches", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeAssetVersionZeroNeverMatchesTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("AssetVerZero"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetNumberField(TEXT("ifAssetVersionDiffersFrom"), 0);
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result) { return false; }
+	bool bUnchanged = false;
+	(*Result)->TryGetBoolField(TEXT("unchanged"), bUnchanged);
+	TestFalse(TEXT("ifAssetVersionDiffersFrom:0 should never short-circuit (versions start at 1)."), bUnchanged);
+	return TestTrue(TEXT("Stale-zero response should include the full payload."), (*Result)->HasField(TEXT("variables")));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFindAssetDependenciesShapeTest, "BlueprintBridge.Reference.FindAssetDependencies.Shape", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFindAssetDependenciesShapeTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Deps"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindAssetDependencies"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Assets = nullptr;
+	double Count = -1.0;
+	TestTrue(TEXT("FindAssetDependencies should return assets array."), (*Result)->TryGetArrayField(TEXT("assets"), Assets) && Assets);
+	TestTrue(TEXT("FindAssetDependencies should return count."), (*Result)->TryGetNumberField(TEXT("count"), Count) && Count >= 0.0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFindAssetReferencesShapeTest, "BlueprintBridge.Reference.FindAssetReferences.Shape", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFindAssetReferencesShapeTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Refs"));
+	if (!Asset.Blueprint) { return false; }
+
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindAssetReferences"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Assets = nullptr;
+	double Count = -1.0;
+	TestTrue(TEXT("FindAssetReferences should return assets array."), (*Result)->TryGetArrayField(TEXT("assets"), Assets) && Assets);
+	TestTrue(TEXT("FindAssetReferences should return count."), (*Result)->TryGetNumberField(TEXT("count"), Count) && Count >= 0.0);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeFindInterfaceImplementationsShapeTest, "BlueprintBridge.Reference.FindInterfaceImplementations.Shape", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeFindInterfaceImplementationsShapeTest::RunTest(const FString& Parameters)
+{
+	TSharedRef<FJsonObject> Params = MakeShared<FJsonObject>();
+	Params->SetStringField(TEXT("interfaceClass"), TEXT("/Script/Engine.Interface_AssetUserData"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindInterfaceImplementations"), Params);
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, Response)) { return false; }
+	const TSharedPtr<FJsonObject>* Result = BlueprintBridgeTests::GetResultObject(*this, Response);
+	if (!Result) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Assets = nullptr;
+	double Count = -1.0;
+	TestTrue(TEXT("FindInterfaceImplementations should return assets array."), (*Result)->TryGetArrayField(TEXT("assets"), Assets) && Assets);
+	TestTrue(TEXT("FindInterfaceImplementations should return count."), (*Result)->TryGetNumberField(TEXT("count"), Count) && Count >= 0.0);
+
+	// Unknown interface class returns ClassNotFound, not a silent empty result.
+	TSharedRef<FJsonObject> BadParams = MakeShared<FJsonObject>();
+	BadParams->SetStringField(TEXT("interfaceClass"), TEXT("/Script/Engine.DefinitelyNotAnInterface_9001"));
+	const TSharedRef<FJsonObject> BadResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("FindInterfaceImplementations"), BadParams);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, BadResponse, TEXT("ClassNotFound"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeRenameBlueprintVariableBasicTest, "BlueprintBridge.Blueprint.RenameBlueprintVariable.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeRenameBlueprintVariableBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Rename"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> AddParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddParams->SetStringField(TEXT("name"), TEXT("OldName"));
+	AddParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddParams))) { return false; }
+
+	TSharedRef<FJsonObject> RenameParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	RenameParams->SetStringField(TEXT("variable"), TEXT("OldName"));
+	RenameParams->SetStringField(TEXT("newName"), TEXT("NewName"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RenameBlueprintVariable"), RenameParams))) { return false; }
+
+	// Verify via a bridge round-trip rather than poking the in-memory UBlueprint directly.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse)) { return false; }
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	if (!DescribeResult) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	if (!(*DescribeResult)->TryGetArrayField(TEXT("variables"), Variables) || !Variables) { return false; }
+	bool bHasNewName = false;
+	bool bHasOldName = false;
+	for (const TSharedPtr<FJsonValue>& V : *Variables)
+	{
+		const TSharedPtr<FJsonObject>* VarObj = nullptr;
+		FString Name;
+		if (V->TryGetObject(VarObj) && VarObj && (*VarObj)->TryGetStringField(TEXT("name"), Name))
+		{
+			if (Name == TEXT("NewName")) bHasNewName = true;
+			if (Name == TEXT("OldName")) bHasOldName = true;
+		}
+	}
+	TestTrue(TEXT("DescribeBlueprint should include the new variable name post-rename."), bHasNewName);
+	TestFalse(TEXT("DescribeBlueprint should not include the old variable name post-rename."), bHasOldName);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeRenameBlueprintVariableCollisionTest, "BlueprintBridge.Blueprint.RenameBlueprintVariable.Collision", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeRenameBlueprintVariableCollisionTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("RenameClash"));
+	if (!Asset.Blueprint) { return false; }
+
+	for (const TCHAR* Name : { TEXT("Alpha"), TEXT("Beta") })
+	{
+		TSharedRef<FJsonObject> AddParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+		AddParams->SetStringField(TEXT("name"), Name);
+		AddParams->SetStringField(TEXT("category"), TEXT("int"));
+		if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddParams))) { return false; }
+	}
+
+	TSharedRef<FJsonObject> RenameParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	RenameParams->SetStringField(TEXT("variable"), TEXT("Beta"));
+	RenameParams->SetStringField(TEXT("newName"), TEXT("Alpha"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RenameBlueprintVariable"), RenameParams);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("VariableAlreadyExists"));
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeRemoveBlueprintVariableBasicTest, "BlueprintBridge.Blueprint.RemoveBlueprintVariable.Basic", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeRemoveBlueprintVariableBasicTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("Remove"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> AddParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	AddParams->SetStringField(TEXT("name"), TEXT("DoomedVar"));
+	AddParams->SetStringField(TEXT("category"), TEXT("int"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("AddBlueprintVariable"), AddParams))) { return false; }
+
+	TSharedRef<FJsonObject> RemoveParams = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	RemoveParams->SetStringField(TEXT("variable"), TEXT("DoomedVar"));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RemoveBlueprintVariable"), RemoveParams))) { return false; }
+
+	// Verify via a bridge round-trip.
+	const TSharedRef<FJsonObject> DescribeResponse = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("DescribeBlueprint"), BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath));
+	if (!BlueprintBridgeTests::ExpectSuccess(*this, DescribeResponse)) { return false; }
+	const TSharedPtr<FJsonObject>* DescribeResult = BlueprintBridgeTests::GetResultObject(*this, DescribeResponse);
+	if (!DescribeResult) { return false; }
+	const TArray<TSharedPtr<FJsonValue>>* Variables = nullptr;
+	if (!(*DescribeResult)->TryGetArrayField(TEXT("variables"), Variables) || !Variables) { return false; }
+	for (const TSharedPtr<FJsonValue>& V : *Variables)
+	{
+		const TSharedPtr<FJsonObject>* VarObj = nullptr;
+		FString Name;
+		if (V->TryGetObject(VarObj) && VarObj && (*VarObj)->TryGetStringField(TEXT("name"), Name))
+		{
+			TestFalse(TEXT("DescribeBlueprint should not include the removed variable."), Name == TEXT("DoomedVar"));
+		}
+	}
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeRemoveBlueprintVariableNotFoundTest, "BlueprintBridge.Blueprint.RemoveBlueprintVariable.NotFound", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FBlueprintBridgeRemoveBlueprintVariableNotFoundTest::RunTest(const FString& Parameters)
+{
+	const BlueprintBridgeTests::FTestBlueprintAsset Asset = BlueprintBridgeTests::CreateTestBlueprint(*this, TEXT("RemoveMissing"));
+	if (!Asset.Blueprint) { return false; }
+
+	TSharedRef<FJsonObject> Params = BlueprintBridgeTests::MakeAssetParams(Asset.AssetPath);
+	Params->SetStringField(TEXT("variable"), TEXT("NotAThing_9001"));
+	const TSharedRef<FJsonObject> Response = BlueprintBridgeTests::ExecuteJsonRequest(TEXT("RemoveBlueprintVariable"), Params);
+	return BlueprintBridgeTests::ExpectErrorCode(*this, Response, TEXT("VariableNotFound"));
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FBlueprintBridgeAddVariableGetNodeUnresolvedTest, "BlueprintBridge.Blueprint.AddVariableGetNode.Unresolved", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)

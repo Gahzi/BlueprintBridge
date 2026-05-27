@@ -591,4 +591,72 @@ TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr
 	Blueprint->GetOutermost()->MarkPackageDirty();
 	return MakeSuccessMessage(Id, TEXT("VariableAdded"));
 }
+
+TSharedRef<FJsonObject> RenameBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString OldName;
+	FString NewName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
+		!TryGetRequiredString(Params, TEXT("variable"), OldName) ||
+		!TryGetRequiredString(Params, TEXT("newName"), NewName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("RenameBlueprintVariable requires params.asset, params.variable, and params.newName."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *OldName) == INDEX_NONE)
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not find variable '%s' on '%s'."), *OldName, *AssetPath));
+	}
+	if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *NewName) != INDEX_NONE)
+	{
+		return MakeBridgeError(Id, TEXT("VariableAlreadyExists"), FString::Printf(TEXT("A variable named '%s' already exists on '%s'."), *NewName, *AssetPath));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "RenameBlueprintVariable", "Blueprint Bridge: Rename Blueprint Variable"));
+	Blueprint->Modify();
+	FBlueprintEditorUtils::RenameMemberVariable(Blueprint, *OldName, *NewName);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	Blueprint->GetOutermost()->MarkPackageDirty();
+
+	TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
+	Result->SetStringField(TEXT("variable"), NewName);
+	Result->SetStringField(TEXT("previousName"), OldName);
+	return MakeSuccess(Id, Result);
+}
+
+TSharedRef<FJsonObject> RemoveBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params)
+{
+	FString AssetPath;
+	FString VariableName;
+	if (!TryGetRequiredString(Params, TEXT("asset"), AssetPath) ||
+		!TryGetRequiredString(Params, TEXT("variable"), VariableName))
+	{
+		return MakeBridgeError(Id, TEXT("InvalidParams"), TEXT("RemoveBlueprintVariable requires params.asset and params.variable."));
+	}
+
+	UBlueprint* Blueprint = LoadBlueprint(AssetPath);
+	if (!Blueprint)
+	{
+		return MakeBridgeError(Id, TEXT("AssetNotFound"), FString::Printf(TEXT("Could not load Blueprint '%s'."), *AssetPath));
+	}
+
+	if (FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, *VariableName) == INDEX_NONE)
+	{
+		return MakeBridgeError(Id, TEXT("VariableNotFound"), FString::Printf(TEXT("Could not find variable '%s' on '%s'. Note: existing references in graphs are NOT validated by this command; call FindVariableReferences first if you want to check."), *VariableName, *AssetPath));
+	}
+
+	const FScopedTransaction Transaction(NSLOCTEXT("BlueprintBridge", "RemoveBlueprintVariable", "Blueprint Bridge: Remove Blueprint Variable"));
+	Blueprint->Modify();
+	FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, *VariableName);
+	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+	Blueprint->GetOutermost()->MarkPackageDirty();
+	return MakeSuccessMessage(Id, TEXT("VariableRemoved"));
+}
 } // namespace BlueprintBridge

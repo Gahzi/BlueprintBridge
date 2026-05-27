@@ -7,6 +7,46 @@ DEFINE_LOG_CATEGORY_STATIC(LogBlueprintBridge, Log, All);
 namespace BlueprintBridge
 {
 
+// Per-asset monotonic version counter. Versions live in-process and reset on editor
+// restart; callers must treat them as session-scoped. First observation returns 1 so
+// that any caller passing a stale 0 from prior storage always sees the current state.
+static TMap<FString, int64>& GetAssetVersionMap()
+{
+	static TMap<FString, int64> Versions;
+	return Versions;
+}
+
+// Normalize asset paths so all three forms ("/Game/Foo/Bar", "/Game/Foo/Bar.Bar",
+// "/Game/Foo/Bar.Bar_C") map to the same key. Otherwise a caller that varies the form
+// across calls would see distinct, stale counters.
+static FString NormalizeAssetPath(const FString& AssetPath)
+{
+	if (AssetPath.IsEmpty()) { return AssetPath; }
+	const FString PackageName = FPackageName::ObjectPathToPackageName(AssetPath);
+	return PackageName.IsEmpty() ? AssetPath : PackageName;
+}
+
+static int64 GetAssetVersion(const FString& AssetPath)
+{
+	if (const int64* Existing = GetAssetVersionMap().Find(NormalizeAssetPath(AssetPath)))
+	{
+		return *Existing;
+	}
+	return 1;
+}
+
+static int64 BumpAssetVersion(const FString& AssetPath)
+{
+	const int64 Next = GetAssetVersion(AssetPath) + 1;
+	GetAssetVersionMap().Add(NormalizeAssetPath(AssetPath), Next);
+	return Next;
+}
+
+static bool RiskMutatesAsset(ECommandRisk Risk)
+{
+	return Risk == ECommandRisk::ModifiesAsset || Risk == ECommandRisk::CreatesAsset || Risk == ECommandRisk::DeletesAsset;
+}
+
 static int32 ComputeEditDistance(const FString& A, const FString& B)
 {
 	const int32 LenA = A.Len();
@@ -101,7 +141,45 @@ TSharedRef<FJsonObject> ExecuteRequestOnGameThread(const FString& RequestText)
 			}
 		}
 
-		return RegisteredCommand->Execute(Id, Params);
+		// Asset-versioning short-circuit: if params.asset is set and the caller's stashed
+		// version matches the current asset version, skip dispatch entirely and return a
+		// minimal "unchanged" response.
+		FString AssetPath;
+		if (Params.IsValid()) { Params->TryGetStringField(TEXT("asset"), AssetPath); }
+		if (!AssetPath.IsEmpty() && Params.IsValid())
+		{
+			double ClientVersion = 0.0;
+			if (Params->TryGetNumberField(TEXT("ifAssetVersionDiffersFrom"), ClientVersion))
+			{
+				const int64 CurrentVersion = GetAssetVersion(AssetPath);
+				if (static_cast<int64>(ClientVersion) == CurrentVersion)
+				{
+					TSharedRef<FJsonObject> ShortCircuit = MakeShared<FJsonObject>();
+					ShortCircuit->SetBoolField(TEXT("unchanged"), true);
+					ShortCircuit->SetNumberField(TEXT("assetVersion"), static_cast<double>(CurrentVersion));
+					return MakeSuccess(Id, ShortCircuit);
+				}
+			}
+		}
+
+		TSharedRef<FJsonObject> Response = RegisteredCommand->Execute(Id, Params);
+
+		// Post-process: bump version on a successful mutation, then stamp the current
+		// version into any object-shaped result so callers can use it on their next call.
+		bool bOk = false;
+		if (Response->TryGetBoolField(TEXT("ok"), bOk) && bOk && !AssetPath.IsEmpty())
+		{
+			if (RiskMutatesAsset(RegisteredCommand->GetRisk()))
+			{
+				BumpAssetVersion(AssetPath);
+			}
+			const TSharedPtr<FJsonObject>* ResultObj = nullptr;
+			if (Response->TryGetObjectField(TEXT("result"), ResultObj) && ResultObj && (*ResultObj).IsValid())
+			{
+				(*ResultObj)->SetNumberField(TEXT("assetVersion"), static_cast<double>(GetAssetVersion(AssetPath)));
+			}
+		}
+		return Response;
 	}
 
 	const FString Suggestion = FindClosestCommandName(Command);

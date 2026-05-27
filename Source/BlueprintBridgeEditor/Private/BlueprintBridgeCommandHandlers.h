@@ -122,6 +122,11 @@ TSharedRef<FJsonObject> AddWidgetToParent(const FString& Id, const TSharedPtr<FJ
 TSharedRef<FJsonObject> SetWidgetSlotLayout(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> GetBlueprintDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> RenameBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> RemoveBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindAssetReferences(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindAssetDependencies(const FString& Id, const TSharedPtr<FJsonObject>& Params);
+TSharedRef<FJsonObject> FindInterfaceImplementations(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetSubobjectDefault(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> SetBlueprintVariableFlags(const FString& Id, const TSharedPtr<FJsonObject>& Params);
 TSharedRef<FJsonObject> AddBlueprintVariable(const FString& Id, const TSharedPtr<FJsonObject>& Params);
